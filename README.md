@@ -28,6 +28,7 @@ qrec records a rectangle of the screen, or a whole display, to an MP4 file: H.26
 - **The pointer** is drawn into the recording, including the inverted I-beam.
 - **Three settings**: 30 or 60 frames per second, a quality of three steps (the bitrate follows the size of the area), and whether sound and the pointer are recorded.
 - **A hotkey**: `Ctrl+Alt+R` by default, changed in the window by pressing another combination, or removed.
+- **An icon in the notification area**: red while a recording runs, with the time recorded in its tooltip; its menu starts and stops the recording, and can leave the program in the notification area alone, without a taskbar button.
 - **Nothing of qrec in the recording**: its own windows are kept out of the capture.
 - **Russian and English**: the interface follows the language of Windows.
 - **One file**: no FFmpeg, no runtime, no network access; the executable is about 7 MB.
@@ -58,6 +59,8 @@ Requirements: Windows 10 version 2004 or later, 64-bit. On earlier builds of Win
 **Record** starts the recording; while it runs, the button shows the time recorded and stops the recording when clicked. The number of frames skipped, if the computer could not keep up, appears below. A red frame surrounds the area while it is recorded. The file is named by the date and time, `qrec_2026-10-08_16-45-12.mp4`, and after the recording its name appears in the window as a link that shows it in Explorer.
 
 The area is cut to the monitor it was started on, its sides are made even (as H.264 requires), and it is at least 64 pixels on each side. The whole display is recorded when the area is outside the monitor, for instance after the displays were rearranged.
+
+The icon of qrec in the notification area turns red while a recording runs, and its tooltip shows the time recorded. A click on the icon brings the window to the front; its menu (right button) starts or stops the recording, shows the window, or closes the program. **Not on the taskbar** in the same menu removes the window's button from the taskbar (and from `Alt+Tab`): the minimise button then hides the window, and the icon brings it back. The choice is remembered. Windows 10 places a new icon among the hidden ones, behind the arrow; it can be dragged from there onto the taskbar.
 
 Closing the window during a recording completes the file first.
 

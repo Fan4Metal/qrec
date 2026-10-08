@@ -156,14 +156,53 @@ pub fn describe(e: &windows::core::Error) -> String {
     if msg.is_empty() { format!("{:#x}", e.code().0) } else { format!("{msg} ({:#x})", e.code().0) }
 }
 
-/// Hides the window, or shows it again in front of the others.
+/// Hides the window, or shows it again in front of the others (restored
+/// when it was minimised).
 pub fn show_window(hwnd: isize, show: bool) {
-    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOW, SetForegroundWindow, ShowWindow};
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow};
     let hwnd = HWND(hwnd as *mut _);
     unsafe {
-        let _ = ShowWindow(hwnd, if show { SW_SHOW } else { SW_HIDE });
+        let how = match show {
+            false => SW_HIDE,
+            true if IsIconic(hwnd).as_bool() => SW_RESTORE,
+            true => SW_SHOW,
+        };
+        let _ = ShowWindow(hwnd, how);
         if show {
             let _ = SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+/// Puts the window's button on the taskbar or takes it off. winit marks
+/// its windows for the taskbar (`WS_EX_APPWINDOW`), so without a button
+/// the window is a tool window instead, which also leaves it out of
+/// Alt+Tab. The taskbar notices the change when the window is shown:
+/// `refresh` hides and shows a visible window; without it only the style
+/// is set, which is enough before the window is shown or to set again
+/// what winit rewrote when it changed the window's state.
+pub fn set_taskbar_button(hwnd: isize, show: bool, refresh: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, IsWindowVisible, SW_HIDE, SW_SHOW, SetWindowLongPtrW, ShowWindow, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    };
+    let hwnd = HWND(hwnd as *mut _);
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let wanted = if show {
+            (style & !WS_EX_TOOLWINDOW.0) | WS_EX_APPWINDOW.0
+        } else {
+            (style & !WS_EX_APPWINDOW.0) | WS_EX_TOOLWINDOW.0
+        };
+        if wanted == style {
+            return;
+        }
+        let visible = refresh && IsWindowVisible(hwnd).as_bool();
+        if visible {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wanted as isize);
+        if visible {
+            let _ = ShowWindow(hwnd, SW_SHOW);
         }
     }
 }

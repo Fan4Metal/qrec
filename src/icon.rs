@@ -46,12 +46,14 @@ fn coverage(d: f32, px: f32) -> f32 {
 }
 
 /// Colour at `(fx, fy)` in 0..1 of the icon, `px` the size of a pixel.
-fn sample(fx: f32, fy: f32, px: f32) -> Rgba {
+/// While recording (the icon in the notification area) the square is red
+/// and the dot white.
+fn sample(fx: f32, fy: f32, px: f32, recording: bool) -> Rgba {
     let (x, y) = (fx - 0.5, fy - 0.5);
     let mut c = [0.0; 4];
     // The square.
     let square = rounded_box(x, y, 0.5, 0.11);
-    let mut back = hex(0x2a_33_40);
+    let mut back = hex(if recording { 0xe5_39_35 } else { 0x2a_33_40 });
     back[3] = coverage(square, px);
     c = over(c, back);
     // The frame: a light rounded outline, at least one pixel thick, with
@@ -73,14 +75,23 @@ fn sample(fx: f32, fy: f32, px: f32) -> Rgba {
     c = over(c, frame);
     // The dot.
     let dot = (x * x + y * y).sqrt() - 0.17;
-    let mut red = hex(0xe5_39_35);
-    red[3] = coverage(dot, px);
-    c = over(c, red);
+    let mut dot_colour = hex(if recording { 0xff_ff_ff } else { 0xe5_39_35 });
+    dot_colour[3] = coverage(dot, px);
+    c = over(c, dot_colour);
     c
 }
 
 /// The icon as straight RGBA, `size` x `size`, supersampled.
 pub fn rgba(size: u32) -> Vec<u8> {
+    rgba_of(size, false)
+}
+
+/// The icon of the notification area while recording.
+pub fn recording_rgba(size: u32) -> Vec<u8> {
+    rgba_of(size, true)
+}
+
+fn rgba_of(size: u32, recording: bool) -> Vec<u8> {
     const SS: u32 = 5;
     let n = size as usize;
     let px = 1.0 / size as f32;
@@ -93,7 +104,7 @@ pub fn rgba(size: u32) -> Vec<u8> {
                 for sx in 0..SS {
                     let fx = (x as f32 + (sx as f32 + 0.5) / SS as f32) * px;
                     let fy = (y as f32 + (sy as f32 + 0.5) / SS as f32) * px;
-                    let c = sample(fx, fy, px);
+                    let c = sample(fx, fy, px, recording);
                     for i in 0..3 {
                         acc[i] += c[i] * c[3];
                     }
@@ -149,8 +160,9 @@ pub fn png(size: u32, px: &[u8]) -> Vec<u8> {
 }
 
 /// A 32-bit BMP icon entry: the header, the rows bottom-up in BGRA, and
-/// an empty AND mask (the alpha channel carries the transparency).
-fn bmp_entry(size: u32, px: &[u8]) -> Vec<u8> {
+/// an empty AND mask (the alpha channel carries the transparency). Also
+/// what `CreateIconFromResourceEx` takes for the notification area.
+pub fn bmp_entry(size: u32, px: &[u8]) -> Vec<u8> {
     let n = size as usize;
     let mask_stride = n.div_ceil(32) * 4;
     let mut out = Vec::with_capacity(40 + n * n * 4 + mask_stride * n);
@@ -183,6 +195,11 @@ mod tests {
         let centre = (16 * 32 + 16) * 4;
         assert_eq!(px[centre + 3], 255);
         assert!(px[centre] > 200 && px[centre + 1] < 80);
+        // While recording: a red square, the dot white.
+        let rec = recording_rgba(32);
+        assert!(rec[centre] > 240 && rec[centre + 1] > 240 && rec[centre + 2] > 240);
+        let edge = (16 * 32 + 3) * 4;
+        assert!(rec[edge] > 200 && rec[edge + 1] < 80 && rec[edge + 3] == 255);
         let ico = ico(&[16, 32]);
         assert_eq!(&ico[..6], &[0, 0, 1, 0, 2, 0]);
     }

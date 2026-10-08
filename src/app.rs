@@ -12,6 +12,7 @@ use crate::hotkey::{Chord, Hotkey};
 use crate::overlay::{self, Border};
 use crate::recorder::{self, Config, Quality, Recorder};
 use crate::region::{Aspect, Region};
+use crate::tray::{self, Tray};
 use crate::win;
 
 /// The window's size in points.
@@ -29,6 +30,7 @@ const CURSOR_KEY: &str = "cursor";
 const FOLDER_KEY: &str = "folder";
 const HOTKEY_KEY: &str = "hotkey";
 const ASPECT_KEY: &str = "aspect";
+const TASKBAR_KEY: &str = "taskbar";
 
 const RECORD_COLOUR: Color32 = Color32::from_rgb(0xe5, 0x39, 0x35);
 /// The dark of the icon and of the record button's ring.
@@ -49,8 +51,13 @@ pub struct App {
     chord: Option<Chord>,
     hotkey: Option<(Hotkey, mpsc::Receiver<()>)>,
     hotkey_error: Option<String>,
+    /// The icon in the notification area; `None` when Windows refused it.
+    tray: Option<(Tray, mpsc::Receiver<tray::Command>)>,
     /// The proportions of the next area selected.
     aspect: Aspect,
+    /// Whether the window has a button on the taskbar; without one it is
+    /// reached from the icon in the notification area.
+    taskbar: bool,
     /// The next key press becomes the hotkey.
     capturing_hotkey: bool,
     recorder: Option<Recorder>,
@@ -86,6 +93,7 @@ impl App {
         };
         let quality = get(QUALITY_KEY).and_then(|q| Quality::from_name(&q)).unwrap_or_default();
         let audio = get(AUDIO_KEY).as_deref() != Some("false");
+        let taskbar = get(TASKBAR_KEY).as_deref() != Some("false");
         let cursor = get(CURSOR_KEY).as_deref() != Some("false");
         let folder = get(FOLDER_KEY).map(PathBuf::from).unwrap_or_else(default_folder);
         let aspect = get(ASPECT_KEY).and_then(|a| Aspect::from_name(&a)).unwrap_or_default();
@@ -121,8 +129,10 @@ impl App {
             folder,
             chord,
             aspect,
+            taskbar,
             hotkey: None,
             hotkey_error: None,
+            tray: Tray::new(cc.egui_ctx.clone()).inspect_err(|e| log::warn!("no tray icon: {e}")).ok(),
             capturing_hotkey: false,
             recorder: None,
             border: None,
@@ -132,6 +142,10 @@ impl App {
             rounded: None,
         };
         app.register_hotkey(&cc.egui_ctx);
+        // Before eframe shows the window, so that no button appears.
+        if let (Some(hwnd), true) = (app.window, app.tray_only()) {
+            win::set_taskbar_button(hwnd, false, false);
+        }
         app
     }
 
@@ -184,6 +198,27 @@ impl App {
         }
         if presses % 2 == 1 && self.selecting.is_none() {
             self.toggle();
+        }
+        let commands: Vec<tray::Command> = self.tray.as_ref().map(|(_, rx)| rx.try_iter().collect()).unwrap_or_default();
+        for command in commands {
+            log::debug!("tray: {command:?}");
+            match command {
+                // While an area is selected the window stays hidden.
+                _ if self.selecting.is_some() => {}
+                tray::Command::Toggle => self.toggle(),
+                tray::Command::Show => {
+                    if let Some(hwnd) = self.window {
+                        win::show_window(hwnd, true);
+                    }
+                }
+                tray::Command::Taskbar => {
+                    self.taskbar = !self.taskbar;
+                    if let Some(hwnd) = self.window {
+                        win::set_taskbar_button(hwnd, !self.tray_only(), true);
+                    }
+                }
+                tray::Command::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            }
         }
         if self.recorder.as_ref().is_some_and(Recorder::failed) {
             self.stop();
@@ -259,6 +294,20 @@ impl App {
             }
             ctx.request_repaint();
         }));
+    }
+
+    /// The window without a taskbar button; only with the icon in the
+    /// notification area, the one way back to a hidden window.
+    fn tray_only(&self) -> bool {
+        !self.taskbar && self.tray.is_some()
+    }
+
+    /// The time recorded, `00:01:23`, while recording.
+    fn clock(&self) -> Option<String> {
+        self.recorder.as_ref().map(|recorder| {
+            let elapsed = recorder.started.elapsed().as_secs();
+            format!("{:02}:{:02}:{:02}", elapsed / 3600, elapsed / 60 % 60, elapsed % 60)
+        })
     }
 
     /// Clips the window to the painted rounded background, again when its
@@ -371,8 +420,15 @@ impl eframe::App for App {
             if title_button(&mut ui.new_child(egui::UiBuilder::new().max_rect(corner(1.0))), TitleButton::Close) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            if title_button(&mut ui.new_child(egui::UiBuilder::new().max_rect(corner(2.0))), TitleButton::Minimise) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            // Without a taskbar button there is nothing to minimise to: the
+            // window is hidden, and the icon brings it back.
+            let tray_only = self.tray_only();
+            let kind = if tray_only { TitleButton::Hide } else { TitleButton::Minimise };
+            if title_button(&mut ui.new_child(egui::UiBuilder::new().max_rect(corner(2.0))), kind) {
+                match (tray_only, self.window) {
+                    (true, Some(hwnd)) => win::show_window(hwnd, false),
+                    _ => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                }
             }
             title(ui, egui::Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.max_rect().width() - 56.0, 24.0)));
             ui.add_space(28.0);
@@ -381,6 +437,15 @@ impl eframe::App for App {
                 self.settings(ui, &ctx, recording);
             });
         });
+
+        if let Some((tray, _)) = &self.tray {
+            tray.set(self.clock().as_deref(), !self.taskbar);
+        }
+        // winit sets the window's style again whenever it changes its
+        // state (it shows the window after the first frame, for one).
+        if let (Some(hwnd), true) = (self.window, self.tray_only()) {
+            win::set_taskbar_button(hwnd, false, false);
+        }
 
         if busy {
             ctx.request_repaint_after(Duration::from_millis(200));
@@ -401,6 +466,7 @@ impl eframe::App for App {
         storage.set_string(FPS_KEY, self.fps.to_string());
         storage.set_string(QUALITY_KEY, self.quality.name().to_owned());
         storage.set_string(AUDIO_KEY, self.audio.to_string());
+        storage.set_string(TASKBAR_KEY, self.taskbar.to_string());
         storage.set_string(CURSOR_KEY, self.cursor.to_string());
         storage.set_string(FOLDER_KEY, self.folder.display().to_string());
         storage.set_string(HOTKEY_KEY, self.chord.map(|c| c.label()).unwrap_or_default());
@@ -562,10 +628,7 @@ impl App {
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let clock = self.recorder.as_ref().map(|recorder| {
-                    let elapsed = recorder.started.elapsed().as_secs();
-                    format!("{:02}:{:02}:{:02}", elapsed / 3600, elapsed / 60 % 60, elapsed % 60)
-                });
+                let clock = self.clock();
                 if record_button(ui, clock.as_deref(), self.selecting.is_none()) {
                     self.toggle();
                 }
@@ -708,11 +771,13 @@ fn record_button(ui: &mut egui::Ui, clock: Option<&str>, enabled: bool) -> bool 
 #[derive(Clone, Copy)]
 enum TitleButton {
     Minimise,
+    Hide,
     Close,
 }
 
-/// A 24 x 24 button of the title row: a dash that minimises or a cross
-/// that closes, as the dialogs of qview have it. True when clicked.
+/// A 24 x 24 button of the title row: a dash that minimises (or hides
+/// the window when it has no taskbar button) or a cross that closes, as
+/// the dialogs of qview have it. True when clicked.
 fn title_button(ui: &mut egui::Ui, kind: TitleButton) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(24.0), egui::Sense::click());
     let visuals = ui.style().interact(&response);
@@ -722,9 +787,12 @@ fn title_button(ui: &mut egui::Ui, kind: TitleButton) -> bool {
     let (c, r) = (rect.center(), 5.0);
     let stroke = egui::Stroke::new(1.5, visuals.fg_stroke.color);
     let hint = match kind {
-        TitleButton::Minimise => {
+        TitleButton::Minimise | TitleButton::Hide => {
             ui.painter().line_segment([c + Vec2::new(-r, 0.0), c + Vec2::new(r, 0.0)], stroke);
-            tr!("Minimise", "Свернуть")
+            match kind {
+                TitleButton::Hide => tr!("Hide to the notification area", "Скрыть в область уведомлений"),
+                _ => tr!("Minimise", "Свернуть"),
+            }
         }
         TitleButton::Close => {
             ui.painter().line_segment([c + Vec2::new(-r, -r), c + Vec2::new(r, r)], stroke);

@@ -15,6 +15,7 @@ mod icon;
 mod overlay;
 mod recorder;
 mod region;
+mod tray;
 mod venc;
 mod win;
 
