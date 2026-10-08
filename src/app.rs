@@ -32,6 +32,7 @@ const HOTKEY_KEY: &str = "hotkey";
 const ASPECT_KEY: &str = "aspect";
 const TASKBAR_KEY: &str = "taskbar";
 const CLOSE_TO_TRAY_KEY: &str = "close_to_tray";
+const MINIMISE_ON_RECORD_KEY: &str = "minimise_on_record";
 
 const RECORD_COLOUR: Color32 = Color32::from_rgb(0xe5, 0x39, 0x35);
 /// The dark of the icon and of the record button's ring.
@@ -62,6 +63,8 @@ pub struct App {
     /// Whether the window's cross hides the window instead of closing the
     /// program.
     close_to_tray: bool,
+    /// Whether the window is put out of the way when a recording starts.
+    minimise_on_record: bool,
     /// The next key press becomes the hotkey.
     capturing_hotkey: bool,
     recorder: Option<Recorder>,
@@ -99,6 +102,7 @@ impl App {
         let audio = get(AUDIO_KEY).as_deref() != Some("false");
         let taskbar = get(TASKBAR_KEY).as_deref() != Some("false");
         let close_to_tray = get(CLOSE_TO_TRAY_KEY).as_deref() == Some("true");
+        let minimise_on_record = get(MINIMISE_ON_RECORD_KEY).as_deref() == Some("true");
         let cursor = get(CURSOR_KEY).as_deref() != Some("false");
         let folder = get(FOLDER_KEY).map(PathBuf::from).unwrap_or_else(default_folder);
         let aspect = get(ASPECT_KEY).and_then(|a| Aspect::from_name(&a)).unwrap_or_default();
@@ -136,6 +140,7 @@ impl App {
             aspect,
             taskbar,
             close_to_tray,
+            minimise_on_record,
             hotkey: None,
             hotkey_error: None,
             tray: Tray::new(cc.egui_ctx.clone()).inspect_err(|e| log::warn!("no tray icon: {e}")).ok(),
@@ -203,7 +208,7 @@ impl App {
             }
         }
         if presses % 2 == 1 && self.selecting.is_none() {
-            self.toggle();
+            self.toggle(ctx);
         }
         let commands: Vec<tray::Command> = self.tray.as_ref().map(|(_, rx)| rx.try_iter().collect()).unwrap_or_default();
         for command in commands {
@@ -211,7 +216,7 @@ impl App {
             match command {
                 // While an area is selected the window stays hidden.
                 _ if self.selecting.is_some() => {}
-                tray::Command::Toggle => self.toggle(),
+                tray::Command::Toggle => self.toggle(ctx),
                 tray::Command::Show => {
                     if let Some(hwnd) = self.window {
                         win::show_window(hwnd, true);
@@ -224,6 +229,7 @@ impl App {
                     }
                 }
                 tray::Command::CloseToTray => self.close_to_tray = !self.close_to_tray,
+                tray::Command::MinimiseOnRecord => self.minimise_on_record = !self.minimise_on_record,
                 tray::Command::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
@@ -232,15 +238,15 @@ impl App {
         }
     }
 
-    fn toggle(&mut self) {
+    fn toggle(&mut self, ctx: &egui::Context) {
         if self.recorder.is_some() {
             self.stop();
         } else {
-            self.start();
+            self.start(ctx);
         }
     }
 
-    fn start(&mut self) {
+    fn start(&mut self, ctx: &egui::Context) {
         self.monitors = display::monitors();
         let Some(monitor) = self.monitors.get(self.monitor).cloned() else {
             self.monitor = 0;
@@ -269,6 +275,9 @@ impl App {
                 };
                 self.notice = Notice::Info(format!("{}×{}, {} fps, {encoder}", region.width, region.height, self.fps));
                 self.recorder = Some(recorder);
+                if self.minimise_on_record {
+                    self.minimise(ctx);
+                }
             }
             Err(e) => self.notice = Notice::Error(e),
         }
@@ -307,6 +316,16 @@ impl App {
     /// notification area, the one way back to a hidden window.
     fn tray_only(&self) -> bool {
         !self.taskbar && self.tray.is_some()
+    }
+
+    /// The window out of the way: hidden when it has no taskbar button
+    /// (there is nothing to minimise to, and the icon brings it back),
+    /// minimised otherwise.
+    fn minimise(&self, ctx: &egui::Context) {
+        match (self.tray_only(), self.window) {
+            (true, Some(hwnd)) => win::show_window(hwnd, false),
+            _ => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+        }
     }
 
     /// The time recorded, `00:01:23`, while recording.
@@ -434,15 +453,9 @@ impl eframe::App for App {
                     _ => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 }
             }
-            // Without a taskbar button there is nothing to minimise to: the
-            // window is hidden, and the icon brings it back.
-            let tray_only = self.tray_only();
-            let kind = if tray_only { TitleButton::Hide } else { TitleButton::Minimise };
+            let kind = if self.tray_only() { TitleButton::Hide } else { TitleButton::Minimise };
             if title_button(&mut ui.new_child(egui::UiBuilder::new().max_rect(corner(2.0))), kind) {
-                match (tray_only, self.window) {
-                    (true, Some(hwnd)) => win::show_window(hwnd, false),
-                    _ => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
-                }
+                self.minimise(&ctx);
             }
             title(ui, egui::Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.max_rect().width() - 56.0, 24.0)));
             ui.add_space(28.0);
@@ -453,7 +466,12 @@ impl eframe::App for App {
         });
 
         if let Some((tray, _)) = &self.tray {
-            tray.set(tray::Status { clock: self.clock(), tray_only: !self.taskbar, close_to_tray: self.close_to_tray });
+            tray.set(tray::Status {
+                clock: self.clock(),
+                tray_only: !self.taskbar,
+                close_to_tray: self.close_to_tray,
+                minimise_on_record: self.minimise_on_record,
+            });
         }
         // winit sets the window's style again whenever it changes its
         // state (it shows the window after the first frame, for one).
@@ -482,6 +500,7 @@ impl eframe::App for App {
         storage.set_string(AUDIO_KEY, self.audio.to_string());
         storage.set_string(TASKBAR_KEY, self.taskbar.to_string());
         storage.set_string(CLOSE_TO_TRAY_KEY, self.close_to_tray.to_string());
+        storage.set_string(MINIMISE_ON_RECORD_KEY, self.minimise_on_record.to_string());
         storage.set_string(CURSOR_KEY, self.cursor.to_string());
         storage.set_string(FOLDER_KEY, self.folder.display().to_string());
         storage.set_string(HOTKEY_KEY, self.chord.map(|c| c.label()).unwrap_or_default());
@@ -645,7 +664,7 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let clock = self.clock();
                 if record_button(ui, clock.as_deref(), self.selecting.is_none()) {
-                    self.toggle();
+                    self.toggle(&ui.ctx().clone());
                 }
             });
         });
