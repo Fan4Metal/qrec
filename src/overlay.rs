@@ -43,14 +43,23 @@ const LABEL_BACKGROUND: u32 = 0xFF_202020;
 
 /// Opens the selection over all monitors and reports what was chosen:
 /// the area, fitted to the monitor the drag started on, or `None` when
-/// cancelled or too small.
-pub fn select(monitors: Vec<Monitor>) -> mpsc::Receiver<Option<Region>> {
+/// cancelled or too small. `done` runs on the selection's thread when it
+/// closes, before the result is sent.
+pub fn select(monitors: Vec<Monitor>, done: impl FnOnce() + Send + 'static) -> mpsc::Receiver<Option<Region>> {
     let (tx, rx) = mpsc::channel();
+    let done = std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(done) as Box<dyn FnOnce() + Send>)));
+    let thread_done = done.clone();
     let spawned = std::thread::Builder::new().name("select".into()).spawn(move || {
         let result = run_selection(monitors);
+        if let Some(done) = thread_done.lock().ok().and_then(|mut d| d.take()) {
+            done();
+        }
         let _ = tx.send(result);
     });
     if spawned.is_err() {
+        if let Some(done) = done.lock().ok().and_then(|mut d| d.take()) {
+            done();
+        }
         let (tx, rx) = mpsc::channel();
         let _ = tx.send(None);
         return rx;

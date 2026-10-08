@@ -132,6 +132,18 @@ pub fn describe(e: &windows::core::Error) -> String {
     if msg.is_empty() { format!("{:#x}", e.code().0) } else { format!("{msg} ({:#x})", e.code().0) }
 }
 
+/// Hides the window, or shows it again in front of the others.
+pub fn show_window(hwnd: isize, show: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOW, SetForegroundWindow, ShowWindow};
+    let hwnd = HWND(hwnd as *mut _);
+    unsafe {
+        let _ = ShowWindow(hwnd, if show { SW_SHOW } else { SW_HIDE });
+        if show {
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+}
+
 /// The window's rectangle on the virtual screen, physical pixels:
 /// `(left, top, right, bottom)`.
 pub fn window_rect(hwnd: isize) -> (i32, i32, i32, i32) {

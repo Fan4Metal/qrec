@@ -10,12 +10,12 @@ use egui::{Color32, RichText, Vec2};
 use crate::display::{self, Monitor};
 use crate::hotkey::{Chord, Hotkey};
 use crate::overlay::{self, Border};
-use crate::recorder::{Config, Quality, Recorder};
+use crate::recorder::{self, Config, Quality, Recorder};
 use crate::region::Region;
 use crate::win;
 
 /// The window's size in points.
-pub const WINDOW_SIZE: [f32; 2] = [460.0, 318.0];
+pub const WINDOW_SIZE: [f32; 2] = [460.0, 340.0];
 
 const MONITOR_KEY: &str = "monitor";
 const REGION_KEY: &str = "region";
@@ -26,8 +26,9 @@ const CURSOR_KEY: &str = "cursor";
 const FOLDER_KEY: &str = "folder";
 const HOTKEY_KEY: &str = "hotkey";
 
-const RECORD_COLOUR: Color32 = Color32::from_rgb(0xd3, 0x2f, 0x2f);
-const STOP_COLOUR: Color32 = Color32::from_rgb(0x45, 0x45, 0x45);
+const RECORD_COLOUR: Color32 = Color32::from_rgb(0xe5, 0x39, 0x35);
+/// The dark of the icon and of the record button's ring.
+const DARK_COLOUR: Color32 = Color32::from_rgb(0x2a, 0x33, 0x40);
 
 pub struct App {
     monitors: Vec<Monitor>,
@@ -49,6 +50,8 @@ pub struct App {
     border: Option<Border>,
     selecting: Option<mpsc::Receiver<Option<Region>>>,
     notice: Notice,
+    /// The window's handle, to hide it while an area is being selected.
+    window: Option<isize>,
 }
 
 /// The status line.
@@ -78,12 +81,16 @@ impl App {
         let chord = get(HOTKEY_KEY).and_then(|h| Chord::from_label(&h)).filter(Chord::is_usable).unwrap_or_default();
 
         // The window must not appear in its own recordings.
-        {
+        let window = {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            if let Ok(RawWindowHandle::Win32(w)) = cc.window_handle().map(|h| h.as_raw()) {
-                win::exclude_from_capture(w.hwnd.get());
-                log::debug!("window at {:?}", win::window_rect(w.hwnd.get()));
+            match cc.window_handle().map(|h| h.as_raw()) {
+                Ok(RawWindowHandle::Win32(w)) => Some(w.hwnd.get()),
+                _ => None,
             }
+        };
+        if let Some(hwnd) = window {
+            win::exclude_from_capture(hwnd);
+            log::debug!("window at {:?}", win::window_rect(hwnd));
         }
 
         // Light, whatever Windows uses, like the other small tools.
@@ -105,6 +112,7 @@ impl App {
             border: None,
             selecting: None,
             notice: Notice::None,
+            window,
         };
         app.register_hotkey(&cc.egui_ctx);
         app
@@ -216,9 +224,22 @@ impl App {
         }
     }
 
-    fn select_area(&mut self) {
+    /// The selection over the screens, with the window hidden so that it
+    /// does not cover what is to be recorded. A hidden window is not
+    /// repainted, so the selection's thread shows it again itself.
+    fn select_area(&mut self, ctx: &egui::Context) {
         self.monitors = display::monitors();
-        self.selecting = Some(overlay::select(self.monitors.clone()));
+        let window = self.window;
+        if let Some(hwnd) = window {
+            win::show_window(hwnd, false);
+        }
+        let ctx = ctx.clone();
+        self.selecting = Some(overlay::select(self.monitors.clone(), move || {
+            if let Some(hwnd) = window {
+                win::show_window(hwnd, true);
+            }
+            ctx.request_repaint();
+        }));
     }
 
     /// The next key press, while the hotkey is being chosen.
@@ -243,6 +264,24 @@ impl App {
         }
     }
 
+    /// The most the recording takes: the bitrate the encoder is given,
+    /// and the file per minute with the sound. A still screen takes less.
+    fn estimate(&self) -> Option<String> {
+        let monitor = self.monitors.get(self.monitor)?;
+        let area = self.region.unwrap_or_else(|| Region::from_rect(monitor.rect));
+        let video = f64::from(recorder::bitrate(area.width, area.height, self.fps, self.quality));
+        let audio = if self.audio { f64::from(crate::encoder::AAC_BYTES_PER_SECOND) } else { 0.0 };
+        let per_minute = (video / 8.0 + audio) * 60.0 / 1e6;
+        let mbits = video / 1e6;
+        let mbits = if mbits < 10.0 { format!("{mbits:.1}").replace('.', tr!(".", ",")) } else { format!("{mbits:.0}") };
+        Some(format!(
+            "{} {mbits} {}, {per_minute:.0} {}",
+            tr!("up to", "до"),
+            tr!("Mbit/s", "Мбит/с"),
+            tr!("MB/min", "МБ/мин")
+        ))
+    }
+
     fn area_label(&self) -> String {
         match self.region {
             Some(r) => format!("{}×{} {} ({}, {})", r.width, r.height, tr!("at", "в точке"), r.x, r.y),
@@ -261,158 +300,39 @@ impl eframe::App for App {
         let recording = self.recorder.is_some();
         let busy = recording || self.selecting.is_some();
 
-        ui.add_space(6.0);
-        egui::Grid::new("settings").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
-            ui.label(tr!("Display", "Экран"));
-            ui.add_enabled_ui(!busy, |ui| {
-                let current = self.monitors.get(self.monitor).map(|m| m.label(self.monitor)).unwrap_or_default();
-                egui::ComboBox::from_id_salt("monitor").selected_text(current).width(300.0).show_ui(ui, |ui| {
-                    for (i, m) in self.monitors.iter().enumerate() {
-                        if ui.selectable_label(self.monitor == i, m.label(i)).clicked() && self.monitor != i {
-                            self.monitor = i;
-                            self.region = None;
-                        }
-                    }
-                });
+        // The bar with the area buttons, the record button and the status
+        // line sits at the bottom; the settings take the rest. The window
+        // has no title bar: a cross in the corner closes it, and the free
+        // parts of the settings area drag it.
+        let fill = ui.visuals().panel_fill;
+        egui::Panel::bottom("bar")
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(fill).inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 8 }))
+            .show(ui, |ui| self.bottom_bar(ui, busy));
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(fill).inner_margin(12)).show(ui, |ui| {
+            let drag = ui.interact(ui.max_rect(), ui.id().with("drag"), egui::Sense::click_and_drag());
+            if drag.drag_started_by(egui::PointerButton::Primary) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            // The buttons of the title row from the right: close, minimise.
+            let top_right = ui.max_rect().right_top();
+            let corner = |n: f32| egui::Rect::from_min_size(egui::pos2(top_right.x - 28.0 * n + 4.0, top_right.y), Vec2::splat(24.0));
+            if title_button(&mut ui.new_child(egui::UiBuilder::new().max_rect(corner(1.0))), TitleButton::Close) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            if title_button(&mut ui.new_child(egui::UiBuilder::new().max_rect(corner(2.0))), TitleButton::Minimise) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+            title(ui, egui::Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.max_rect().width() - 56.0, 24.0)));
+            ui.add_space(28.0);
+            egui::Frame::group(ui.style()).inner_margin(10).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.settings(ui, &ctx, recording);
             });
-            ui.end_row();
-
-            ui.label(tr!("Area", "Область"));
-            ui.horizontal(|ui| {
-                ui.add_enabled_ui(!busy, |ui| {
-                    if ui.button(tr!("Select…", "Выделить…")).clicked() {
-                        self.select_area();
-                    }
-                    if ui.add_enabled(self.region.is_some(), egui::Button::new(tr!("Whole display", "Весь экран"))).clicked() {
-                        self.region = None;
-                    }
-                });
-                ui.label(self.area_label());
-            });
-            ui.end_row();
-
-            ui.label(tr!("Frame rate", "Частота кадров"));
-            ui.add_enabled_ui(!recording, |ui| {
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.fps, 30, "30");
-                    ui.radio_value(&mut self.fps, 60, "60");
-                });
-            });
-            ui.end_row();
-
-            ui.label(tr!("Quality", "Качество"));
-            ui.add_enabled_ui(!recording, |ui| {
-                ui.horizontal(|ui| {
-                    for q in Quality::ALL {
-                        ui.radio_value(&mut self.quality, q, q.label());
-                    }
-                });
-            });
-            ui.end_row();
-
-            ui.label(tr!("Record", "Записывать"));
-            ui.add_enabled_ui(!recording, |ui| {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.audio, tr!("System sound", "Звук системы"));
-                    ui.add_space(8.0);
-                    ui.checkbox(&mut self.cursor, tr!("Pointer", "Указатель"));
-                });
-            });
-            ui.end_row();
-
-            ui.label(tr!("Folder", "Папка"));
-            ui.horizontal(|ui| {
-                let text = elide(&self.folder.display().to_string(), 36);
-                let button = ui.add_enabled(!recording, egui::Button::new(text)).on_hover_text(self.folder.display().to_string());
-                if button.clicked()
-                    && let Some(folder) = rfd::FileDialog::new().set_directory(&self.folder).pick_folder()
-                {
-                    self.folder = folder;
-                }
-                if ui.button(tr!("Open", "Открыть")).on_hover_text(tr!("Open the folder in Explorer", "Открыть папку в Проводнике")).clicked() {
-                    win::open_folder(&self.folder);
-                }
-            });
-            ui.end_row();
-
-            ui.label(tr!("Hotkey", "Клавиша"));
-            ui.horizontal(|ui| {
-                let text = if self.capturing_hotkey { tr!("Press the keys…", "Нажмите клавиши…").to_owned() } else { self.chord.label() };
-                let button = ui.add_enabled(!recording, egui::Button::new(text)).on_hover_text(tr!(
-                    "Starts and stops the recording from anywhere. Click, then press a key with Ctrl, Alt or Win, or a function key.",
-                    "Начинает и останавливает запись из любого окна. Нажмите кнопку, затем клавишу с Ctrl, Alt или Win, или функциональную клавишу."
-                ));
-                if button.clicked() {
-                    self.capturing_hotkey = !self.capturing_hotkey;
-                    if self.capturing_hotkey {
-                        // Free the key while another is chosen.
-                        self.hotkey = None;
-                    } else {
-                        self.register_hotkey(&ctx);
-                    }
-                }
-                if let Some(e) = &self.hotkey_error {
-                    // Usually another program (or another qrec) holds the key.
-                    ui.label(RichText::new(tr!("taken by another program", "занята другой программой")).color(ui.visuals().error_fg_color))
-                        .on_hover_text(e);
-                }
-            });
-            ui.end_row();
         });
 
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            let (text, colour) = if recording { (tr!("Stop", "Стоп"), STOP_COLOUR) } else { (tr!("Record", "Запись"), RECORD_COLOUR) };
-            // Room on the left for the symbol, drawn by hand: the fonts have none.
-            let button = egui::Button::new(RichText::new(format!("      {text}")).size(17.0).color(Color32::WHITE))
-                .fill(colour)
-                .min_size(Vec2::new(150.0, 38.0));
-            let response = ui.add_enabled(self.selecting.is_none(), button);
-            let centre = response.rect.left_center() + Vec2::new(24.0, 0.0);
-            if recording {
-                ui.painter().rect_filled(egui::Rect::from_center_size(centre, Vec2::splat(13.0)), 2.0, Color32::WHITE);
-            } else {
-                ui.painter().circle_filled(centre, 7.5, Color32::WHITE);
-            }
-            if response.clicked() {
-                self.toggle();
-            }
-            if let Some(recorder) = &self.recorder {
-                let elapsed = recorder.started.elapsed().as_secs();
-                let clock = format!("{:02}:{:02}:{:02}", elapsed / 3600, elapsed / 60 % 60, elapsed % 60);
-                ui.add_space(12.0);
-                ui.label(RichText::new(clock).size(22.0).monospace());
-                let dropped = recorder.dropped();
-                if dropped > 0 {
-                    ui.label(RichText::new(format!("{} {dropped}", tr!("skipped frames:", "пропущено кадров:"))).small());
-                }
-            }
-        });
-        ui.add_space(6.0);
-        match &self.notice {
-            Notice::None => {}
-            Notice::Saved(path) => {
-                ui.horizontal(|ui| {
-                    ui.label(tr!("Saved:", "Сохранено:"));
-                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    if ui.link(name).on_hover_text(tr!("Show in Explorer", "Показать в Проводнике")).clicked() {
-                        win::show_in_explorer(path);
-                    }
-                });
-            }
-            Notice::Error(e) => {
-                ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
-            }
-            Notice::Info(text) => {
-                ui.label(RichText::new(text).weak());
-            }
-        }
-
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
-            ui.label(RichText::new(format!("qrec {}", crate::VERSION)).small().weak());
-        });
+        // Without the system frame, a thin line marks the window's edge.
+        ui.painter().rect_stroke(ctx.content_rect(), 0.0, egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color), egui::StrokeKind::Inside);
 
         if busy {
             ctx.request_repaint_after(Duration::from_millis(200));
@@ -442,6 +362,300 @@ impl eframe::App for App {
         // A recording still running is completed, so the file is playable.
         self.stop();
     }
+}
+
+impl App {
+    /// The settings, a label and its controls per row.
+    fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, recording: bool) {
+        egui::Grid::new("settings").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
+            ui.label(tr!("Display", "Экран"));
+            ui.add_enabled_ui(!recording, |ui| {
+                let current = self.monitors.get(self.monitor).map(|m| m.label(self.monitor)).unwrap_or_default();
+                let width = ui.available_width();
+                egui::ComboBox::from_id_salt("monitor").selected_text(current).width(width).show_ui(ui, |ui| {
+                    for (i, m) in self.monitors.iter().enumerate() {
+                        if ui.selectable_label(self.monitor == i, m.label(i)).clicked() && self.monitor != i {
+                            self.monitor = i;
+                            self.region = None;
+                        }
+                    }
+                });
+            });
+            ui.end_row();
+
+            ui.label(tr!("Frame rate", "Частота кадров"));
+            ui.add_enabled_ui(!recording, |ui| {
+                ui.horizontal(|ui| {
+                    segmented(ui, &mut self.fps, &[(30, "30"), (60, "60")]);
+                    ui.label(RichText::new(tr!("frames per second", "кадров в секунду")).weak());
+                });
+            });
+            ui.end_row();
+
+            ui.label(tr!("Quality", "Качество"));
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!recording, |ui| {
+                    let options = Quality::ALL.map(|q| (q, q.label()));
+                    segmented(ui, &mut self.quality, &options);
+                });
+                // What the area at this rate and quality comes to.
+                if let Some(estimate) = self.estimate() {
+                    ui.label(RichText::new(estimate).small().weak()).on_hover_text(tr!(
+                        "The most the recording takes: the bitrate given to the encoder, and the file per minute with the sound. A still screen takes less.",
+                        "Наибольший объём записи: битрейт, заданный кодеру, и размер файла за минуту вместе со звуком. Неподвижный экран занимает меньше."
+                    ));
+                }
+            });
+            ui.end_row();
+
+            ui.label(tr!("Record", "Записывать"));
+            ui.add_enabled_ui(!recording, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.audio, tr!("System sound", "Звук системы"));
+                    ui.add_space(8.0);
+                    ui.checkbox(&mut self.cursor, tr!("Pointer", "Указатель"));
+                });
+            });
+            ui.end_row();
+
+            ui.label(tr!("Folder", "Папка"));
+            ui.horizontal(|ui| {
+                let text = elide(&self.folder.display().to_string(), 36);
+                let button = ui.add_enabled(!recording, egui::Button::new(text)).on_hover_text(self.folder.display().to_string());
+                if button.clicked()
+                    && let Some(folder) = rfd::FileDialog::new().set_directory(&self.folder).pick_folder()
+                {
+                    self.folder = folder;
+                }
+                if ui.button(tr!("Open", "Открыть")).on_hover_text(tr!("Open the folder in Explorer", "Открыть папку в Проводнике")).clicked() {
+                    win::open_folder(&self.folder);
+                }
+            });
+            ui.end_row();
+
+            ui.label(tr!("Hotkey", "Клавиша"));
+            ui.horizontal_wrapped(|ui| {
+                if self.capturing_hotkey {
+                    ui.label(RichText::new(tr!("Press the keys…", "Нажмите клавиши…")).color(ui.visuals().selection.bg_fill));
+                } else {
+                    ui.label(RichText::new(self.chord.label()).strong());
+                }
+                let text = if self.capturing_hotkey { tr!("Cancel", "Отмена") } else { tr!("Change", "Изменить") };
+                let button = ui.add_enabled(!recording, egui::Button::new(text)).on_hover_text(tr!(
+                    "Starts and stops the recording from anywhere. Click, then press a key with Ctrl, Alt or Win, or a function key.",
+                    "Начинает и останавливает запись из любого окна. Нажмите кнопку, затем клавишу с Ctrl, Alt или Win, или функциональную клавишу."
+                ));
+                if button.clicked() {
+                    self.capturing_hotkey = !self.capturing_hotkey;
+                    if self.capturing_hotkey {
+                        // Free the key while another is chosen.
+                        self.hotkey = None;
+                    } else {
+                        self.register_hotkey(ctx);
+                    }
+                }
+                if let Some(e) = &self.hotkey_error {
+                    // Usually another program (or another qrec) holds the key.
+                    ui.label(RichText::new(tr!("taken by another program", "занята другой программой")).color(ui.visuals().error_fg_color))
+                        .on_hover_text(e);
+                }
+            });
+            ui.end_row();
+        });
+    }
+
+    /// The area buttons, the record button with the time recorded, and
+    /// the status line: the area, the last file or what went wrong.
+    fn bottom_bar(&mut self, ui: &mut egui::Ui, busy: bool) {
+        // The row is as high as the record button from the start, so the
+        // buttons and the record button are centred on one line (a plain
+        // horizontal row centres on the height it has when each widget
+        // is placed).
+        let row = Vec2::new(ui.available_width(), BAR_HEIGHT);
+        ui.allocate_ui_with_layout(row, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_height(BAR_HEIGHT);
+            ui.add_enabled_ui(!busy, |ui| {
+                // Two halves of one choice, the current one filled: an
+                // area of its own or the whole display.
+                ui.spacing_mut().item_spacing.x = 1.0;
+                let size = Vec2::new(0.0, BAR_HEIGHT);
+                let area = self.region.is_some();
+                let r = BAR_CORNER;
+                let left = egui::CornerRadius { nw: r, sw: r, ne: 0, se: 0 };
+                let right = egui::CornerRadius { nw: 0, sw: 0, ne: r, se: r };
+                let select = choice(ui, area, tr!("Select area…", "Выделить область…"), Some(16.0)).corner_radius(left).min_size(size);
+                if ui.add(select).clicked() {
+                    self.select_area(ui.ctx());
+                }
+                let whole = choice(ui, !area, tr!("Whole display", "Весь экран"), Some(16.0)).corner_radius(right).min_size(size);
+                if ui.add(whole).clicked() {
+                    self.region = None;
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let clock = self.recorder.as_ref().map(|recorder| {
+                    let elapsed = recorder.started.elapsed().as_secs();
+                    format!("{:02}:{:02}:{:02}", elapsed / 3600, elapsed / 60 % 60, elapsed % 60)
+                });
+                if record_button(ui, clock.as_deref(), self.selecting.is_none()) {
+                    self.toggle();
+                }
+            });
+        });
+        ui.add_space(6.0);
+        // Two lines of text at most; wrapped, so a long message stays in
+        // the window.
+        let height = ui.text_style_height(&egui::TextStyle::Body) * 2.0 + 4.0;
+        ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), height), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+            ui.set_min_height(height);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            match &self.notice {
+                Notice::None => {
+                    ui.label(RichText::new(self.area_label()).weak());
+                }
+                Notice::Saved(path) => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(tr!("Saved:", "Сохранено:"));
+                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        if ui.link(name).on_hover_text(tr!("Show in Explorer", "Показать в Проводнике")).clicked() {
+                            win::show_in_explorer(path);
+                        }
+                    });
+                }
+                Notice::Error(e) => {
+                    ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
+                }
+                Notice::Info(text) => {
+                    let dropped = self.recorder.as_ref().map_or(0, Recorder::dropped);
+                    let text = if dropped > 0 {
+                        format!("{text}, {} {dropped}", tr!("skipped frames:", "пропущено кадров:"))
+                    } else {
+                        text.clone()
+                    };
+                    ui.label(RichText::new(text).weak());
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
+                ui.label(RichText::new(format!("qrec {}", crate::VERSION)).small().weak());
+            });
+        });
+    }
+}
+
+/// The name in the top left corner, its `q` in the dark of the icon
+/// and its `rec` in the red of the record dot. Only painted, so it
+/// drags the window like the rest of the free area.
+fn title(ui: &egui::Ui, rect: egui::Rect) {
+    let painter = ui.painter_at(rect);
+    let font = egui::FontId::proportional(18.0);
+    let mut job = egui::text::LayoutJob::default();
+    job.append("q", 0.0, egui::TextFormat::simple(font.clone(), DARK_COLOUR));
+    job.append("rec", 0.0, egui::TextFormat::simple(font, RECORD_COLOUR));
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
+    painter.galley(pos, galley, DARK_COLOUR);
+}
+
+/// The height of the area buttons and of the record button.
+const BAR_HEIGHT: f32 = 42.0;
+/// The rounding of their corners.
+const BAR_CORNER: u8 = 6;
+
+/// A button that is one of the values of a choice: filled with the
+/// selection colour when it is the current one.
+fn choice(ui: &egui::Ui, selected: bool, text: &str, size: Option<f32>) -> egui::Button<'static> {
+    let selection = ui.visuals().selection;
+    let text = size.map_or_else(|| RichText::new(text), |size| RichText::new(text).size(size));
+    if selected {
+        egui::Button::new(text.color(selection.stroke.color)).fill(selection.bg_fill)
+    } else {
+        egui::Button::new(text)
+    }
+}
+
+/// A few values side by side as one control, the current one filled.
+fn segmented<T: Copy + PartialEq>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 1.0;
+        let last = options.len().saturating_sub(1);
+        for (i, &(v, text)) in options.iter().enumerate() {
+            let r = 4;
+            let corner = egui::CornerRadius {
+                nw: if i == 0 { r } else { 0 },
+                sw: if i == 0 { r } else { 0 },
+                ne: if i == last { r } else { 0 },
+                se: if i == last { r } else { 0 },
+            };
+            let button = choice(ui, *value == v, text, None).corner_radius(corner).min_size(Vec2::new(44.0, 0.0));
+            if ui.add(button).clicked() {
+                *value = v;
+            }
+        }
+    });
+}
+
+/// The record button: red, with a white dot and the word; while
+/// recording, a white square, the stop, and the time recorded. True
+/// when clicked.
+fn record_button(ui: &mut egui::Ui, clock: Option<&str>, enabled: bool) -> bool {
+    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(150.0, BAR_HEIGHT), sense);
+    let fill = if !enabled {
+        RECORD_COLOUR.gamma_multiply(0.5)
+    } else if response.hovered() {
+        Color32::from_rgb(0xf0, 0x4a, 0x45)
+    } else {
+        RECORD_COLOUR
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, BAR_CORNER, fill);
+    let (text, font) = match clock {
+        Some(clock) => (clock.to_owned(), egui::FontId::monospace(18.0)),
+        None => (tr!("RECORD", "ЗАПИСЬ").to_owned(), egui::FontId::proportional(17.0)),
+    };
+    let galley = painter.layout_no_wrap(text, font, Color32::WHITE);
+    // The mark and the text, centred together.
+    let (mark, gap) = (14.0, 10.0);
+    let left = rect.center().x - (mark + gap + galley.size().x) / 2.0;
+    let centre = egui::pos2(left + mark / 2.0, rect.center().y);
+    if clock.is_some() {
+        painter.rect_filled(egui::Rect::from_center_size(centre, Vec2::splat(mark - 2.0)), 2.0, Color32::WHITE);
+    } else {
+        painter.circle_filled(centre, mark / 2.0, Color32::WHITE);
+    }
+    painter.galley(egui::pos2(left + mark + gap, rect.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
+    let hint = if clock.is_some() { tr!("Stop", "Стоп") } else { tr!("Record", "Запись") };
+    response.on_hover_text(hint).clicked()
+}
+
+#[derive(Clone, Copy)]
+enum TitleButton {
+    Minimise,
+    Close,
+}
+
+/// A 24 x 24 button of the title row: a dash that minimises or a cross
+/// that closes, as the dialogs of qview have it. True when clicked.
+fn title_button(ui: &mut egui::Ui, kind: TitleButton) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(24.0), egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 3.0, visuals.bg_fill);
+    }
+    let (c, r) = (rect.center(), 5.0);
+    let stroke = egui::Stroke::new(1.5, visuals.fg_stroke.color);
+    let hint = match kind {
+        TitleButton::Minimise => {
+            ui.painter().line_segment([c + Vec2::new(-r, 0.0), c + Vec2::new(r, 0.0)], stroke);
+            tr!("Minimise", "Свернуть")
+        }
+        TitleButton::Close => {
+            ui.painter().line_segment([c + Vec2::new(-r, -r), c + Vec2::new(r, r)], stroke);
+            ui.painter().line_segment([c + Vec2::new(-r, r), c + Vec2::new(r, -r)], stroke);
+            tr!("Close", "Закрыть")
+        }
+    };
+    response.on_hover_text(hint).clicked()
 }
 
 /// The Videos folder, or the current directory.

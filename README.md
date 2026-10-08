@@ -47,14 +47,14 @@ Requirements: Windows 10 version 2004 or later, 64-bit. On earlier builds of Win
 | Setting | Meaning |
 |---|---|
 | Display | The monitor to record, when there are several. The area belongs to one monitor. |
-| Area | **Select…** dims the screen; the area is drawn with the left mouse button, `Esc` or the right button cancels. **Whole display** records the monitor entirely. The area is remembered between runs. |
+| Area | **Select…** hides the window and dims the screen; the area is drawn with the left mouse button, `Esc` or the right button cancels. **Whole display** records the monitor entirely. The current choice of the two is highlighted. The area is remembered between runs. |
 | Frame rate | 30 or 60 frames per second. A still screen costs nothing extra: the last image is repeated. |
-| Quality | Low, Medium or High: about 0.05, 0.1 or 0.2 bits per pixel and frame. 1920×1080 at 30 frames per second comes to about 3, 6 or 12 Mbit/s. |
+| Quality | Low, Medium or High: about 0.05, 0.1 or 0.2 bits per pixel and frame. 1920×1080 at 30 frames per second comes to about 3, 6 or 12 Mbit/s. Beside the buttons, the window shows the most the chosen area takes, in Mbit/s and in megabytes per minute with the sound; a still screen takes less. |
 | Record | **System sound**: what the computer plays. **Pointer**: the mouse pointer. |
 | Folder | Where the files go; `Videos` by default. **Open** shows the folder in Explorer. |
-| Hotkey | Starts and stops the recording from any window. A click on the button, then a key with `Ctrl`, `Alt` or `Win`, or a function key, sets another one; `Esc` keeps the current one. A combination held by another program is reported as not available. |
+| Hotkey | Starts and stops the recording from any window. A click on **Change**, then a key with `Ctrl`, `Alt` or `Win`, or a function key, sets another one; `Esc` or **Cancel** keeps the current one. A combination held by another program is reported as not available. |
 
-**Record** starts the recording and turns into **Stop**; the time recorded is shown beside it, and the number of frames skipped if the computer could not keep up. A red frame surrounds the area while it is recorded. The file is named by the date and time, `qrec_2026-10-08_16-45-12.mp4`, and after the recording its name appears in the window as a link that shows it in Explorer.
+**Record** starts the recording; while it runs, the button shows the time recorded and stops the recording when clicked. The number of frames skipped, if the computer could not keep up, appears below. A red frame surrounds the area while it is recorded. The file is named by the date and time, `qrec_2026-10-08_16-45-12.mp4`, and after the recording its name appears in the window as a link that shows it in Explorer.
 
 The area is cut to the monitor it was started on, its sides are made even (as H.264 requires), and it is at least 64 pixels on each side. The whole display is recorded when the area is outside the monitor, for instance after the displays were rearranged.
 

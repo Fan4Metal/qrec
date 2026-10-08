@@ -42,7 +42,7 @@ pub struct AudioConfig {
 
 /// Bytes per second of the AAC stream, one of the values Microsoft's
 /// encoder offers (192 kbit/s).
-const AAC_BYTES_PER_SECOND: u32 = 24000;
+pub const AAC_BYTES_PER_SECOND: u32 = 24000;
 
 pub struct Encoder {
     video: Mutex<VideoEncoder>,

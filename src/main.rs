@@ -82,6 +82,8 @@ fn main() -> eframe::Result {
             .with_inner_size(app::WINDOW_SIZE)
             .with_resizable(false)
             .with_maximize_button(false)
+            // The title row is the program's own: the name, minimise and close.
+            .with_decorations(false)
             .with_icon(embedded_icon()),
         renderer: eframe::Renderer::Glow,
         centered: true,

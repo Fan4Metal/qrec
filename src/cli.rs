@@ -87,7 +87,7 @@ pub fn test_select() -> i32 {
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetSystemMetrics, PostMessageW, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
     use windows::core::w;
     let monitors = display::monitors();
-    let rx = crate::overlay::select(monitors);
+    let rx = crate::overlay::select(monitors, || {});
     let hwnd = (0..50).find_map(|_| {
         std::thread::sleep(std::time::Duration::from_millis(50));
         unsafe { FindWindowW(w!("qrec_select"), None) }.ok()
