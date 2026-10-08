@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::audio::Loopback;
+use crate::audio::{Loopback, Source};
 use crate::capture::{Capturer, PollError};
 use crate::convert::Converter;
 use crate::cursor::CursorDrawer;
@@ -81,7 +81,8 @@ pub struct Config {
     pub region: Region,
     pub fps: u32,
     pub quality: Quality,
-    pub audio: bool,
+    /// Whose sound is recorded; `None` for none.
+    pub audio: Option<Source>,
     /// Draw the pointer into the frames.
     pub cursor: bool,
     pub path: PathBuf,
@@ -190,10 +191,17 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
         let local = config.region.relative_to(origin);
         let mut capturer = Capturer::new(&config.monitor, local)
             .map_err(|e| format!("{}: {}", tr!("screen capture", "захват экрана"), win::describe(&e)))?;
-        let loopback = if config.audio {
-            Some(Loopback::open().map_err(|e| format!("{}: {}", tr!("audio capture", "захват звука"), win::describe(&e)))?)
-        } else {
-            None
+        let audio_error = |e: windows::core::Error| format!("{}: {}", tr!("audio capture", "захват звука"), win::describe(&e));
+        let loopback = match &config.audio {
+            None => None,
+            Some(Source::System) => Some(Loopback::open().map_err(audio_error)?),
+            Some(Source::App { program, boost }) => {
+                let name = crate::sessions::stem(program);
+                let root = crate::sessions::find(program)
+                    .ok_or_else(|| tr!(format!("{name} is not running"), format!("Программа {name} не запущена")))?;
+                log::debug!("audio: {program}, process {root}");
+                Some(Loopback::open_app(root, *boost).map_err(audio_error)?)
+            }
         };
         let (width, height) = (config.region.width, config.region.height);
         let video = VideoConfig { width, height, fps: config.fps, bitrate: bitrate(width, height, config.fps, config.quality) };

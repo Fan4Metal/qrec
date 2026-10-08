@@ -7,17 +7,19 @@ use std::time::Duration;
 
 use egui::{Color32, RichText, Vec2};
 
+use crate::audio::Source;
 use crate::display::{self, Monitor};
 use crate::hotkey::{Chord, Hotkey};
 use crate::i18n::LangChoice;
 use crate::overlay::{self, Border};
 use crate::recorder::{self, Config, Quality, Recorder};
 use crate::region::{Aspect, Region};
+use crate::sessions;
 use crate::tray::{self, Tray};
 use crate::win;
 
 /// The window's size in points.
-pub const WINDOW_SIZE: [f32; 2] = [460.0, 368.0];
+pub const WINDOW_SIZE: [f32; 2] = [460.0, 398.0];
 /// The window's corners, painted over a transparent window (as Windows 11
 /// rounds its own).
 const CORNER_RADIUS: f32 = 8.0;
@@ -27,6 +29,8 @@ const REGION_KEY: &str = "region";
 const FPS_KEY: &str = "fps";
 const QUALITY_KEY: &str = "quality";
 const AUDIO_KEY: &str = "audio";
+const AUDIO_APP_KEY: &str = "audio_app";
+const AUDIO_BOOST_KEY: &str = "audio_boost";
 const CURSOR_KEY: &str = "cursor";
 const FOLDER_KEY: &str = "folder";
 const HOTKEY_KEY: &str = "hotkey";
@@ -52,6 +56,18 @@ pub struct App {
     fps: u32,
     quality: Quality,
     audio: bool,
+    /// The program whose sound is recorded, by its executable's full path
+    /// (or its file name, as `--audio-app` takes it); `None` for the
+    /// whole system.
+    audio_app: Option<String>,
+    /// Whether the program's sound is brought to full volume, whatever
+    /// its volume in the Volume Mixer.
+    boost: bool,
+    /// The programs that play sound, as last listed.
+    apps: Vec<sessions::App>,
+    /// Whether `apps` was listed since the list was opened, so it is
+    /// listed once each time it opens.
+    apps_listed: bool,
     cursor: bool,
     folder: PathBuf,
     /// `None` when the hotkey was removed.
@@ -111,6 +127,10 @@ impl App {
         };
         let quality = get(QUALITY_KEY).and_then(|q| Quality::from_name(&q)).unwrap_or_default();
         let audio = get(AUDIO_KEY).as_deref() != Some("false");
+        let audio_app = get(AUDIO_APP_KEY).filter(|a| !a.is_empty());
+        let boost = get(AUDIO_BOOST_KEY).as_deref() != Some("false");
+        // For the name of the program chosen.
+        let apps = if audio_app.is_some() { sessions::apps() } else { Vec::new() };
         let taskbar = get(TASKBAR_KEY).as_deref() != Some("false");
         let close_to_tray = get(CLOSE_TO_TRAY_KEY).as_deref() == Some("true");
         let minimise_on_record = get(MINIMISE_ON_RECORD_KEY).as_deref() == Some("true");
@@ -147,6 +167,10 @@ impl App {
             fps,
             quality,
             audio,
+            audio_app,
+            boost,
+            apps,
+            apps_listed: false,
             cursor,
             folder,
             chord,
@@ -286,7 +310,11 @@ impl App {
             return;
         }
         let path = unique_path(&self.folder);
-        let config = Config { monitor, region, fps: self.fps, quality: self.quality, audio: self.audio, cursor: self.cursor, path };
+        let audio = self.audio.then(|| match &self.audio_app {
+            Some(program) => Source::App { program: program.clone(), boost: self.boost },
+            None => Source::System,
+        });
+        let config = Config { monitor, region, fps: self.fps, quality: self.quality, audio, cursor: self.cursor, path };
         match Recorder::start(config) {
             Ok(recorder) => {
                 self.border = Some(Border::show(region));
@@ -497,6 +525,12 @@ impl App {
         }
     }
 
+    /// How the program whose sound is recorded is named: its description
+    /// when it was listed, or the name of its executable.
+    fn app_name<'a>(&'a self, program: &'a str) -> &'a str {
+        self.apps.iter().find(|a| a.path.eq_ignore_ascii_case(program)).map_or_else(|| sessions::stem(program), |a| a.name.as_str())
+    }
+
     fn area_label(&self) -> String {
         match self.region {
             Some(r) => format!("{}×{} {} ({}, {})", r.width, r.height, tr!("at", "в точке"), r.x, r.y),
@@ -602,6 +636,8 @@ impl eframe::App for App {
         storage.set_string(FPS_KEY, self.fps.to_string());
         storage.set_string(QUALITY_KEY, self.quality.name().to_owned());
         storage.set_string(AUDIO_KEY, self.audio.to_string());
+        storage.set_string(AUDIO_APP_KEY, self.audio_app.clone().unwrap_or_default());
+        storage.set_string(AUDIO_BOOST_KEY, self.boost.to_string());
         storage.set_string(TASKBAR_KEY, self.taskbar.to_string());
         storage.set_string(CLOSE_TO_TRAY_KEY, self.close_to_tray.to_string());
         storage.set_string(MINIMISE_ON_RECORD_KEY, self.minimise_on_record.to_string());
@@ -676,11 +712,15 @@ impl App {
             ui.label(tr!("Record", "Записывать"));
             ui.add_enabled_ui(!recording, |ui| {
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.audio, tr!("System sound", "Звук системы"));
+                    ui.checkbox(&mut self.audio, tr!("Sound", "Звук"));
                     ui.add_space(8.0);
                     ui.checkbox(&mut self.cursor, tr!("Pointer", "Указатель"));
                 });
             });
+            ui.end_row();
+
+            ui.label(tr!("Sound from", "Источник звука"));
+            ui.add_enabled_ui(!recording && self.audio, |ui| self.audio_source(ui));
             ui.end_row();
 
             ui.label(tr!("Folder", "Папка"));
@@ -736,6 +776,61 @@ impl App {
             });
             ui.end_row();
         });
+    }
+
+    /// The list of whose sound is recorded: the whole system, or one of
+    /// the programs that have played sound since they started (their
+    /// sessions in the Volume Mixer), listed again each time it opens;
+    /// and, at the right, whether a program's sound is boosted.
+    fn audio_source(&mut self, ui: &mut egui::Ui) {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let boost = ui.add_enabled(self.audio_app.is_some(), egui::Checkbox::new(&mut self.boost, tr!("Boost", "Усиление")));
+            boost.on_hover_text(tr!(
+                "On: the program's sound is recorded at full volume, whatever its volume in the Volume Mixer (up to 100 times louder); a muted program is still silent. Off: it is recorded as it is heard.",
+                "Включено: звук программы записывается на полной громкости, какой бы ни была её громкость в микшере (усиление до 100 раз); выключенная в микшере программа всё равно записывается тишиной. Выключено: звук записывается так, как слышится."
+            ))
+            .on_disabled_hover_text(tr!("Only for the sound of one program.", "Только для звука одной программы."));
+            self.audio_list(ui);
+        });
+    }
+
+    fn audio_list(&mut self, ui: &mut egui::Ui) {
+        let system = tr!("Whole system", "Вся система");
+        let selected = match &self.audio_app {
+            Some(exe) => self.app_name(exe).to_owned(),
+            None => system.to_owned(),
+        };
+        let mut choice = self.audio_app.clone();
+        let mut open = false;
+        let width = ui.available_width();
+        let combo = egui::ComboBox::from_id_salt("audio_source").selected_text(elide(&selected, 40)).width(width).show_ui(ui, |ui| {
+            open = true;
+            if !self.apps_listed {
+                self.apps = sessions::apps();
+                self.apps_listed = true;
+            }
+            ui.selectable_value(&mut choice, None, system);
+            ui.separator();
+            if self.apps.is_empty() {
+                ui.weak(tr!("No program has played sound", "Ни одна программа не воспроизводила звук"));
+            }
+            for app in &self.apps {
+                // The programs playing now in the normal colour.
+                let text = if app.active { RichText::new(&app.name) } else { RichText::new(&app.name).weak() };
+                let selected = choice.as_ref().is_some_and(|c| c.eq_ignore_ascii_case(&app.path));
+                if ui.selectable_label(selected, text).on_hover_text(&app.path).clicked() {
+                    choice = Some(app.path.clone());
+                }
+            }
+        });
+        combo.response.on_hover_text(tr!(
+            "The whole system: everything the computer plays, at the volume it is played. A program: only its sound, with Boost at full volume whatever its volume in the Volume Mixer. The program must be running when the recording starts.",
+            "Вся система: всё, что воспроизводит компьютер, с той громкостью, с которой оно звучит. Программа: только её звук, с «Усилением» на полной громкости, какой бы ни была её громкость в микшере. Программа должна быть запущена к началу записи."
+        ));
+        if !open {
+            self.apps_listed = false;
+        }
+        self.audio_app = choice;
     }
 
     /// The area buttons, the record button with the time recorded, and

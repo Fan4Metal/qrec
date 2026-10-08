@@ -1,18 +1,25 @@
 //! What the computer plays, through WASAPI loopback: no "Stereo Mix" and
 //! no virtual cable.
 //!
-//! Two ways, the first that works wins:
+//! The sound of the whole system comes two ways, the first that works
+//! wins:
 //!
 //! - *Process loopback* (Windows 10 2004 and later): the virtual loopback
 //!   device, asked for everything except this process. The format is the
-//!   program's choice (16-bit stereo at 48 kHz, exactly what the encoder
-//!   wants), the stream runs on while nothing plays, and it works where
-//!   capture on the endpoint itself is refused.
+//!   program's choice (32-bit float stereo at 48 kHz, turned into the
+//!   16-bit samples the encoder takes), the stream runs on while nothing
+//!   plays, and it works where capture on the endpoint itself is refused.
 //! - *Endpoint loopback*: the default output device opened for capture.
 //!   The packets come in the device's mix format (floating point as a
 //!   rule) and are turned into 16-bit stereo. Such a stream only delivers
 //!   packets while something is rendered, so a silent render stream on
 //!   the same device keeps it flowing.
+//!
+//! The sound of one program is the process loopback asked for that
+//! program's process tree, brought to full volume when it is boosted: the
+//! volume of its sessions in the Volume Mixer is undone
+//! ([`sessions::Volume`]); floating point keeps a quiet program's sound
+//! whole until then.
 //!
 //! Either way the packets carry performance counter timestamps, and the
 //! recorder fills any gap with silence.
@@ -26,14 +33,16 @@ use windows::Win32::Media::Audio::{
     AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
     ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
     IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient, IAudioRenderClient,
-    IMMDeviceEnumerator, MMDeviceEnumerator, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
-    VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eConsole, eRender,
+    IMMDeviceEnumerator, MMDeviceEnumerator, PROCESS_LOOPBACK_MODE, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eConsole, eRender,
 };
 use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0};
 use windows::Win32::System::Com::{BLOB, CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId};
 use windows::Win32::System::Variant::VT_BLOB;
 use windows::core::{GUID, IUnknown, Interface, Ref, Result, implement};
+
+use crate::sessions;
 
 const WAVE_FORMAT_PCM: u16 = 1;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
@@ -43,6 +52,17 @@ const SUBTYPE_IEEE_FLOAT: GUID = GUID::from_u128(0x00000003_0000_0010_8000_00aa0
 
 /// The format asked of the process loopback.
 const PROCESS_RATE: u32 = 48000;
+
+/// Whose sound is recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// Everything the computer plays, but this program.
+    System,
+    /// One program, by the full path of its executable or by its file
+    /// name (`firefox.exe`), with its child processes; with `boost`, at
+    /// full volume whatever its volume in the Volume Mixer.
+    App { program: String, boost: bool },
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Samples {
@@ -69,6 +89,10 @@ pub struct Loopback {
     samples: Samples,
     block_align: usize,
     scratch: Vec<i16>,
+    /// The volume to undo, for one program.
+    volume: Option<sessions::Volume>,
+    /// The gain of the last packet, where the next one starts.
+    gain: f32,
     /// How the stream was opened, for the log.
     pub method: &'static str,
 }
@@ -87,7 +111,8 @@ impl Loopback {
     /// Opens the system's audio for capture: the process loopback, or
     /// the default output device when that is not available.
     pub fn open() -> Result<Loopback> {
-        match Self::open_process() {
+        let own = unsafe { GetCurrentProcessId() };
+        match Self::open_process(own, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE) {
             Ok(loopback) => Ok(loopback),
             Err(e) => {
                 log::warn!("process loopback not available ({e}); trying the endpoint");
@@ -96,12 +121,24 @@ impl Loopback {
         }
     }
 
-    fn open_process() -> Result<Loopback> {
+    /// Opens the sound of the process tree from `root` (see
+    /// [`sessions::find`]); with `boost`, at full volume. There is nothing
+    /// to fall back to: without the process loopback this fails.
+    pub fn open_app(root: u32, boost: bool) -> Result<Loopback> {
+        let mut loopback = Self::open_process(root, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE)?;
+        if boost {
+            let mut volume = sessions::Volume::new(root);
+            loopback.gain = volume.gain();
+            loopback.volume = Some(volume);
+        }
+        loopback.method = if boost { "process loopback of one program, boosted" } else { "process loopback of one program" };
+        Ok(loopback)
+    }
+
+    fn open_process(pid: u32, mode: PROCESS_LOOPBACK_MODE) -> Result<Loopback> {
         let mut params = AUDIOCLIENT_ACTIVATION_PARAMS { ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, ..Default::default() };
-        params.Anonymous.ProcessLoopbackParams = AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
-            TargetProcessId: unsafe { GetCurrentProcessId() },
-            ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
-        };
+        params.Anonymous.ProcessLoopbackParams =
+            AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS { TargetProcessId: pid, ProcessLoopbackMode: mode };
         let blob = BLOB {
             cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
             pBlobData: (&mut params as *mut AUDIOCLIENT_ACTIVATION_PARAMS).cast(),
@@ -132,12 +169,12 @@ impl Loopback {
         };
         log::debug!("process loopback: activated");
         let format = WAVEFORMATEX {
-            wFormatTag: WAVE_FORMAT_PCM,
+            wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
             nChannels: 2,
             nSamplesPerSec: PROCESS_RATE,
-            nAvgBytesPerSec: PROCESS_RATE * 4,
-            nBlockAlign: 4,
-            wBitsPerSample: 16,
+            nAvgBytesPerSec: PROCESS_RATE * 8,
+            nBlockAlign: 8,
+            wBitsPerSample: 32,
             cbSize: 0,
         };
         unsafe {
@@ -168,9 +205,11 @@ impl Loopback {
             event: Some(event),
             rate: PROCESS_RATE,
             channels: 2,
-            samples: Samples::Int16,
-            block_align: 4,
+            samples: Samples::Float32,
+            block_align: 8,
             scratch: Vec::new(),
+            volume: None,
+            gain: 1.0,
             method: "process loopback",
         })
     }
@@ -211,6 +250,8 @@ impl Loopback {
                 samples,
                 block_align,
                 scratch: Vec::new(),
+                volume: None,
+                gain: 1.0,
                 method: "endpoint loopback",
             })
         })();
@@ -241,8 +282,14 @@ impl Loopback {
     }
 
     /// Hands every packet waiting in the buffer to `f`, in order, and
-    /// tops up the silent render stream.
+    /// tops up the silent render stream. The sound of one program is
+    /// brought to full volume, the gain moving across a packet when the
+    /// volume has changed since the last one.
     pub fn drain(&mut self, mut f: impl FnMut(Packet)) -> Result<()> {
+        let target = self.volume.as_mut().map_or(1.0, sessions::Volume::gain);
+        if target != self.gain {
+            log::debug!("audio: gain {target:.2} (volume {:.0} %)", 100.0 / target);
+        }
         loop {
             let packet = unsafe { self.capture.GetNextPacketSize()? };
             if packet == 0 {
@@ -255,8 +302,9 @@ impl Loopback {
             self.scratch.resize(frames * 2, 0);
             if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 && !data.is_null() {
                 let bytes = unsafe { std::slice::from_raw_parts(data, frames * self.block_align) };
-                convert(bytes, self.channels, self.samples, &mut self.scratch);
+                convert(bytes, self.channels, self.samples, (self.gain, target), &mut self.scratch);
             }
+            self.gain = target;
             f(Packet { samples: &self.scratch, qpc: qpc as i64 });
             unsafe { self.capture.ReleaseBuffer(frames as u32)? };
         }
@@ -342,23 +390,25 @@ unsafe fn parse_format(format: *const WAVEFORMATEX) -> Result<(u32, usize, Sampl
 }
 
 /// Frames of the device's format into interleaved 16-bit stereo: the
-/// first two channels (a mono device fills both).
-fn convert(bytes: &[u8], channels: usize, samples: Samples, out: &mut [i16]) {
+/// first two channels (a mono device fills both), multiplied by a gain
+/// that goes from `gain.0` to `gain.1` across the frames. What goes past
+/// full scale is clipped.
+fn convert(bytes: &[u8], channels: usize, samples: Samples, gain: (f32, f32), out: &mut [i16]) {
     let frames = out.len() / 2;
-    let sample = |frame: usize, channel: usize| -> i16 {
+    let step = (gain.1 - gain.0) / frames.max(1) as f32;
+    let sample = |frame: usize, channel: usize, gain: f32| -> i16 {
         let i = frame * channels + channel;
-        match samples {
-            Samples::Float32 => {
-                let v = f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
-                (v.clamp(-1.0, 1.0) * 32767.0) as i16
-            }
-            Samples::Int16 => i16::from_le_bytes(bytes[i * 2..i * 2 + 2].try_into().unwrap()),
-            Samples::Int32 => (i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()) >> 16) as i16,
-        }
+        let v = match samples {
+            Samples::Float32 => f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()) * 32767.0,
+            Samples::Int16 => f32::from(i16::from_le_bytes(bytes[i * 2..i * 2 + 2].try_into().unwrap())),
+            Samples::Int32 => (i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()) >> 16) as f32,
+        };
+        (v * gain).clamp(-32768.0, 32767.0) as i16
     };
     for frame in 0..frames {
-        let left = sample(frame, 0);
-        let right = if channels > 1 { sample(frame, 1) } else { left };
+        let gain = gain.0 + step * (frame + 1) as f32;
+        let left = sample(frame, 0, gain);
+        let right = if channels > 1 { sample(frame, 1, gain) } else { left };
         out[frame * 2] = left;
         out[frame * 2 + 1] = right;
     }
@@ -378,7 +428,7 @@ mod tests {
         let frames: Vec<f32> = vec![0.5, -0.5, 1.5, 0.0];
         let bytes: Vec<u8> = frames.iter().flat_map(|f| f.to_le_bytes()).collect();
         let mut out = vec![0i16; 4];
-        convert(&bytes, 2, Samples::Float32, &mut out);
+        convert(&bytes, 2, Samples::Float32, (1.0, 1.0), &mut out);
         assert_eq!(out, vec![16383, -16383, 32767, 0]);
     }
 
@@ -386,7 +436,19 @@ mod tests {
     fn mono_is_doubled() {
         let bytes: Vec<u8> = [100i16, -100].iter().flat_map(|s| s.to_le_bytes()).collect();
         let mut out = vec![0i16; 4];
-        convert(&bytes, 1, Samples::Int16, &mut out);
+        convert(&bytes, 1, Samples::Int16, (1.0, 1.0), &mut out);
         assert_eq!(out, vec![100, 100, -100, -100]);
+    }
+
+    #[test]
+    fn gain_moves_across_the_packet() {
+        let frames: Vec<f32> = vec![0.01; 8];
+        let bytes: Vec<u8> = frames.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let mut out = vec![0i16; 8];
+        convert(&bytes, 2, Samples::Float32, (1.0, 5.0), &mut out);
+        assert_eq!(out, vec![655, 655, 983, 983, 1310, 1310, 1638, 1638]);
+        // A quiet program at full volume: clipped, not wrapped.
+        convert(&bytes, 2, Samples::Float32, (400.0, 400.0), &mut out);
+        assert_eq!(out, vec![32767; 8]);
     }
 }

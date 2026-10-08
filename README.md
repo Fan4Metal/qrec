@@ -25,6 +25,7 @@ qrec records a rectangle of the screen, or a whole display, to an MP4 file: H.26
 - **An area or a display**: the area is drawn with the mouse over a dimmed screen, freely or in the proportions 16:9 or 1:1, and remembered; a red frame marks it while it is recorded.
 - **Hardware encoding**: H.264 by the NVIDIA, Intel or AMD encoder of the graphics card through Media Foundation, with Microsoft's software encoder as the fallback; frames go from the screen to the encoder without leaving the graphics card.
 - **The sound of the computer without "Stereo Mix"**: whatever is played is captured through WASAPI loopback and written as AAC; no virtual cable or driver is needed.
+- **The sound of one program**: instead of the whole system, the sound of a single program can be recorded, and with **Boost** at full volume, whatever its volume in the Volume Mixer.
 - **The pointer** is drawn into the recording, including the inverted I-beam.
 - **Three settings**: 30 or 60 frames per second, a quality of three steps (the bitrate follows the size of the area), and whether sound and the pointer are recorded.
 - **A hotkey**: `Ctrl+Alt+R` by default, changed in the window by pressing another combination, or removed.
@@ -41,7 +42,7 @@ The installer, `qrec_<version>_Setup.exe`, needs no administrator rights: the pr
 
 The portable archive, `qrec_<version>_portable.zip`, contains the program in a `qrec` folder and runs without installation. It also contains an empty `app.ron` file: while it lies beside `qrec.exe`, the settings are kept in that folder, so the program can be carried on a removable drive (the folder must be writable); without it they are kept in `%APPDATA%\qrec`, as for the installed program.
 
-Requirements: Windows 10 version 2004 or later, 64-bit. On earlier builds of Windows 10 the program runs, but the sound is captured from the default output device instead of through the process loopback (see [Sound](#sound)), and the windows of qrec may appear in the recording.
+Requirements: Windows 10 version 2004 or later, 64-bit. On earlier builds of Windows 10 the program runs, but the sound is captured from the default output device instead of through the process loopback (see [Sound](#sound)), the sound of one program cannot be recorded, and the windows of qrec may appear in the recording.
 
 ## Usage
 
@@ -52,7 +53,8 @@ Requirements: Windows 10 version 2004 or later, 64-bit. On earlier builds of Win
 | Area | **Select…** hides the window and dims the screen; the area is drawn with the left mouse button, `Esc` or the right button cancels. **Whole display** records the monitor entirely. The current choice of the two is highlighted. The area is remembered between runs. |
 | Frame rate | 30 or 60 frames per second. A still screen costs nothing extra: the last image is repeated. |
 | Quality | Low, Medium or High: about 0.05, 0.1 or 0.2 bits per pixel and frame. 1920×1080 at 30 frames per second comes to about 3, 6 or 12 Mbit/s. Beside the buttons, the window shows the most the chosen area takes, in Mbit/s and in megabytes per minute with the sound; a still screen takes less. |
-| Record | **System sound**: what the computer plays. **Pointer**: the mouse pointer. |
+| Record | **Sound**: the sound, from the source below. **Pointer**: the mouse pointer. |
+| Sound from | **Whole system**: everything the computer plays, at the volume it is played. Or one of the programs that have played sound since they started (those of the Volume Mixer; the ones playing now are shown brighter): only its sound. **Boost**, beside the list, records it at full volume whatever its volume in the mixer; without it the program is recorded as it is heard (see [Sound](#sound)). Two programs of one name (two copies of a browser) are told apart by the folder they are in, `Vivaldi (VP)`. The program is remembered by the path of its executable and must be running when a recording starts; when it runs more than once, the copy that plays at that moment is recorded. |
 | Folder | Where the files go; `Videos` by default. **Open** shows the folder in Explorer. |
 | Hotkey | Starts and stops the recording from any window. A click on **Change**, then a key with `Ctrl`, `Alt` or `Win`, or a function key, sets another one; `Esc` or **Cancel** keeps the current one; the cross beside **Change** removes the hotkey. A combination held by another program is reported as not available. |
 
@@ -68,7 +70,9 @@ Closing the window during a recording completes the file first.
 
 ## Sound
 
-The sound is captured with the *process loopback* of Windows 10 version 2004 and later: the audio engine delivers everything that is played by other programs, in 16-bit stereo at 48 kHz, regardless of the output device and without "Stereo Mix" or a virtual cable. qrec's own sounds, if any, are left out. Programs that play in WASAPI exclusive mode bypass the audio engine and are not captured.
+The sound is captured with the *process loopback* of Windows 10 version 2004 and later: the audio engine delivers everything that is played by other programs, in floating-point stereo at 48 kHz, regardless of the output device and without "Stereo Mix" or a virtual cable. qrec's own sounds, if any, are left out. Programs that play in WASAPI exclusive mode bypass the audio engine and are not captured.
+
+The sound of one program is the process loopback of that program and its child processes (a browser plays from a child process). The audio engine delivers it after the program's volume in the Volume Mixer: at 25 % it is 12 dB quieter, as it is heard. With **Boost**, qrec follows that volume during the recording and divides the sound by it, so the program is recorded as at 100 %, and a change of the volume during the recording does not reach the file. Up to 1 % is undone (a gain of up to 100); a program muted in the mixer is recorded as silence. The device's master volume does not reach the capture when the device applies it in hardware; otherwise the recording follows it. When a program has several sessions at different volumes, the loudest one is taken.
 
 On earlier builds of Windows 10, the default output device is opened for loopback capture instead, which captures what is played through that device.
 
@@ -84,10 +88,10 @@ The audio and the video share one clock, the performance counter of Windows: a p
 ## Command line
 
 ```
-qrec.exe --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality low|medium|high] [--no-audio] [--no-cursor] [--out FILE]
+qrec.exe --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality low|medium|high] [--no-audio | --audio-app NAME.exe [--no-boost]] [--no-cursor] [--out FILE]
 ```
 
-Records without the window for the given number of seconds, from a console: `--region` is on the virtual screen (physical pixels), `--monitor` counts from 1 with the primary display first, and the defaults are the whole primary display, 30 frames per second, medium quality, with sound and the pointer, into `qrec_<date>_<time>.mp4` in the current folder.
+Records without the window for the given number of seconds, from a console: `--region` is on the virtual screen (physical pixels), `--monitor` counts from 1 with the primary display first, `--audio-app` records the sound of one program, named by its executable (`firefox.exe`) or its full path, boosted unless `--no-boost` is given, and the defaults are the whole primary display, 30 frames per second, medium quality, with sound and the pointer, into `qrec_<date>_<time>.mp4` in the current folder.
 
 ## Building
 

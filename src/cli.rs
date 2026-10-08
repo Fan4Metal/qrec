@@ -1,9 +1,11 @@
 //! `qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N]
-//! [--quality low|medium|high] [--no-audio] [--out FILE]`: a recording
-//! without the window, for checking the pipeline from a console.
+//! [--quality low|medium|high] [--no-audio | --audio-app NAME.exe
+//! [--no-boost]] [--out FILE]`: a recording without the window, for checking the
+//! pipeline from a console.
 
 use std::path::PathBuf;
 
+use crate::audio::Source;
 use crate::display;
 use crate::recorder::{Config, Quality, Recorder};
 use crate::region::Region;
@@ -26,7 +28,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
     let mut monitor_index = 0usize;
     let mut fps = 30u32;
     let mut quality = Quality::Medium;
-    let mut audio = true;
+    let mut audio = Some(Source::System);
+    let mut boost = true;
     let mut cursor = true;
     let mut out: Option<PathBuf> = None;
     let mut border = false;
@@ -38,7 +41,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--monitor" => monitor_index = value()?.parse::<usize>().map_err(|e| e.to_string())?.saturating_sub(1),
             "--fps" => fps = value()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?,
             "--quality" => quality = Quality::from_name(&value()?).ok_or("--quality wants low, medium or high")?,
-            "--no-audio" => audio = false,
+            "--no-audio" => audio = None,
+            "--audio-app" => audio = Some(Source::App { program: value()?, boost: true }),
+            "--no-boost" => boost = false,
             "--no-cursor" => cursor = false,
             "--border" => border = true,
             "--out" => out = Some(PathBuf::from(value()?)),
@@ -46,7 +51,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             s => return Err(format!("unknown argument {s}")),
         }
     }
-    let seconds = seconds.ok_or("usage: qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality Q] [--no-audio] [--out FILE]")?;
+    let seconds = seconds.ok_or("usage: qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality Q] [--no-audio | --audio-app NAME.exe [--no-boost]] [--out FILE]")?;
+    if let Some(Source::App { boost: b, .. }) = &mut audio {
+        *b = boost;
+    }
 
     let monitors = display::monitors();
     let monitor = monitors.get(monitor_index).ok_or_else(|| format!("no display {}", monitor_index + 1))?.clone();
@@ -55,8 +63,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
         .fit(monitor.rect)
         .ok_or("the area does not fit the display or is too small")?;
     let path = out.unwrap_or_else(|| PathBuf::from(format!("qrec_{}.mp4", win::local_time_stamp())));
+    let sound = match &audio {
+        None => "off".to_owned(),
+        Some(Source::System) => "of the system".to_owned(),
+        Some(Source::App { program, boost: true }) => format!("of {program}, boosted"),
+        Some(Source::App { program, boost: false }) => format!("of {program}"),
+    };
     let config = Config { monitor, region, fps, quality, audio, cursor, path: path.clone() };
-    eprintln!("recording {}x{} at ({}, {}) for {seconds} s, {fps} fps, {} quality, audio {}", region.width, region.height, region.x, region.y, quality.name(), if audio { "on" } else { "off" });
+    eprintln!("recording {}x{} at ({}, {}) for {seconds} s, {fps} fps, {} quality, sound {sound}", region.width, region.height, region.x, region.y, quality.name());
 
     let recorder = Recorder::start(config)?;
     let _border = border.then(|| crate::overlay::Border::show(region));
