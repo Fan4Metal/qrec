@@ -1,0 +1,70 @@
+[package]
+name = "qrec"
+version = "0.1.0-dev"
+authors = ["Fan4_Metal"]
+edition = "2024"
+description = "Simple screen area recorder for Windows"
+license = "MIT"
+repository = "https://github.com/Fan4Metal/qrec"
+
+[dependencies]
+# glow, not the default wgpu: a smaller binary and a faster start for a
+# window of a few controls. eframe default features are off (no accesskit).
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "persistence"] }
+egui = "0.36"
+rfd = { version = "0.17.2", default-features = false }
+raw-window-handle = "0.6"
+log = "0.4"
+env_logger = "0.11"
+# The 256 px layer of the icon (src/icon.rs, also run by build.rs).
+png = "0.18"
+
+[target.'cfg(windows)'.dependencies]
+# COM-heavy APIs (Direct3D 11, DXGI, Media Foundation, WASAPI): the
+# `windows` crate with its interface wrappers, not the raw `windows-sys`.
+windows = { version = "0.62", features = [
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Media_MediaFoundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# The `implement` macro for COM callbacks expands to paths in this crate.
+windows-core = "0.62"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+png = "0.18"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

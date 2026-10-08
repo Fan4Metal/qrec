@@ -1,0 +1,51 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project
+
+qrec is a Windows-only screen area recorder, written in Rust with egui/eframe 0.36 and the `windows` crate. It records a rectangle of one monitor to an MP4 (H.264, AAC) with the sound the computer plays and the pointer, from a window of a few options and a global hotkey. Priorities: a minimal interface, no external runtime (no FFmpeg, no .NET), hardware encoding when the GPU has it. `README.md` / `README.ru.md` are the user-facing docs and must be kept in sync (both languages, cross-linked, formal tone, no imperatives).
+
+## Commands
+
+```
+cargo build --release                  # target\release\qrec.exe
+cargo test                             # unit tests (geometry, settings round trips, audio conversion, cursor masks, H.264 parameter sets, icon)
+cargo clippy --all-targets             # must stay warning-free
+python tools/make_release.py           # tests, release build, dist\qrec_<ver>_Setup.exe (Inno Setup 6, tools/setup.iss) and _portable.zip
+python tools/make_release.py --no-tests --install   # the same, then installs it silently over the installed copy
+$env:QREC_TRACE=1; .\target\debug\qrec.exe          # what the recording does, on stderr (debug build has a console)
+.\target\debug\qrec.exe --record 5 --region 100,100,1280,720 [--monitor 2] [--fps 60] [--quality high] [--no-audio] [--no-cursor] [--border] [--out file.mp4]
+                                       # a recording without the window, from a console; checks the pipeline end to end
+.\target\debug\qrec.exe --test-select  # opens the selection overlay and drives it with posted mouse messages (the screen dims for a moment)
+.\target\debug\qrec.exe --export-icon file.ico|file.png   # the app icon for the installer / the README
+cargo run --example wasapi_probe       # whether WASAPI capture streams can be opened on this machine (see Architecture: audio)
+cargo run --example process_loopback   # whether the process loopback works and delivers timestamps
+```
+
+## Architecture
+
+The recording is a pipeline of threads started by `recorder::Recorder::start`:
+
+- **`capture.rs`**: Desktop Duplication of one monitor on the adapter that drives it. Only the recorded area is copied out of each frame, into a BGRA texture of the area's size (`Capturer::frame`). Frames come only when the desktop changes; a frame that only reports a pointer move is not copied. The pointer position and shape are kept in `Capturer::cursor`. `DXGI_ERROR_ACCESS_LOST` (a mode change, the secure desktop) is reported as `PollError::AccessLost` and the recorder recreates the duplication, encoding the last frame meanwhile. HDR displays (16-bit float frames) are refused with a message. Rotated displays come in their native orientation.
+- **`cursor.rs`**: the pointer drawn into a copy of the frame by a pixel shader (compiled at run time with `D3DCompile`), over a patch of the frame copied from under it, so monochrome (AND/XOR) and masked-colour shapes invert or XOR correctly. The captured frame stays clean so a still desktop does not leave pointer trails.
+- **`convert.rs`**: BGRA to NV12 with the Direct3D 11 video processor (auto-processing off, RGB full range to BT.709 studio), into a pool of NV12 textures. A pooled texture is reused only when its COM reference count is back to the idle value, so a texture still held by the encoder is never overwritten; the pool grows when all are busy (it stays at 4 with the direct encoder).
+- **`venc.rs`**: the H.264 encoder as a Media Foundation transform driven directly (hardware ones are asynchronous: `METransformNeedInput` / `METransformHaveOutput` events are pumped on each frame; the software one is synchronous and gets frames read back to system memory). Why not let the sink writer encode: it then queues about two seconds of *input* frames per stream for interleaving, each a texture in video memory (68 textures at 30 fps, 138 at 60; measured, independent of `MF_LOW_LATENCY` and of the encoder). With compressed samples the sink writer queues bytes instead.
+- **`encoder.rs`**: the MP4 file through the sink writer with throttling disabled: the H.264 stream passed through (its media type gets `MF_MT_MPEG_SEQUENCE_HEADER` from the SPS/PPS of the first sample when the encoder did not set it), the AAC stream encoded by the sink writer from 16-bit stereo PCM. The file is opened with the first encoded frame; audio that comes earlier waits in `pending_audio`.
+- **`audio.rs`**: WASAPI loopback. *Process loopback* first (`ActivateAudioInterfaceAsync` with `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK`, excluding this process's tree; Windows 10 2004+): the format is the program's choice (48 kHz 16-bit stereo), the stream runs on while nothing plays, packets carry QPC timestamps. The endpoint loopback (`AUDCLNT_STREAMFLAGS_LOOPBACK` on the default output, with a silent render stream to keep packets flowing) is the fallback. On the development machine every endpoint *capture* stream, loopback or microphone, fails with `E_INVALIDARG` from `Initialize` (confirmed with the `wasapi` crate and PyAudioWPatch too), while the process loopback works: the fallback is untested here. The `PROPVARIANT` of the activation parameters is wrapped in `ManuallyDrop`: the crate's `PROPVARIANT` clears itself on drop, which would free the blob pointer into the stack (heap corruption, exit code 0xC0000374).
+- **`recorder.rs`**: the clock is `QueryPerformanceCounter` in 100 ns units (`win::qpc_100ns`), shared by video ticks and WASAPI packet timestamps. The video thread encodes at a fixed rate (a tick every 1/fps with the last frame; ticks skipped when behind, counted as `dropped`). The audio thread writes packets at their own timestamps and fills gaps over 30 ms with silence, trims overlaps. Bitrate = pixels × fps × bits-per-pixel of the quality (0.05 / 0.1 / 0.2), clamped to 0.5..60 Mbit/s.
+- **`overlay.rs`**: two Win32 windows on their own threads. The selection covers the virtual screen with a per-pixel-alpha layered window (`UpdateLayeredWindowIndirect` with a dirty rectangle; a DIB of the whole virtual screen), takes mouse coordinates from the messages (so `--test-select` can post them), and fits the drag to the monitor it started on (`Region::fit`: even sides, at least 64 px). The frame around the recorded area is a colour-keyed layered window, click-through, 3 px outside the area. Both are excluded from capture.
+- **`hotkey.rs`**: `RegisterHotKey` on a thread with a message loop; the chord is chosen in the window by pressing keys (`Chord::from_egui`), letters, digits and F1–F12 only, and must have a modifier unless it is a function key.
+- **`app.rs`**: the egui window; `display.rs` lists the monitors from DXGI (`\\.\DISPLAYn` identifies one between runs); `region.rs` is the geometry; `win.rs` the Win32 helpers; `i18n.rs` the `tr!` macro; `icon.rs` the procedural icon (also compiled by `build.rs` for the `.ico` and the window icon); `cli.rs` the command line modes.
+
+Every window of the program (the main one, the selection, the frame) is excluded from captures with `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`, which Desktop Duplication honours; `QREC_NO_EXCLUDE=1` leaves them visible, to look at them in a recording.
+
+## Conventions
+
+- Every user-visible string goes through `tr!("English", "Русский")`; the language follows the Windows UI language. Log messages stay English.
+- Persisted state (eframe storage, `%APPDATA%\qrec\data\app.ron`, or `app.ron` beside the exe when that file exists: portable mode): `monitor` (device name), `region` (`x,y,w,h` on the virtual screen, empty for the whole display), `fps` (`30`/`60`), `quality` (`low`/`medium`/`high`), `audio`, `cursor`, `folder`, `hotkey` (`Ctrl+Alt+R`).
+- The release profile has `panic = "abort"` and no console; a panic shows a message box (`install_panic_hook`). The C runtime is linked statically (`.cargo/config.toml`).
+- The version comes from `Cargo.toml` (`main::VERSION`, shown in the window). Between releases it is the next version with `-dev`, and `build.rs` appends `git describe --tags --always`. Release: drop `-dev`, commit, tag `vX.Y.Z` (release.yml checks the tag against `Cargo.toml`), then set the next `-dev` version.
+- COM: worker threads initialise the MTA (`win::com_init_mta`); Media Foundation, WASAPI and DXGI objects are used across the recording threads under the encoder's locks. The `windows` crate (not `windows-sys`) is used for its interface wrappers; `windows-core` is a direct dependency only because `#[implement]` expands to paths in it.
+- GUI checks without a user: the window's OpenGL client area cannot be captured with `PrintWindow`/`BitBlt` on an NVIDIA machine, but a recording *can* show it with `QREC_NO_EXCLUDE=1`: start the window in the background, run `--record` on its area (the window logs `window at (l, t, r, b)` with `QREC_TRACE=1`), extract a frame with ffmpeg and look at the PNG. The same shows the selection overlay (`--test-select` while a recording runs) and the recording frame (`--record --border` while a second recording covers a larger area). Close test windows with `taskkill /PID` (WM_CLOSE, which saves the settings), never leave one open: a launched qrec window takes the focus and the hotkey. Coordinates from a non-DPI-aware tool (PowerShell's `Cursor.Position`) are logical, not physical: multiply by the display scale.
+- Measurements on the development machine (i7-13700KF, RTX 4070 Ti SUPER, 3840×2160 at 150 % scaling, Windows 10 22H2): NVIDIA H.264 Encoder MFT is found and asynchronous; 1280×720 at 60 fps with audio runs with 0 skipped frames in a debug build; the first frame is written within about 100 ms of start.
