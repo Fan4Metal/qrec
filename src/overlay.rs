@@ -33,7 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, w};
 
 use crate::display::{self, Monitor};
-use crate::region::{Rect, Region};
+use crate::region::{Aspect, Rect, Region};
 use crate::win;
 
 /// Alpha of the veil over the parts not selected.
@@ -42,15 +42,15 @@ const WHITE: u32 = 0xFF_FFFFFF;
 const LABEL_BACKGROUND: u32 = 0xFF_202020;
 
 /// Opens the selection over all monitors and reports what was chosen:
-/// the area, fitted to the monitor the drag started on, or `None` when
-/// cancelled or too small. `done` runs on the selection's thread when it
+/// the area, of the proportions `aspect` and fitted to the monitor the
+/// drag started on, or `None` when cancelled or too small. `done` runs on the selection's thread when it
 /// closes, before the result is sent.
-pub fn select(monitors: Vec<Monitor>, done: impl FnOnce() + Send + 'static) -> mpsc::Receiver<Option<Region>> {
+pub fn select(monitors: Vec<Monitor>, aspect: Aspect, done: impl FnOnce() + Send + 'static) -> mpsc::Receiver<Option<Region>> {
     let (tx, rx) = mpsc::channel();
     let done = std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(done) as Box<dyn FnOnce() + Send>)));
     let thread_done = done.clone();
     let spawned = std::thread::Builder::new().name("select".into()).spawn(move || {
-        let result = run_selection(monitors);
+        let result = run_selection(monitors, aspect);
         if let Some(done) = thread_done.lock().ok().and_then(|mut d| d.take()) {
             done();
         }
@@ -69,6 +69,7 @@ pub fn select(monitors: Vec<Monitor>, done: impl FnOnce() + Send + 'static) -> m
 
 struct Selection {
     monitors: Vec<Monitor>,
+    aspect: Aspect,
     origin: (i32, i32),
     size: (i32, i32),
     dc: HDC,
@@ -84,11 +85,25 @@ struct Selection {
     done: bool,
 }
 
+impl Selection {
+    /// The rectangle dragged from the start to `end`, and what is recorded
+    /// of it: fitted to the monitor the drag started on, or `None` when
+    /// too small. `None` before the drag.
+    fn dragged(&self, end: (i32, i32)) -> Option<(Region, Option<Region>)> {
+        let start = self.start?;
+        let free = Region::from_drag(start, end);
+        let monitor = display::monitor_at(&self.monitors, start.0, start.1).or_else(|| display::monitor_of(&self.monitors, &free.rect()));
+        let Some(monitor) = monitor else { return Some((free, None)) };
+        let region = Region::drag(start, end, self.aspect, monitor.rect);
+        Some((region, region.fit(monitor.rect)))
+    }
+}
+
 thread_local! {
     static SELECTION: RefCell<Option<Selection>> = const { RefCell::new(None) };
 }
 
-fn run_selection(monitors: Vec<Monitor>) -> Option<Region> {
+fn run_selection(monitors: Vec<Monitor>, aspect: Aspect) -> Option<Region> {
     unsafe {
         let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok()?;
         let class = w!("qrec_select");
@@ -145,6 +160,7 @@ fn run_selection(monitors: Vec<Monitor>) -> Option<Region> {
         SELECTION.with(|s| {
             *s.borrow_mut() = Some(Selection {
                 monitors,
+                aspect,
                 origin,
                 size,
                 dc,
@@ -232,11 +248,8 @@ unsafe extern "system" fn selection_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             let finished = SELECTION.with(|s| {
                 let mut s = s.borrow_mut();
                 let Some(s) = s.as_mut() else { return false };
-                let Some(start) = s.start else { return false };
-                let region = Region::from_drag(start, pos);
-                let monitor = display::monitor_at(&s.monitors, start.0, start.1)
-                    .or_else(|| display::monitor_of(&s.monitors, &region.rect()));
-                s.result = monitor.and_then(|m| region.fit(m.rect));
+                let Some((_, fitted)) = s.dragged(pos) else { return false };
+                s.result = fitted;
                 s.done = true;
                 true
             });
@@ -310,8 +323,9 @@ fn paint_selection(hwnd: HWND, all: bool) {
         }
         let (w, h) = s.size;
         let whole = Rect { left: 0, top: 0, right: w, bottom: h };
-        let selection = s.start.map(|start| {
-            let r = Region::from_drag(start, s.current).rect();
+        let dragged = s.dragged(s.current);
+        let selection = dragged.map(|(region, _)| {
+            let r = region.rect();
             Rect { left: r.left - s.origin.0, top: r.top - s.origin.1, right: r.right - s.origin.0, bottom: r.bottom - s.origin.1 }
         });
         // The hint at the top of the monitor the pointer is on.
@@ -325,12 +339,7 @@ fn paint_selection(hwnd: HWND, all: bool) {
         });
         let label = selection.map(|r| {
             // The size that will be recorded: fitted to the monitor, even.
-            let fitted = s.start.and_then(|start| {
-                let region = Region::from_drag(start, s.current);
-                let monitor = display::monitor_at(&s.monitors, start.0, start.1)
-                    .or_else(|| display::monitor_of(&s.monitors, &region.rect()));
-                monitor.and_then(|m| region.fit(m.rect))
-            });
+            let fitted = dragged.and_then(|(_, fitted)| fitted);
             let text = match fitted {
                 Some(f) => format!("{} × {}", f.width, f.height),
                 None => format!("{} × {} ({})", r.width(), r.height(), tr!("too small", "слишком мало")),
@@ -346,7 +355,12 @@ fn paint_selection(hwnd: HWND, all: bool) {
             }
             (Rect { left, top, right: left + tw + 16, bottom: top + th + 8 }, text)
         });
-        let mut touched = union(selection, hint_rect);
+        // The white outline lies outside the selection: it belongs to what
+        // this paint touches, or a new edge more than a pixel away from the
+        // last one would be drawn but not shown.
+        const OUTLINE: i32 = 2;
+        let outline = selection.map(|r| Rect { left: r.left - OUTLINE, top: r.top - OUTLINE, right: r.right + OUTLINE, bottom: r.bottom + OUTLINE });
+        let mut touched = union(outline, hint_rect);
         touched = union(touched, label.as_ref().map(|l| l.0));
         let dirty = if all { Some(whole) } else { union(s.painted, touched) };
         let Some(dirty) = dirty.and_then(|d| d.intersect(&whole)) else { return };
@@ -362,12 +376,11 @@ fn paint_selection(hwnd: HWND, all: bool) {
         fill(dirty, DIM);
         if let Some(r) = selection {
             fill(r, 0);
-            let b = 2;
+            let b = OUTLINE;
             fill(Rect { left: r.left - b, top: r.top - b, right: r.right + b, bottom: r.top }, WHITE);
             fill(Rect { left: r.left - b, top: r.bottom, right: r.right + b, bottom: r.bottom + b }, WHITE);
             fill(Rect { left: r.left - b, top: r.top, right: r.left, bottom: r.bottom }, WHITE);
             fill(Rect { left: r.right, top: r.top, right: r.right + b, bottom: r.bottom }, WHITE);
-            touched = union(touched, Some(Rect { left: r.left - b, top: r.top - b, right: r.right + b, bottom: r.bottom + b }));
         }
         let mut boxes = Vec::new();
         if let Some(r) = hint_rect {

@@ -22,7 +22,7 @@ qrec records a rectangle of the screen, or a whole display, to an MP4 file: H.26
 
 ## Features
 
-- **An area or a display**: the area is drawn with the mouse over a dimmed screen and remembered; a red frame marks it while it is recorded.
+- **An area or a display**: the area is drawn with the mouse over a dimmed screen, freely or in the proportions 16:9 or 1:1, and remembered; a red frame marks it while it is recorded.
 - **Hardware encoding**: H.264 by the NVIDIA, Intel or AMD encoder of the graphics card through Media Foundation, with Microsoft's software encoder as the fallback; frames go from the screen to the encoder without leaving the graphics card.
 - **The sound of the computer without "Stereo Mix"**: whatever is played is captured through WASAPI loopback and written as AAC; no virtual cable or driver is needed.
 - **The pointer** is drawn into the recording, including the inverted I-beam.
@@ -47,6 +47,7 @@ Requirements: Windows 10 version 2004 or later, 64-bit. On earlier builds of Win
 | Setting | Meaning |
 |---|---|
 | Display | The monitor to record, when there are several. The area belongs to one monitor. |
+| Proportions | **Free**, **16:9** or **1:1**: the shape of the area drawn with the mouse. A 16:9 area changes in steps of 2 pixels, its height rounded to the even number H.264 needs, so it is within a pixel of 16:9 and exact where the ratio allows it (1280×720, 1920×1080); a 1:1 area is a square. The corner where the drag starts stays in place, and the area stops at the edge of the monitor. An area already chosen takes the new proportions around its centre. |
 | Area | **Select…** hides the window and dims the screen; the area is drawn with the left mouse button, `Esc` or the right button cancels. **Whole display** records the monitor entirely. The current choice of the two is highlighted. The area is remembered between runs. |
 | Frame rate | 30 or 60 frames per second. A still screen costs nothing extra: the last image is repeated. |
 | Quality | Low, Medium or High: about 0.05, 0.1 or 0.2 bits per pixel and frame. 1920×1080 at 30 frames per second comes to about 3, 6 or 12 Mbit/s. Beside the buttons, the window shows the most the chosen area takes, in Mbit/s and in megabytes per minute with the sound; a still screen takes less. |

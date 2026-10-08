@@ -11,11 +11,11 @@ use crate::display::{self, Monitor};
 use crate::hotkey::{Chord, Hotkey};
 use crate::overlay::{self, Border};
 use crate::recorder::{self, Config, Quality, Recorder};
-use crate::region::Region;
+use crate::region::{Aspect, Region};
 use crate::win;
 
 /// The window's size in points.
-pub const WINDOW_SIZE: [f32; 2] = [460.0, 340.0];
+pub const WINDOW_SIZE: [f32; 2] = [460.0, 368.0];
 
 const MONITOR_KEY: &str = "monitor";
 const REGION_KEY: &str = "region";
@@ -25,6 +25,7 @@ const AUDIO_KEY: &str = "audio";
 const CURSOR_KEY: &str = "cursor";
 const FOLDER_KEY: &str = "folder";
 const HOTKEY_KEY: &str = "hotkey";
+const ASPECT_KEY: &str = "aspect";
 
 const RECORD_COLOUR: Color32 = Color32::from_rgb(0xe5, 0x39, 0x35);
 /// The dark of the icon and of the record button's ring.
@@ -44,6 +45,8 @@ pub struct App {
     chord: Chord,
     hotkey: Option<(Hotkey, mpsc::Receiver<()>)>,
     hotkey_error: Option<String>,
+    /// The proportions of the next area selected.
+    aspect: Aspect,
     /// The next key press becomes the hotkey.
     capturing_hotkey: bool,
     recorder: Option<Recorder>,
@@ -78,6 +81,7 @@ impl App {
         let audio = get(AUDIO_KEY).as_deref() != Some("false");
         let cursor = get(CURSOR_KEY).as_deref() != Some("false");
         let folder = get(FOLDER_KEY).map(PathBuf::from).unwrap_or_else(default_folder);
+        let aspect = get(ASPECT_KEY).and_then(|a| Aspect::from_name(&a)).unwrap_or_default();
         let chord = get(HOTKEY_KEY).and_then(|h| Chord::from_label(&h)).filter(Chord::is_usable).unwrap_or_default();
 
         // The window must not appear in its own recordings.
@@ -105,6 +109,7 @@ impl App {
             cursor,
             folder,
             chord,
+            aspect,
             hotkey: None,
             hotkey_error: None,
             capturing_hotkey: false,
@@ -234,7 +239,7 @@ impl App {
             win::show_window(hwnd, false);
         }
         let ctx = ctx.clone();
-        self.selecting = Some(overlay::select(self.monitors.clone(), move || {
+        self.selecting = Some(overlay::select(self.monitors.clone(), self.aspect, move || {
             if let Some(hwnd) = window {
                 win::show_window(hwnd, true);
             }
@@ -280,6 +285,16 @@ impl App {
             tr!("Mbit/s", "Мбит/с"),
             tr!("MB/min", "МБ/мин")
         ))
+    }
+
+    /// The area already chosen takes the new proportions around its
+    /// centre, so what is shown is what will be recorded.
+    fn apply_aspect(&mut self) {
+        let (Some(region), Some(monitor)) = (self.region, self.monitors.get(self.monitor)) else { return };
+        if let Some(fitted) = region.with_aspect(self.aspect, monitor.rect) {
+            self.region = Some(fitted);
+            self.notice = Notice::None;
+        }
     }
 
     fn area_label(&self) -> String {
@@ -356,6 +371,7 @@ impl eframe::App for App {
         storage.set_string(CURSOR_KEY, self.cursor.to_string());
         storage.set_string(FOLDER_KEY, self.folder.display().to_string());
         storage.set_string(HOTKEY_KEY, self.chord.label());
+        storage.set_string(ASPECT_KEY, self.aspect.name().to_owned());
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -380,6 +396,17 @@ impl App {
                         }
                     }
                 });
+            });
+            ui.end_row();
+
+            ui.label(tr!("Proportions", "Пропорции"));
+            ui.add_enabled_ui(!recording, |ui| {
+                let before = self.aspect;
+                let options = Aspect::ALL.map(|a| (a, aspect_label(a)));
+                segmented(ui, &mut self.aspect, &options);
+                if self.aspect != before {
+                    self.apply_aspect();
+                }
             });
             ui.end_row();
 
@@ -560,6 +587,14 @@ fn title(ui: &egui::Ui, rect: egui::Rect) {
 const BAR_HEIGHT: f32 = 42.0;
 /// The rounding of their corners.
 const BAR_CORNER: u8 = 6;
+
+/// How the proportions are named in the window.
+fn aspect_label(aspect: Aspect) -> &'static str {
+    match aspect {
+        Aspect::Free => tr!("Free", "Свободные"),
+        other => other.name(),
+    }
+}
 
 /// A button that is one of the values of a choice: filled with the
 /// selection colour when it is the current one.
