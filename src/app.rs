@@ -16,6 +16,9 @@ use crate::win;
 
 /// The window's size in points.
 pub const WINDOW_SIZE: [f32; 2] = [460.0, 368.0];
+/// The window's corners, painted over a transparent window (as Windows 11
+/// rounds its own).
+const CORNER_RADIUS: f32 = 8.0;
 
 const MONITOR_KEY: &str = "monitor";
 const REGION_KEY: &str = "region";
@@ -318,13 +321,21 @@ impl eframe::App for App {
         // The bar with the area buttons, the record button and the status
         // line sits at the bottom; the settings take the rest. The window
         // has no title bar: a cross in the corner closes it, and the free
-        // parts of the settings area drag it.
-        let fill = ui.visuals().panel_fill;
+        // parts of the settings area drag it. The window is transparent: the
+        // panels have no fill of their own, one rounded background with a
+        // thin line at its edge is under both.
+        ui.painter().rect(
+            ctx.content_rect(),
+            CORNER_RADIUS,
+            ui.visuals().panel_fill,
+            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            egui::StrokeKind::Inside,
+        );
         egui::Panel::bottom("bar")
             .show_separator_line(false)
-            .frame(egui::Frame::new().fill(fill).inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 8 }))
+            .frame(egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 8 }))
             .show(ui, |ui| self.bottom_bar(ui, busy));
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(fill).inner_margin(12)).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(12)).show(ui, |ui| {
             let drag = ui.interact(ui.max_rect(), ui.id().with("drag"), egui::Sense::click_and_drag());
             if drag.drag_started_by(egui::PointerButton::Primary) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
@@ -346,18 +357,15 @@ impl eframe::App for App {
             });
         });
 
-        // Without the system frame, a thin line marks the window's edge.
-        ui.painter().rect_stroke(ctx.content_rect(), 0.0, egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color), egui::StrokeKind::Inside);
-
         if busy {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
 
-    /// eframe clears to near-black by default; the panel colour of the
-    /// theme keeps the window light.
-    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-        visuals.panel_fill.to_normalized_gamma_f32()
+    /// Transparent, so the corners outside the rounded background show what
+    /// is behind the window.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
