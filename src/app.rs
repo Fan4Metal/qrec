@@ -31,6 +31,7 @@ const FOLDER_KEY: &str = "folder";
 const HOTKEY_KEY: &str = "hotkey";
 const ASPECT_KEY: &str = "aspect";
 const TASKBAR_KEY: &str = "taskbar";
+const CLOSE_TO_TRAY_KEY: &str = "close_to_tray";
 
 const RECORD_COLOUR: Color32 = Color32::from_rgb(0xe5, 0x39, 0x35);
 /// The dark of the icon and of the record button's ring.
@@ -58,6 +59,9 @@ pub struct App {
     /// Whether the window has a button on the taskbar; without one it is
     /// reached from the icon in the notification area.
     taskbar: bool,
+    /// Whether the window's cross hides the window instead of closing the
+    /// program.
+    close_to_tray: bool,
     /// The next key press becomes the hotkey.
     capturing_hotkey: bool,
     recorder: Option<Recorder>,
@@ -94,6 +98,7 @@ impl App {
         let quality = get(QUALITY_KEY).and_then(|q| Quality::from_name(&q)).unwrap_or_default();
         let audio = get(AUDIO_KEY).as_deref() != Some("false");
         let taskbar = get(TASKBAR_KEY).as_deref() != Some("false");
+        let close_to_tray = get(CLOSE_TO_TRAY_KEY).as_deref() == Some("true");
         let cursor = get(CURSOR_KEY).as_deref() != Some("false");
         let folder = get(FOLDER_KEY).map(PathBuf::from).unwrap_or_else(default_folder);
         let aspect = get(ASPECT_KEY).and_then(|a| Aspect::from_name(&a)).unwrap_or_default();
@@ -130,6 +135,7 @@ impl App {
             chord,
             aspect,
             taskbar,
+            close_to_tray,
             hotkey: None,
             hotkey_error: None,
             tray: Tray::new(cc.egui_ctx.clone()).inspect_err(|e| log::warn!("no tray icon: {e}")).ok(),
@@ -217,6 +223,7 @@ impl App {
                         win::set_taskbar_button(hwnd, !self.tray_only(), true);
                     }
                 }
+                tray::Command::CloseToTray => self.close_to_tray = !self.close_to_tray,
                 tray::Command::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
@@ -417,8 +424,15 @@ impl eframe::App for App {
             // The buttons of the title row from the right: close, minimise.
             let top_right = ui.max_rect().right_top();
             let corner = |n: f32| egui::Rect::from_min_size(egui::pos2(top_right.x - 28.0 * n + 4.0, top_right.y), Vec2::splat(24.0));
-            if title_button(&mut ui.new_child(egui::UiBuilder::new().max_rect(corner(1.0))), TitleButton::Close) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            // Only the cross hides the window: Alt+F4 and WM_CLOSE from
+            // outside (the installer, a shutdown) still close the program.
+            let hide_on_close = self.close_to_tray && self.tray.is_some();
+            let kind = if hide_on_close { TitleButton::CloseToTray } else { TitleButton::Close };
+            if title_button(&mut ui.new_child(egui::UiBuilder::new().max_rect(corner(1.0))), kind) {
+                match (hide_on_close, self.window) {
+                    (true, Some(hwnd)) => win::show_window(hwnd, false),
+                    _ => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                }
             }
             // Without a taskbar button there is nothing to minimise to: the
             // window is hidden, and the icon brings it back.
@@ -439,7 +453,7 @@ impl eframe::App for App {
         });
 
         if let Some((tray, _)) = &self.tray {
-            tray.set(self.clock().as_deref(), !self.taskbar);
+            tray.set(tray::Status { clock: self.clock(), tray_only: !self.taskbar, close_to_tray: self.close_to_tray });
         }
         // winit sets the window's style again whenever it changes its
         // state (it shows the window after the first frame, for one).
@@ -467,6 +481,7 @@ impl eframe::App for App {
         storage.set_string(QUALITY_KEY, self.quality.name().to_owned());
         storage.set_string(AUDIO_KEY, self.audio.to_string());
         storage.set_string(TASKBAR_KEY, self.taskbar.to_string());
+        storage.set_string(CLOSE_TO_TRAY_KEY, self.close_to_tray.to_string());
         storage.set_string(CURSOR_KEY, self.cursor.to_string());
         storage.set_string(FOLDER_KEY, self.folder.display().to_string());
         storage.set_string(HOTKEY_KEY, self.chord.map(|c| c.label()).unwrap_or_default());
@@ -773,11 +788,12 @@ enum TitleButton {
     Minimise,
     Hide,
     Close,
+    CloseToTray,
 }
 
 /// A 24 x 24 button of the title row: a dash that minimises (or hides
-/// the window when it has no taskbar button) or a cross that closes, as
-/// the dialogs of qview have it. True when clicked.
+/// the window when it has no taskbar button) or a cross that closes (or
+/// hides the window), as the dialogs of qview have it. True when clicked.
 fn title_button(ui: &mut egui::Ui, kind: TitleButton) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(24.0), egui::Sense::click());
     let visuals = ui.style().interact(&response);
@@ -794,10 +810,13 @@ fn title_button(ui: &mut egui::Ui, kind: TitleButton) -> bool {
                 _ => tr!("Minimise", "Свернуть"),
             }
         }
-        TitleButton::Close => {
+        TitleButton::Close | TitleButton::CloseToTray => {
             ui.painter().line_segment([c + Vec2::new(-r, -r), c + Vec2::new(r, r)], stroke);
             ui.painter().line_segment([c + Vec2::new(-r, r), c + Vec2::new(r, -r)], stroke);
-            tr!("Close", "Закрыть")
+            match kind {
+                TitleButton::CloseToTray => tr!("Hide to the notification area", "Скрыть в область уведомлений"),
+                _ => tr!("Close", "Закрыть"),
+            }
         }
     };
     response.on_hover_text(hint).clicked()

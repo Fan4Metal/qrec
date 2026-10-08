@@ -1,7 +1,8 @@
 //! The icon in the notification area: the app's icon, red with a white
 //! dot while recording, the time recorded in its tooltip. A click shows
 //! the window; its menu starts or stops the recording, shows the window,
-//! takes the window off the taskbar or exits.
+//! sets whether the window is on the taskbar and whether closing it hides
+//! it, or exits.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -33,6 +34,8 @@ pub enum Command {
     Show,
     /// Put the window's button on the taskbar or take it off.
     Taskbar,
+    /// Whether closing the window hides it instead.
+    CloseToTray,
     /// Close the program.
     Exit,
 }
@@ -49,21 +52,24 @@ const MENU_TOGGLE: usize = 1;
 const MENU_SHOW: usize = 2;
 const MENU_EXIT: usize = 3;
 const MENU_TASKBAR: usize = 4;
+const MENU_CLOSE_TO_TRAY: usize = 5;
 
 /// What the icon and its menu show.
-#[derive(Clone, Default, PartialEq)]
-struct State {
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Status {
     /// The time recorded, `None` when there is no recording.
-    clock: Option<String>,
+    pub clock: Option<String>,
     /// Whether the window is kept off the taskbar.
-    tray_only: bool,
+    pub tray_only: bool,
+    /// Whether closing the window hides it.
+    pub close_to_tray: bool,
 }
 
 /// The icon; removed when dropped. Commands arrive on the receiver, and
 /// the egui context is woken for each.
 pub struct Tray {
     hwnd: isize,
-    state: Arc<Mutex<State>>,
+    state: Arc<Mutex<Status>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -71,7 +77,7 @@ pub struct Tray {
 struct Context {
     tx: mpsc::Sender<Command>,
     ctx: egui::Context,
-    state: Arc<Mutex<State>>,
+    state: Arc<Mutex<Status>>,
     /// Idle and recording.
     icons: [HICON; 2],
 }
@@ -87,7 +93,7 @@ static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 impl Tray {
     pub fn new(ctx: egui::Context) -> Result<(Tray, mpsc::Receiver<Command>), String> {
         let (tx, rx) = mpsc::channel();
-        let state = Arc::new(Mutex::new(State::default()));
+        let state = Arc::new(Mutex::new(Status::default()));
         let shared = Arc::clone(&state);
         let (ready_tx, ready_rx) = mpsc::channel::<Result<isize, String>>();
         let thread = std::thread::Builder::new()
@@ -130,14 +136,14 @@ impl Tray {
         }
     }
 
-    /// The clock while recording, `None` otherwise, and whether the window
-    /// is off the taskbar; the icon is set again only when they change.
-    pub fn set(&self, clock: Option<&str>, tray_only: bool) {
+    /// What the icon and its menu show; the icon is set again only when it
+    /// changes.
+    pub fn set(&self, status: Status) {
         let mut state = self.state.lock().unwrap();
-        if state.clock.as_deref() == clock && state.tray_only == tray_only {
+        if *state == status {
             return;
         }
-        *state = State { clock: clock.map(str::to_owned), tray_only };
+        *state = status;
         drop(state);
         unsafe {
             let _ = PostMessageW(Some(HWND(self.hwnd as *mut _)), WM_STATE, WPARAM(0), LPARAM(0));
@@ -233,14 +239,16 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
     let toggle = wide(if recording { tr!("Stop recording", "Остановить запись") } else { tr!("Start recording", "Начать запись") });
     let show = wide(tr!("Show the window", "Показать окно"));
     let taskbar = wide(tr!("Not on the taskbar", "Не показывать на панели задач"));
+    let close_to_tray = wide(tr!("Hide when closed", "Сворачивать в трей при закрытии"));
     let exit = wide(tr!("Exit", "Выход"));
     unsafe {
         let menu = CreatePopupMenu().ok()?;
         let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, PCWSTR(toggle.as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING, MENU_SHOW, PCWSTR(show.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let checked = if state.tray_only { MF_CHECKED } else { Default::default() };
-        let _ = AppendMenuW(menu, MF_STRING | checked, MENU_TASKBAR, PCWSTR(taskbar.as_ptr()));
+        let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
+        let _ = AppendMenuW(menu, check(state.tray_only), MENU_TASKBAR, PCWSTR(taskbar.as_ptr()));
+        let _ = AppendMenuW(menu, check(state.close_to_tray), MENU_CLOSE_TO_TRAY, PCWSTR(close_to_tray.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, PCWSTR(exit.as_ptr()));
         // In bold: what a click on the icon does.
@@ -254,6 +262,7 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
             MENU_TOGGLE => Some(Command::Toggle),
             MENU_SHOW => Some(Command::Show),
             MENU_TASKBAR => Some(Command::Taskbar),
+            MENU_CLOSE_TO_TRAY => Some(Command::CloseToTray),
             MENU_EXIT => Some(Command::Exit),
             _ => None,
         }
