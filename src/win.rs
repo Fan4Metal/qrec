@@ -158,6 +158,17 @@ pub fn show_in_explorer(path: &std::path::Path) {
     let _ = std::process::Command::new("explorer.exe").arg(arg).spawn();
 }
 
+/// Opens `target` (a web address here) as Explorer would. eframe opens
+/// links only with its `links` feature (the webbrowser crate), which is off.
+pub fn shell_open(target: &str) -> bool {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let (verb, file) = (wide("open"), wide(target));
+    let result = unsafe { ShellExecuteW(None, PCWSTR(verb.as_ptr()), PCWSTR(file.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
+    // Values above 32 mean success.
+    result.0 as isize > 32
+}
+
 /// Opens a folder in Explorer.
 pub fn open_folder(path: &std::path::Path) {
     let _ = std::process::Command::new("explorer.exe").arg(path).spawn();

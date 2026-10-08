@@ -9,6 +9,7 @@ use egui::{Color32, RichText, Vec2};
 
 use crate::display::{self, Monitor};
 use crate::hotkey::{Chord, Hotkey};
+use crate::i18n::LangChoice;
 use crate::overlay::{self, Border};
 use crate::recorder::{self, Config, Quality, Recorder};
 use crate::region::{Aspect, Region};
@@ -33,6 +34,10 @@ const ASPECT_KEY: &str = "aspect";
 const TASKBAR_KEY: &str = "taskbar";
 const CLOSE_TO_TRAY_KEY: &str = "close_to_tray";
 const MINIMISE_ON_RECORD_KEY: &str = "minimise_on_record";
+const LANGUAGE_KEY: &str = "language";
+
+/// Width of the language list in About, enough for its longest entry.
+const LANG_WIDTH: f32 = 220.0;
 
 const RECORD_COLOUR: Color32 = Color32::from_rgb(0xe5, 0x39, 0x35);
 /// The dark of the icon and of the record button's ring.
@@ -65,6 +70,12 @@ pub struct App {
     close_to_tray: bool,
     /// Whether the window is put out of the way when a recording starts.
     minimise_on_record: bool,
+    /// Interface language, chosen in About.
+    lang: LangChoice,
+    /// Whether the About window is open.
+    about: bool,
+    /// The icon of About, rasterised at the display's pixel density.
+    about_icon: Option<egui::TextureHandle>,
     /// The next key press becomes the hotkey.
     capturing_hotkey: bool,
     recorder: Option<Recorder>,
@@ -103,6 +114,8 @@ impl App {
         let taskbar = get(TASKBAR_KEY).as_deref() != Some("false");
         let close_to_tray = get(CLOSE_TO_TRAY_KEY).as_deref() == Some("true");
         let minimise_on_record = get(MINIMISE_ON_RECORD_KEY).as_deref() == Some("true");
+        let lang = get(LANGUAGE_KEY).and_then(|l| LangChoice::from_name(&l)).unwrap_or_default();
+        crate::i18n::set_lang(lang.resolve());
         let cursor = get(CURSOR_KEY).as_deref() != Some("false");
         let folder = get(FOLDER_KEY).map(PathBuf::from).unwrap_or_else(default_folder);
         let aspect = get(ASPECT_KEY).and_then(|a| Aspect::from_name(&a)).unwrap_or_default();
@@ -141,6 +154,9 @@ impl App {
             taskbar,
             close_to_tray,
             minimise_on_record,
+            lang,
+            about: false,
+            about_icon: None,
             hotkey: None,
             hotkey_error: None,
             tray: Tray::new(cc.egui_ctx.clone()).inspect_err(|e| log::warn!("no tray icon: {e}")).ok(),
@@ -230,6 +246,12 @@ impl App {
                 }
                 tray::Command::CloseToTray => self.close_to_tray = !self.close_to_tray,
                 tray::Command::MinimiseOnRecord => self.minimise_on_record = !self.minimise_on_record,
+                tray::Command::About => {
+                    if let Some(hwnd) = self.window {
+                        win::show_window(hwnd, true);
+                    }
+                    self.about = true;
+                }
                 tray::Command::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
@@ -325,6 +347,82 @@ impl App {
         match (self.tray_only(), self.window) {
             (true, Some(hwnd)) => win::show_window(hwnd, false),
             _ => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+        }
+    }
+
+    /// About, as in qview: the icon, the name, the version, what the
+    /// program does, the author, the homepage and the licence from
+    /// Cargo.toml, where the settings are kept, and the interface language.
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.about {
+            return;
+        }
+        const ICON: f32 = 64.0;
+        const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+        const LICENSE: &str = env!("CARGO_PKG_LICENSE");
+        /// Cargo joins several authors with `:`.
+        const AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
+        let px = (ICON * ctx.pixels_per_point()).round() as usize;
+        if self.about_icon.as_ref().is_none_or(|t| t.size() != [px, px]) {
+            let image = egui::ColorImage::from_rgba_unmultiplied([px, px], &crate::icon::rgba(px as u32));
+            self.about_icon = Some(ctx.load_texture("about_icon", image, egui::TextureOptions::LINEAR));
+        }
+        let icon = self.about_icon.clone().expect("set above");
+        let modal = egui::Modal::new(egui::Id::new("about")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            // The cross in the top right corner, over the centred content
+            // (a child Ui takes no room in the layout).
+            let corner = egui::Rect::from_min_size(egui::pos2(ui.max_rect().right() - 24.0, ui.cursor().top()), Vec2::splat(24.0));
+            let closed = title_button(&mut ui.new_child(egui::UiBuilder::new().max_rect(corner)), TitleButton::Close);
+            ui.vertical_centered(|ui| {
+                ui.image((icon.id(), Vec2::splat(ICON)));
+                ui.add_space(4.0);
+                ui.heading("qrec");
+                ui.label(tr!(format!("Version {}", crate::VERSION), format!("Версия {}", crate::VERSION)));
+                ui.add_space(6.0);
+                ui.label(tr!("A simple screen area recorder for Windows.", "Простая запись области экрана для Windows."));
+                ui.add_space(6.0);
+                let authors = AUTHORS.replace(':', ", ");
+                ui.label(tr!(format!("Author: {authors}"), format!("Автор: {authors}")));
+                if ui.link(tr!("Homepage", "Сайт проекта")).on_hover_text(REPOSITORY).clicked() && !win::shell_open(REPOSITORY) {
+                    log::warn!("could not open {REPOSITORY}");
+                }
+                ui.weak(tr!(format!("{LICENSE} License"), format!("Лицензия {LICENSE}")));
+                let place = if crate::portable_dir().is_some() {
+                    ui.weak(tr!("Settings: beside the program (portable)", "Настройки: рядом с программой (переносная версия)"))
+                } else {
+                    ui.weak(tr!("Settings: in the user profile", "Настройки: в профиле пользователя"))
+                };
+                if let Some(file) = crate::settings_file() {
+                    place.on_hover_text(file.display().to_string());
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(2.0);
+                // The label over the list, both centred; a fixed width
+                // keeps the list from jumping when the language changes.
+                ui.weak(tr!("Interface language", "Язык интерфейса"));
+                let mut choice = self.lang;
+                // A combo box lays itself out left to right, ignoring the
+                // centring: indented by hand (`width` is its outer width).
+                ui.horizontal(|ui| {
+                    ui.add_space(((ui.available_width() - LANG_WIDTH) / 2.0).max(0.0));
+                    egui::ComboBox::from_id_salt("language").selected_text(choice.label()).width(LANG_WIDTH).show_ui(ui, |ui| {
+                        for c in LangChoice::ALL {
+                            ui.selectable_value(&mut choice, c, c.label());
+                        }
+                    });
+                });
+                if choice != self.lang {
+                    self.lang = choice;
+                    crate::i18n::set_lang(choice.resolve());
+                }
+                ui.add_space(4.0);
+            });
+            closed
+        });
+        if modal.inner || modal.should_close() {
+            self.about = false;
         }
     }
 
@@ -440,7 +538,8 @@ impl eframe::App for App {
             if drag.drag_started_by(egui::PointerButton::Primary) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
             }
-            // The buttons of the title row from the right: close, minimise.
+            // The buttons of the title row from the right: close, minimise,
+            // about.
             let top_right = ui.max_rect().right_top();
             let corner = |n: f32| egui::Rect::from_min_size(egui::pos2(top_right.x - 28.0 * n + 4.0, top_right.y), Vec2::splat(24.0));
             // Only the cross hides the window: Alt+F4 and WM_CLOSE from
@@ -457,13 +556,18 @@ impl eframe::App for App {
             if title_button(&mut ui.new_child(egui::UiBuilder::new().max_rect(corner(2.0))), kind) {
                 self.minimise(&ctx);
             }
-            title(ui, egui::Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.max_rect().width() - 56.0, 24.0)));
+            if title_button(&mut ui.new_child(egui::UiBuilder::new().max_rect(corner(3.0))), TitleButton::About) {
+                self.about = true;
+            }
+            title(ui, egui::Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.max_rect().width() - 84.0, 24.0)));
             ui.add_space(28.0);
             egui::Frame::group(ui.style()).inner_margin(10).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 self.settings(ui, &ctx, recording);
             });
         });
+
+        self.about_window(&ctx);
 
         if let Some((tray, _)) = &self.tray {
             tray.set(tray::Status {
@@ -501,6 +605,7 @@ impl eframe::App for App {
         storage.set_string(TASKBAR_KEY, self.taskbar.to_string());
         storage.set_string(CLOSE_TO_TRAY_KEY, self.close_to_tray.to_string());
         storage.set_string(MINIMISE_ON_RECORD_KEY, self.minimise_on_record.to_string());
+        storage.set_string(LANGUAGE_KEY, self.lang.name().to_owned());
         storage.set_string(CURSOR_KEY, self.cursor.to_string());
         storage.set_string(FOLDER_KEY, self.folder.display().to_string());
         storage.set_string(HOTKEY_KEY, self.chord.map(|c| c.label()).unwrap_or_default());
@@ -808,6 +913,7 @@ enum TitleButton {
     Hide,
     Close,
     CloseToTray,
+    About,
 }
 
 /// A 24 x 24 button of the title row: a dash that minimises (or hides
@@ -836,6 +942,13 @@ fn title_button(ui: &mut egui::Ui, kind: TitleButton) -> bool {
                 TitleButton::CloseToTray => tr!("Hide to the notification area", "Скрыть в область уведомлений"),
                 _ => tr!("Close", "Закрыть"),
             }
+        }
+        TitleButton::About => {
+            // An "i" in a circle.
+            ui.painter().circle_stroke(c, r + 1.5, egui::Stroke::new(1.2, visuals.fg_stroke.color));
+            ui.painter().circle_filled(c + Vec2::new(0.0, -2.8), 1.0, visuals.fg_stroke.color);
+            ui.painter().line_segment([c + Vec2::new(0.0, -0.8), c + Vec2::new(0.0, 3.5)], stroke);
+            tr!("About", "О программе")
         }
     };
     response.on_hover_text(hint).clicked()

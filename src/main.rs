@@ -37,6 +37,12 @@ fn portable_dir() -> Option<PathBuf> {
     dir.join(SETTINGS_FILE).is_file().then_some(dir)
 }
 
+/// The settings file: beside the exe when portable, else where eframe
+/// keeps it (`%APPDATA%\qrec\data`).
+fn settings_file() -> Option<PathBuf> {
+    portable_dir().or_else(|| eframe::storage_dir(APP_ID)).map(|d| d.join(SETTINGS_FILE))
+}
+
 /// The app icon rasterised at build time (`build.rs`) as straight RGBA,
 /// 64 x 64 pixels.
 fn embedded_icon() -> egui::IconData {

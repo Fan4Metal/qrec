@@ -1,5 +1,5 @@
 //! Interface language: English or Russian, taken from the language of the
-//! Windows interface.
+//! Windows interface unless chosen in the About window.
 //!
 //! Strings stay next to the code that shows them, both languages together:
 //! `tr!("Record", "Запись")` gives the one of the current language (and
@@ -12,6 +12,56 @@ pub enum Lang {
     #[default]
     En,
     Ru,
+}
+
+/// The language as kept in the settings: a fixed one, or the system's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LangChoice {
+    #[default]
+    System,
+    En,
+    Ru,
+}
+
+impl LangChoice {
+    pub const ALL: [LangChoice; 3] = [LangChoice::System, LangChoice::En, LangChoice::Ru];
+
+    pub fn resolve(self) -> Lang {
+        match self {
+            LangChoice::System => system_lang(),
+            LangChoice::En => Lang::En,
+            LangChoice::Ru => Lang::Ru,
+        }
+    }
+
+    /// Name in the settings.
+    pub fn name(self) -> &'static str {
+        match self {
+            LangChoice::System => "system",
+            LangChoice::En => "en",
+            LangChoice::Ru => "ru",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<LangChoice> {
+        Self::ALL.into_iter().find(|c| c.name() == name)
+    }
+
+    /// As listed in the About window: the languages in their own language,
+    /// so that they can be found whatever the interface shows.
+    pub fn label(self) -> String {
+        let own = |lang| match lang {
+            Lang::En => "English",
+            Lang::Ru => "Русский",
+        };
+        match self {
+            LangChoice::System => {
+                let own = own(system_lang());
+                crate::tr!(format!("As in Windows ({own})"), format!("Как в Windows ({own})"))
+            }
+            LangChoice::En | LangChoice::Ru => own(self.resolve()).into(),
+        }
+    }
 }
 
 static LANG: AtomicU8 = AtomicU8::new(0);
@@ -42,4 +92,19 @@ macro_rules! tr {
             $crate::i18n::Lang::Ru => $ru,
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn choice_names_round_trip() {
+        for c in LangChoice::ALL {
+            assert_eq!(LangChoice::from_name(c.name()), Some(c));
+        }
+        assert_eq!(LangChoice::from_name("de"), None);
+        assert_eq!(LangChoice::En.resolve(), Lang::En);
+        assert_eq!(LangChoice::Ru.resolve(), Lang::Ru);
+    }
 }
