@@ -79,6 +79,30 @@ pub fn exclude_from_capture(hwnd: isize) -> bool {
     unsafe { SetWindowDisplayAffinity(HWND(hwnd as *mut _), WDA_EXCLUDEFROMCAPTURE).is_ok() }
 }
 
+/// Clips the window to its client area with corners of `radius` pixels.
+/// DWM draws no shadow for a window with a region: its rectangular shadow
+/// would outline the transparent corners. A region does not follow the
+/// window's size: it is set again when the size changes.
+pub fn round_window(hwnd: isize, radius: i32) -> bool {
+    use windows::Win32::Foundation::{POINT, RECT};
+    use windows::Win32::Graphics::Gdi::{ClientToScreen, CreateRoundRectRgn, SetWindowRgn};
+    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
+    let hwnd = HWND(hwnd as *mut _);
+    let (mut window, mut client, mut origin) = (RECT::default(), RECT::default(), POINT::default());
+    unsafe {
+        if GetWindowRect(hwnd, &mut window).is_err() || GetClientRect(hwnd, &mut client).is_err() || !ClientToScreen(hwnd, &mut origin).as_bool() {
+            return false;
+        }
+        // winit leaves a pixel of non-client area above an undecorated
+        // window: the client area is offset in the window. The region
+        // takes window coordinates and excludes its right and bottom edge.
+        let (x, y) = (origin.x - window.left, origin.y - window.top);
+        let region = CreateRoundRectRgn(x, y, x + client.right + 1, y + client.bottom + 1, 2 * radius, 2 * radius);
+        // The system owns the region from here on.
+        !region.is_invalid() && SetWindowRgn(hwnd, Some(region), true) != 0
+    }
+}
+
 /// The performance counter in 100-nanosecond units: the clock of a
 /// recording. WASAPI stamps its packets with the same counter, so the
 /// audio and the video share one timeline.

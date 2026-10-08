@@ -59,6 +59,9 @@ pub struct App {
     notice: Notice,
     /// The window's handle, to hide it while an area is being selected.
     window: Option<isize>,
+    /// The window size in pixels and the corner radius its region was
+    /// made for (`win::round_window`).
+    rounded: Option<(egui::Vec2, i32)>,
 }
 
 /// The status line.
@@ -126,6 +129,7 @@ impl App {
             selecting: None,
             notice: Notice::None,
             window,
+            rounded: None,
         };
         app.register_hotkey(&cc.egui_ctx);
         app
@@ -257,6 +261,19 @@ impl App {
         }));
     }
 
+    /// Clips the window to the painted rounded background, again when its
+    /// size in pixels changes (another display scale). The region's corners
+    /// are a pixel less round than the painted ones, so their smoothed edge
+    /// stays inside.
+    fn round_corners(&mut self, ctx: &egui::Context) {
+        let Some(hwnd) = self.window else { return };
+        let ppp = ctx.pixels_per_point();
+        let wanted = ((ctx.content_rect().size() * ppp).round(), (CORNER_RADIUS * ppp).round() as i32 - 1);
+        if self.rounded != Some(wanted) && win::round_window(hwnd, wanted.1) {
+            self.rounded = Some(wanted);
+        }
+    }
+
     /// The next key press, while the hotkey is being chosen.
     fn capture_hotkey(&mut self, ctx: &egui::Context) {
         let events = ctx.input(|i| i.events.clone());
@@ -338,6 +355,7 @@ impl eframe::App for App {
             egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
             egui::StrokeKind::Inside,
         );
+        self.round_corners(&ctx);
         egui::Panel::bottom("bar")
             .show_separator_line(false)
             .frame(egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 8 }))
