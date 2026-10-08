@@ -79,6 +79,21 @@ pub fn exclude_from_capture(hwnd: isize) -> bool {
     unsafe { SetWindowDisplayAffinity(HWND(hwnd as *mut _), WDA_EXCLUDEFROMCAPTURE).is_ok() }
 }
 
+/// A window hidden and shown again keeps `WDA_EXCLUDEFROMCAPTURE`, yet
+/// Desktop Duplication then delivers it as a black shape instead of what
+/// is behind it (Windows 10 22H2; minimising and restoring does not do
+/// this). Set anew, the exclusion works again: called after showing.
+fn renew_exclusion(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowDisplayAffinity, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE};
+    let mut affinity = 0;
+    unsafe {
+        if GetWindowDisplayAffinity(hwnd, &mut affinity).is_ok() && affinity == WDA_EXCLUDEFROMCAPTURE.0 {
+            let _ = SetWindowDisplayAffinity(hwnd, WDA_NONE);
+            let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        }
+    }
+}
+
 /// Clips the window to its client area with corners of `radius` pixels.
 /// DWM draws no shadow for a window with a region: its rectangular shadow
 /// would outline the transparent corners. A region does not follow the
@@ -169,6 +184,7 @@ pub fn show_window(hwnd: isize, show: bool) {
         };
         let _ = ShowWindow(hwnd, how);
         if show {
+            renew_exclusion(hwnd);
             let _ = SetForegroundWindow(hwnd);
         }
     }
@@ -203,6 +219,7 @@ pub fn set_taskbar_button(hwnd: isize, show: bool, refresh: bool) {
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wanted as isize);
         if visible {
             let _ = ShowWindow(hwnd, SW_SHOW);
+            renew_exclusion(hwnd);
         }
     }
 }
