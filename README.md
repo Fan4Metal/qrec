@@ -27,7 +27,7 @@ qrec records a rectangle of the screen, or a whole display, to an MP4 file: H.26
 - **The sound of the computer without "Stereo Mix"**: whatever is played is captured through WASAPI loopback and written as AAC; no virtual cable or driver is needed.
 - **The pointer** is drawn into the recording, including the inverted I-beam.
 - **Three settings**: 30 or 60 frames per second, a quality of three steps (the bitrate follows the size of the area), and whether sound and the pointer are recorded.
-- **A hotkey**: `Ctrl+Alt+R` by default, changed in the window by pressing another combination.
+- **A hotkey**: `Ctrl+Alt+R` by default, changed in the window by pressing another combination, or removed.
 - **Nothing of qrec in the recording**: its own windows are kept out of the capture.
 - **Russian and English**: the interface follows the language of Windows.
 - **One file**: no FFmpeg, no runtime, no network access; the executable is about 7 MB.
@@ -53,7 +53,7 @@ Requirements: Windows 10 version 2004 or later, 64-bit. On earlier builds of Win
 | Quality | Low, Medium or High: about 0.05, 0.1 or 0.2 bits per pixel and frame. 1920×1080 at 30 frames per second comes to about 3, 6 or 12 Mbit/s. Beside the buttons, the window shows the most the chosen area takes, in Mbit/s and in megabytes per minute with the sound; a still screen takes less. |
 | Record | **System sound**: what the computer plays. **Pointer**: the mouse pointer. |
 | Folder | Where the files go; `Videos` by default. **Open** shows the folder in Explorer. |
-| Hotkey | Starts and stops the recording from any window. A click on **Change**, then a key with `Ctrl`, `Alt` or `Win`, or a function key, sets another one; `Esc` or **Cancel** keeps the current one. A combination held by another program is reported as not available. |
+| Hotkey | Starts and stops the recording from any window. A click on **Change**, then a key with `Ctrl`, `Alt` or `Win`, or a function key, sets another one; `Esc` or **Cancel** keeps the current one; the cross beside **Change** removes the hotkey. A combination held by another program is reported as not available. |
 
 **Record** starts the recording; while it runs, the button shows the time recorded and stops the recording when clicked. The number of frames skipped, if the computer could not keep up, appears below. A red frame surrounds the area while it is recorded. The file is named by the date and time, `qrec_2026-10-08_16-45-12.mp4`, and after the recording its name appears in the window as a link that shows it in Explorer.
 

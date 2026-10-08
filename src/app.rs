@@ -45,7 +45,8 @@ pub struct App {
     audio: bool,
     cursor: bool,
     folder: PathBuf,
-    chord: Chord,
+    /// `None` when the hotkey was removed.
+    chord: Option<Chord>,
     hotkey: Option<(Hotkey, mpsc::Receiver<()>)>,
     hotkey_error: Option<String>,
     /// The proportions of the next area selected.
@@ -85,7 +86,11 @@ impl App {
         let cursor = get(CURSOR_KEY).as_deref() != Some("false");
         let folder = get(FOLDER_KEY).map(PathBuf::from).unwrap_or_else(default_folder);
         let aspect = get(ASPECT_KEY).and_then(|a| Aspect::from_name(&a)).unwrap_or_default();
-        let chord = get(HOTKEY_KEY).and_then(|h| Chord::from_label(&h)).filter(Chord::is_usable).unwrap_or_default();
+        // An empty setting is a removed hotkey; a missing one is the default.
+        let chord = match get(HOTKEY_KEY) {
+            Some(h) if h.is_empty() => None,
+            h => Some(h.and_then(|h| Chord::from_label(&h)).filter(Chord::is_usable).unwrap_or_default()),
+        };
 
         // The window must not appear in its own recordings.
         let window = {
@@ -128,7 +133,9 @@ impl App {
 
     fn register_hotkey(&mut self, ctx: &egui::Context) {
         self.hotkey = None;
-        match Hotkey::register(self.chord, ctx.clone()) {
+        self.hotkey_error = None;
+        let Some(chord) = self.chord else { return };
+        match Hotkey::register(chord, ctx.clone()) {
             Ok(registered) => {
                 self.hotkey = Some(registered);
                 self.hotkey_error = None;
@@ -263,7 +270,7 @@ impl App {
                 if let Some(chord) = Chord::from_egui(key, modifiers)
                     && chord.is_usable()
                 {
-                    self.chord = chord;
+                    self.chord = Some(chord);
                     self.capturing_hotkey = false;
                     self.register_hotkey(ctx);
                     return;
@@ -378,7 +385,7 @@ impl eframe::App for App {
         storage.set_string(AUDIO_KEY, self.audio.to_string());
         storage.set_string(CURSOR_KEY, self.cursor.to_string());
         storage.set_string(FOLDER_KEY, self.folder.display().to_string());
-        storage.set_string(HOTKEY_KEY, self.chord.label());
+        storage.set_string(HOTKEY_KEY, self.chord.map(|c| c.label()).unwrap_or_default());
         storage.set_string(ASPECT_KEY, self.aspect.name().to_owned());
     }
 
@@ -472,8 +479,10 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 if self.capturing_hotkey {
                     ui.label(RichText::new(tr!("Press the keys…", "Нажмите клавиши…")).color(ui.visuals().selection.bg_fill));
+                } else if let Some(chord) = self.chord {
+                    ui.label(RichText::new(chord.label()).strong());
                 } else {
-                    ui.label(RichText::new(self.chord.label()).strong());
+                    ui.weak(tr!("none", "нет"));
                 }
                 let text = if self.capturing_hotkey { tr!("Cancel", "Отмена") } else { tr!("Change", "Изменить") };
                 let button = ui.add_enabled(!recording, egui::Button::new(text)).on_hover_text(tr!(
@@ -488,6 +497,13 @@ impl App {
                     } else {
                         self.register_hotkey(ctx);
                     }
+                }
+                if self.chord.is_some()
+                    && !self.capturing_hotkey
+                    && ui.add_enabled(!recording, cross_button).on_hover_text(tr!("Remove the hotkey", "Убрать клавишу")).clicked()
+                {
+                    self.chord = None;
+                    self.register_hotkey(ctx);
                 }
                 if let Some(e) = &self.hotkey_error {
                     // Usually another program (or another qrec) holds the key.
@@ -699,6 +715,19 @@ fn title_button(ui: &mut egui::Ui, kind: TitleButton) -> bool {
         }
     };
     response.on_hover_text(hint).clicked()
+}
+
+/// A square button with a cross, as high as the buttons beside it.
+fn cross_button(ui: &mut egui::Ui) -> egui::Response {
+    let side = ui.spacing().interact_size.y;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    ui.painter().rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
+    let (c, r) = (rect.center(), side * 0.2);
+    let stroke = egui::Stroke::new(1.5, visuals.fg_stroke.color);
+    ui.painter().line_segment([c + Vec2::new(-r, -r), c + Vec2::new(r, r)], stroke);
+    ui.painter().line_segment([c + Vec2::new(-r, r), c + Vec2::new(r, -r)], stroke);
+    response
 }
 
 /// The Videos folder, or the current directory.
