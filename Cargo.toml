@@ -1,6 +1,6 @@
 [package]
 name = "qrec"
-version = "0.1.0"
+version = "0.2.0-dev"
 authors = ["Fan4_Metal"]
 edition = "2024"
 description = "Simple screen area recorder for Windows"
