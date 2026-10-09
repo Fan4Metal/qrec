@@ -121,8 +121,9 @@ impl VideoEncoder {
             output.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
             output.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             output.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
-            // A key frame every two seconds: seeking stays quick.
-            output.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, video.fps * 2)?;
+            // A key frame every second: a cut (`trim`) can start on any
+            // of them, and seeking stays quick.
+            output.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, video.fps)?;
             transform.SetOutputType(output_id, &output, 0)?;
         }
         let input = unsafe { MFCreateMediaType()? };

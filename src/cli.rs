@@ -1,7 +1,8 @@
 //! `qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N]
 //! [--quality low|medium|high] [--no-audio | --audio-app NAME.exe
 //! [--no-boost]] [--out FILE]`: a recording without the window, for checking the
-//! pipeline from a console.
+//! pipeline from a console. `qrec --cut FILE --from S --to S [--out FILE]`
+//! and `qrec --info FILE`: a cut and a look at a file, the same way.
 
 use std::path::PathBuf;
 
@@ -90,6 +91,81 @@ fn run(args: Vec<String>) -> Result<(), String> {
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     eprintln!("{frames} frames written, {dropped} skipped, {} bytes: {}", size, path.display());
     Ok(())
+}
+
+/// `qrec --cut FILE --from SECONDS --to SECONDS [--out FILE]`: the stretch
+/// of a recording into a new file, without re-encoding; the start lands
+/// on the key frame at or before it.
+pub fn cut(args: Vec<String>) -> i32 {
+    let mut src: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let (mut from, mut to) = (0.0f64, f64::INFINITY);
+    let mut args = args.into_iter();
+    let result = (|| -> Result<(), String> {
+        while let Some(arg) = args.next() {
+            let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
+            match arg.as_str() {
+                "--from" => from = value()?.parse().map_err(|e: std::num::ParseFloatError| e.to_string())?,
+                "--to" => to = value()?.parse().map_err(|e: std::num::ParseFloatError| e.to_string())?,
+                "--out" => out = Some(PathBuf::from(value()?)),
+                s if src.is_none() => src = Some(PathBuf::from(s)),
+                s => return Err(format!("unknown argument {s}")),
+            }
+        }
+        let src = src.ok_or("usage: qrec --cut FILE --from SECONDS --to SECONDS [--out FILE]")?;
+        let seconds = |s: f64| if s.is_finite() { (s * crate::trim::SECOND as f64) as i64 } else { i64::MAX };
+        let dst = out.unwrap_or_else(|| src.with_extension("cut.mp4"));
+        let progress = crate::trim::Progress::default();
+        let started = std::time::Instant::now();
+        let cut = crate::trim::cut(&src, &dst, seconds(from), seconds(to), &progress).map_err(|e| win::describe(&e))?;
+        let size = std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "{} frames from {} in {:.2} s, {size} bytes: {}",
+            cut.frames,
+            crate::editor::clock(cut.start),
+            started.elapsed().as_secs_f64(),
+            dst.display()
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("qrec: {e}");
+            1
+        }
+    }
+}
+
+/// `qrec --info FILE`: what a recording holds, and where its key frames are.
+pub fn info(path: Option<PathBuf>) -> i32 {
+    let Some(path) = path else {
+        eprintln!("usage: qrec --info FILE");
+        return 2;
+    };
+    let result = (|| -> Result<(), String> {
+        let info = crate::trim::info(&path).map_err(|e| win::describe(&e))?;
+        eprintln!(
+            "{}x{} at {} fps, {} s, {}",
+            info.width,
+            info.height,
+            info.fps,
+            info.duration as f64 / crate::trim::SECOND as f64,
+            if info.audio { "with audio" } else { "no audio" }
+        );
+        let started = std::time::Instant::now();
+        let frames = crate::trim::frames(&path, &std::sync::atomic::AtomicBool::new(false)).map_err(|e| win::describe(&e))?;
+        let keys: Vec<String> = frames.iter().filter(|f| f.key).map(|f| crate::editor::clock(f.time)).collect();
+        eprintln!("{} frames listed in {:.2} s, {} key frames: {}", frames.len(), started.elapsed().as_secs_f64(), keys.len(), keys.join(" "));
+        Ok(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("qrec: {e}");
+            1
+        }
+    }
 }
 
 /// `qrec --test-select`: opens the selection overlay and drives it with

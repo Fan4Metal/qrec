@@ -9,6 +9,7 @@ use egui::{Color32, RichText, Vec2};
 
 use crate::audio::Source;
 use crate::display::{self, Monitor};
+use crate::editor::Editor;
 use crate::hotkey::{Chord, Hotkey};
 use crate::i18n::LangChoice;
 use crate::overlay::{self, Border};
@@ -90,6 +91,8 @@ pub struct App {
     lang: LangChoice,
     /// Whether the About window is open.
     about: bool,
+    /// The trimming window, while one is open.
+    editor: Option<Editor>,
     /// The icon of About, rasterised at the display's pixel density.
     about_icon: Option<egui::TextureHandle>,
     /// The next key press becomes the hotkey.
@@ -114,7 +117,8 @@ enum Notice {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> App {
+    /// `open`: a recording to trim straight away.
+    pub fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>) -> App {
         let get = |key: &str| cc.storage.and_then(|s| s.get_string(key));
         let monitors = display::monitors();
         let monitor = get(MONITOR_KEY).and_then(|name| monitors.iter().position(|m| m.device_name == name)).unwrap_or(0);
@@ -183,6 +187,7 @@ impl App {
             minimise_on_record,
             lang,
             about: false,
+            editor: None,
             about_icon: None,
             hotkey: None,
             hotkey_error: None,
@@ -196,6 +201,9 @@ impl App {
             rounded: None,
         };
         app.register_hotkey(&cc.egui_ctx);
+        if let Some(path) = open {
+            app.open_editor(path, &cc.egui_ctx);
+        }
         // Before eframe shows the window, so that no button appears.
         if let (Some(hwnd), true) = (app.window, app.tray_only()) {
             win::set_taskbar_button(hwnd, false, false);
@@ -459,6 +467,36 @@ impl App {
         }
     }
 
+    /// Opens the trimming window on `path` (one at a time: a second file
+    /// replaces the first).
+    fn open_editor(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.editor = None;
+        self.editor = Some(Editor::open(path, ctx.clone(), editor_viewport()));
+    }
+
+    /// The trimming window, a viewport of its own.
+    fn editor_window(&mut self, ctx: &egui::Context) {
+        let Some(editor) = &mut self.editor else { return };
+        let name = editor.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let builder = egui::ViewportBuilder::default()
+            .with_title(format!("{} — {name}", tr!("Trim", "Подрезка")))
+            .with_inner_size(crate::editor::WINDOW_SIZE)
+            .with_min_inner_size(crate::editor::MIN_WINDOW_SIZE)
+            .with_icon(crate::embedded_icon());
+        let close = ctx.show_viewport_immediate(editor_viewport(), builder, |ui, _class| editor.ui(ui));
+        if close {
+            self.editor = None;
+        }
+    }
+
+    /// A recording dropped on the window opens in the trimming window.
+    fn dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect::<Vec<_>>());
+        if let Some(path) = dropped.into_iter().find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4"))) {
+            self.open_editor(path, ctx);
+        }
+    }
+
     /// The icon's state: the clock while recording, and the menu's ticks.
     fn update_tray(&self) {
         if let Some((tray, _)) = &self.tray {
@@ -619,6 +657,8 @@ impl eframe::App for App {
         });
 
         self.about_window(&ctx);
+        self.editor_window(&ctx);
+        self.dropped_files(&ctx);
 
         self.update_tray();
         // winit sets the window's style again whenever it changes its
@@ -897,6 +937,7 @@ impl App {
         ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), height), egui::Layout::top_down(egui::Align::LEFT), |ui| {
             ui.set_min_height(height);
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            let mut trim = None;
             match &self.notice {
                 Notice::None => {
                     ui.label(RichText::new(self.area_label()).weak());
@@ -907,6 +948,9 @@ impl App {
                         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                         if ui.link(name).on_hover_text(tr!("Show in Explorer", "Показать в Проводнике")).clicked() {
                             win::show_in_explorer(path);
+                        }
+                        if ui.small_button(tr!("Trim…", "Подрезать…")).on_hover_text(tr!("Cut the start and the end off, without re-encoding", "Отрезать начало и конец без перекодирования")).clicked() {
+                            trim = Some(path.clone());
                         }
                     });
                 }
@@ -926,6 +970,9 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
                 ui.label(RichText::new(format!("qrec {}", crate::VERSION)).small().weak());
             });
+            if let Some(path) = trim {
+                self.open_editor(path, ui.ctx());
+            }
         });
     }
 }
@@ -942,6 +989,11 @@ fn title(ui: &egui::Ui, rect: egui::Rect) {
     let galley = ui.fonts_mut(|f| f.layout_job(job));
     let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
     painter.galley(pos, galley, DARK_COLOUR);
+}
+
+/// The trimming window's viewport.
+fn editor_viewport() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("editor")
 }
 
 /// The height of the area buttons and of the record button.

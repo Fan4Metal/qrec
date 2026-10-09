@@ -9,6 +9,7 @@ mod cli;
 mod convert;
 mod cursor;
 mod display;
+mod editor;
 mod encoder;
 mod hotkey;
 mod icon;
@@ -17,6 +18,7 @@ mod recorder;
 mod region;
 mod sessions;
 mod tray;
+mod trim;
 mod venc;
 mod win;
 
@@ -46,7 +48,7 @@ fn settings_file() -> Option<PathBuf> {
 
 /// The app icon rasterised at build time (`build.rs`) as straight RGBA,
 /// 64 x 64 pixels.
-fn embedded_icon() -> egui::IconData {
+pub(crate) fn embedded_icon() -> egui::IconData {
     egui::IconData { rgba: include_bytes!(concat!(env!("OUT_DIR"), "/app_icon_64.rgba")).to_vec(), width: 64, height: 64 }
 }
 
@@ -62,7 +64,8 @@ fn main() -> eframe::Result {
     win::set_dpi_aware();
 
     // The command line modes: a recording without the window, a check of
-    // the selection overlay, the icon for the installer.
+    // the selection overlay, the icon for the installer, a cut.
+    let mut open = None;
     match std::env::args().nth(1).as_deref() {
         Some("--record") => {
             win::attach_parent_console();
@@ -76,6 +79,16 @@ fn main() -> eframe::Result {
             win::attach_parent_console();
             std::process::exit(cli::export_icon(std::env::args_os().nth(2).map(PathBuf::from)));
         }
+        Some("--cut") => {
+            win::attach_parent_console();
+            std::process::exit(cli::cut(std::env::args().skip(2).collect()));
+        }
+        Some("--info") => {
+            win::attach_parent_console();
+            std::process::exit(cli::info(std::env::args_os().nth(2).map(PathBuf::from)));
+        }
+        // A recording to trim, as Explorer's "Open with" passes it.
+        Some(file) if is_mp4(file) => open = Some(PathBuf::from(std::env::args_os().nth(1).unwrap_or_default())),
         Some(other) => {
             win::attach_parent_console();
             eprintln!("qrec: unknown argument {other}");
@@ -102,7 +115,11 @@ fn main() -> eframe::Result {
         persistence_path: portable_dir().map(|d| d.join(SETTINGS_FILE)),
         ..Default::default()
     };
-    eframe::run_native(APP_ID, options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
+    eframe::run_native(APP_ID, options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, open)))))
+}
+
+fn is_mp4(arg: &str) -> bool {
+    std::path::Path::new(arg).extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
 }
 
 /// The release build aborts on a panic and has no console, so the window

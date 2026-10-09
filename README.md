@@ -27,6 +27,7 @@ qrec records a rectangle of the screen, or a whole display, to an MP4 file: H.26
 - **The sound of the computer without "Stereo Mix"**: whatever is played is captured through WASAPI loopback and written as AAC; no virtual cable or driver is needed.
 - **The sound of one program**: instead of the whole system, the sound of a single program can be recorded, and with **Boost** at full volume, whatever its volume in the Volume Mixer.
 - **The pointer** is drawn into the recording, including the inverted I-beam.
+- **Trimming without re-encoding**: the start and the end of a recording are cut off in a window with the frame under the cursor and a timeline; the chosen stretch is copied into a new file as it is, in a moment and without loss of quality.
 - **Three settings**: 30 or 60 frames per second, a quality of three steps (the bitrate follows the size of the area), and whether sound and the pointer are recorded.
 - **A hotkey**: `Ctrl+Alt+R` by default, changed in the window by pressing another combination, or removed.
 - **An icon in the notification area**: red while a recording runs, with the time recorded in its tooltip; its menu starts and stops the recording, and can leave the program in the notification area alone, without a taskbar button, make the window's cross hide it there, or put the window away when a recording starts.
@@ -60,6 +61,14 @@ Requirements: Windows 10 version 2004 or later, 64-bit. On earlier builds of Win
 
 **Record** starts the recording; while it runs, the button shows the time recorded and stops the recording when clicked. The number of frames skipped, if the computer could not keep up, appears below. A red frame surrounds the area while it is recorded. The file is named by the date and time, `qrec_2026-10-08_16-45-12.mp4`, and after the recording its name appears in the window as a link that shows it in Explorer.
 
+### Trimming
+
+A recording usually holds a little of what came before and after what was wanted, as it is started and stopped by hand. **Trim…** beside the name of the last recording opens a window that cuts the start and the end off without re-encoding: the chosen stretch of the file is copied into a new one beside the source, `qrec_2026-10-08_16-45-12_0.02.000-0.14.500.mp4`, as it is, in a moment and without loss of quality; the source is left as it was. The same window opens for an MP4 file dropped onto the qrec window, or given to `qrec.exe` as its argument (Explorer's **Open with**).
+
+The window shows the frame under the cursor and a timeline with the stretch kept and the key frames marked under it. The cursor is moved by dragging on the timeline or with the arrow keys: by a frame, with `Shift` by a key frame, with `Ctrl` by a second; `Home` and `End` go to the first and the last frame. **[ Start here** (`I`) and **End here ]** (`O`) place the start and the end of the stretch on the frame under the cursor; the marks can also be dragged. H.264 is decoded from a key frame, so without re-encoding the stretch can only start on one: the start lands on the key frame at or before the chosen frame. qrec puts a key frame every second, so the start is within a second of the choice; the end is exact to the frame. The sound is cut to the same stretch. **Save the cut** (`Ctrl+S`) writes the file.
+
+The window opens MP4 files with H.264 video and AAC sound, as qrec writes them. Files of other programs usually have key frames every few seconds, which limits where a cut can start.
+
 The area is cut to the monitor it was started on, its sides are made even (as H.264 requires), and it is at least 64 pixels on each side. The whole display is recorded when the area is outside the monitor, for instance after the displays were rearranged.
 
 The icon of qrec in the notification area turns red while a recording runs, and its tooltip shows the time recorded. A click on the icon brings the window to the front; its menu (right button) starts or stops the recording, shows the window, opens **About**, or closes the program. **Not on the taskbar** in the same menu removes the window's button from the taskbar (and from `Alt+Tab`): the minimise button then hides the window, and the icon brings it back. **Hide when closed** makes the cross in the window's corner hide the window instead of closing the program; `Alt+F4` and the **Exit** item still close it. **Minimise when recording starts** minimises the window as a recording starts, however it was started (hidden instead when the window is not on the taskbar). The choices are remembered. Windows 10 places a new icon among the hidden ones, behind the arrow; it can be dragged from there onto the taskbar.
@@ -89,9 +98,14 @@ The audio and the video share one clock, the performance counter of Windows: a p
 
 ```
 qrec.exe --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality low|medium|high] [--no-audio | --audio-app NAME.exe [--no-boost]] [--no-cursor] [--out FILE]
+qrec.exe --cut FILE --from SECONDS --to SECONDS [--out FILE]
+qrec.exe --info FILE
+qrec.exe FILE.mp4
 ```
 
-Records without the window for the given number of seconds, from a console: `--region` is on the virtual screen (physical pixels), `--monitor` counts from 1 with the primary display first, `--audio-app` records the sound of one program, named by its executable (`firefox.exe`) or its full path, boosted unless `--no-boost` is given, and the defaults are the whole primary display, 30 frames per second, medium quality, with sound and the pointer, into `qrec_<date>_<time>.mp4` in the current folder.
+`--record` records without the window for the given number of seconds, from a console: `--region` is on the virtual screen (physical pixels), `--monitor` counts from 1 with the primary display first, `--audio-app` records the sound of one program, named by its executable (`firefox.exe`) or its full path, boosted unless `--no-boost` is given, and the defaults are the whole primary display, 30 frames per second, medium quality, with sound and the pointer, into `qrec_<date>_<time>.mp4` in the current folder.
+
+`--cut` copies the stretch between the two times into a new file without re-encoding, from the key frame at or before `--from` up to the frame before `--to`, into `<name>.cut.mp4` beside the source unless `--out` names the file. `--info` prints the size, the frame rate and the length of a file and the times of its key frames. A file given on its own opens the window with the trimming window on that file.
 
 ## Building
 

@@ -248,7 +248,7 @@ fn add_audio_stream(writer: &IMFSinkWriter, audio: AudioConfig) -> Result<u32> {
 /// The SPS and PPS NAL units of an Annex B sample (start codes kept), as
 /// `MF_MT_MPEG_SEQUENCE_HEADER` wants them; `None` when the sample has
 /// none.
-fn parameter_sets(sample: &IMFSample) -> Result<Option<Vec<u8>>> {
+pub(crate) fn parameter_sets(sample: &IMFSample) -> Result<Option<Vec<u8>>> {
     let buffer = unsafe { sample.ConvertToContiguousBuffer()? };
     let (mut data, mut length) = (std::ptr::null_mut(), 0u32);
     unsafe { buffer.Lock(&mut data, None, Some(&mut length))? };
@@ -285,7 +285,7 @@ fn extract_parameter_sets(bytes: &[u8]) -> Option<Vec<u8>> {
     (!header.is_empty()).then_some(header)
 }
 
-fn mf_version() -> u32 {
+pub(crate) fn mf_version() -> u32 {
     (MF_SDK_VERSION << 16) | MF_API_VERSION
 }
 
