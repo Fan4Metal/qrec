@@ -51,6 +51,29 @@ pub struct Encoder {
     /// Name of the H.264 encoder in use, and whether it is a hardware one.
     pub encoder_name: String,
     pub hardware: bool,
+    // Last: Media Foundation is shut down after the objects above are
+    // released.
+    _mf: Mf,
+}
+
+/// Media Foundation started for as long as the value lives. Declared as
+/// the last field of a struct holding MF objects, so that it is dropped
+/// after them.
+pub(crate) struct Mf;
+
+impl Mf {
+    pub(crate) fn start() -> Result<Mf> {
+        unsafe { MFStartup(mf_version(), MFSTARTUP_FULL)? };
+        Ok(Mf)
+    }
+}
+
+impl Drop for Mf {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = MFShutdown();
+        }
+    }
 }
 
 /// The sink writer, once the first frame is encoded, and what waits for it.
@@ -77,7 +100,7 @@ impl Encoder {
     /// Prepares to write `path`. With `audio`, the file gets an AAC
     /// track for 16-bit stereo PCM at that sample rate.
     pub fn new(path: &Path, device: &ID3D11Device, video: VideoConfig, audio: Option<AudioConfig>) -> Result<Encoder> {
-        unsafe { MFStartup(mf_version(), MFSTARTUP_FULL)? };
+        let mf = Mf::start()?;
         let (mut token, mut manager) = (0u32, None);
         unsafe { MFCreateDXGIDeviceManager(&mut token, &mut manager)? };
         let manager = manager.unwrap();
@@ -90,6 +113,7 @@ impl Encoder {
             _manager: manager,
             encoder_name,
             hardware,
+            _mf: mf,
         })
     }
 
@@ -120,36 +144,42 @@ impl Encoder {
         match &mux.writer {
             Some(writer) => writer.write_audio(samples, time, duration),
             None => {
+                // At most ten seconds wait for the first frame: an encoder
+                // that never delivers one would fill the memory otherwise.
                 mux.pending_audio.push((samples.to_vec(), time, duration));
+                let limit = i64::from(mux.audio.map_or(48_000, |a| a.sample_rate)) * 10 * 2;
+                while mux.pending_audio.len() > 1 && mux.pending_audio.iter().map(|(s, _, _)| s.len() as i64).sum::<i64>() > limit {
+                    mux.pending_audio.remove(0);
+                }
                 Ok(())
             }
         }
     }
 
     /// Completes the file: the encoder is drained and the index written.
+    /// The index is written even when the drain fails (a dead encoder
+    /// after a GPU reset): the frames already written are kept playable,
+    /// and the drain's error is returned after.
     pub fn finish(&self) -> Result<()> {
         let mut video = self.video.lock().unwrap_or_else(|e| e.into_inner());
         let mut mux = self.mux.lock().unwrap_or_else(|e| e.into_inner());
         let mut samples = Vec::new();
-        video.finish(&mut |s| {
+        let drained = video.finish(&mut |s| {
             samples.push(s);
             Ok(())
-        })?;
+        });
+        let mut written = Ok(());
         for sample in samples {
-            mux.write_video(&video, &sample)?;
+            if let Err(e) = mux.write_video(&video, &sample) {
+                written = Err(e);
+                break;
+            }
         }
-        match mux.writer.take() {
+        let finalized = match mux.writer.take() {
             Some(writer) => unsafe { writer.writer.Finalize() },
             None => Ok(()),
-        }
-    }
-}
-
-impl Drop for Encoder {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = MFShutdown();
-        }
+        };
+        drained.and(written).and(finalized)
     }
 }
 

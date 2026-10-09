@@ -15,14 +15,15 @@
 
 use std::mem::ManuallyDrop;
 
-use windows::Win32::Foundation::E_NOTIMPL;
+use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Device,
     ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Media::MediaFoundation::{
-    IMF2DBuffer, IMFActivate, IMFAttributes, IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFMediaType, IMFSample,
+    IMF2DBuffer, IMFActivate, IMFAttributes, IMFDXGIDeviceManager, IMFMediaEvent, IMFMediaEventGenerator, IMFMediaType, IMFSample,
     IMFTransform, MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
     MF_EVENT_FLAG_NO_WAIT, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE,
     MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING, MF_MT_MPEG2_PROFILE,
@@ -33,8 +34,10 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
-    eAVEncH264VProfile_High,
+    MFVideoInterlace_Progressive, MEError, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
+    eAVEncH264VProfile_High, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX,
+    MFCreateAttributes, MFNominalRange_16_235, MFT_ENUM_ADAPTER_LUID, MFTEnum2, MFVideoPrimaries_BT709, MFVideoTransFunc_709,
+    MFVideoTransferMatrix_BT709,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::core::{GUID, Interface, PWSTR, Result};
@@ -68,13 +71,19 @@ impl VideoEncoder {
     /// of `device`, else the software one.
     pub fn new(device: &ID3D11Device, manager: &IMFDXGIDeviceManager, video: VideoConfig) -> Result<VideoEncoder> {
         let mut last_error = None;
+        // The hardware encoders of the capture's adapter: with two (a
+        // laptop's integrated and discrete graphics) the other one's would
+        // be given textures it cannot read.
+        let adapter = adapter_luid(device);
         for (flags, hardware) in [(MFT_ENUM_FLAG_HARDWARE, true), (MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT, false)] {
-            for activate in enumerate(flags | MFT_ENUM_FLAG_SORTANDFILTER)? {
+            for activate in enumerate(flags | MFT_ENUM_FLAG_SORTANDFILTER, adapter.filter(|_| hardware))? {
                 let name = allocated_string(&activate, &MFT_FRIENDLY_NAME_Attribute).unwrap_or_else(|| "H.264 encoder".into());
                 match Self::open(&activate, device, manager, video, name.clone(), hardware) {
                     Ok(encoder) => return Ok(encoder),
                     Err(e) => {
                         log::warn!("encoder {name} refused: {}", crate::win::describe(&e));
+                        // The hardware session it may hold is let go now.
+                        let _ = unsafe { activate.ShutdownObject() };
                         last_error = Some(e);
                     }
                 }
@@ -124,6 +133,7 @@ impl VideoEncoder {
             // A key frame every second: a cut (`trim`) can start on any
             // of them, and seeking stays quick.
             output.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, video.fps)?;
+            set_colours(&output)?;
             transform.SetOutputType(output_id, &output, 0)?;
         }
         let input = unsafe { MFCreateMediaType()? };
@@ -136,6 +146,7 @@ impl VideoEncoder {
             input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             input.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
             input.SetUINT32(&MF_MT_DEFAULT_STRIDE, video.width)?;
+            set_colours(&input)?;
             transform.SetInputType(input_id, &input, 0)?;
         }
         let info = unsafe { transform.GetOutputStreamInfo(output_id)? };
@@ -214,7 +225,7 @@ impl VideoEncoder {
                         if kind == METransformDrainComplete.0 as u32 {
                             break;
                         }
-                        self.handle(kind, out)?;
+                        self.handle(&event, kind, out)?;
                     }
                     Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
                         if std::time::Instant::now() >= deadline {
@@ -240,7 +251,7 @@ impl VideoEncoder {
             match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                 Ok(event) => {
                     let kind = unsafe { event.GetType()? };
-                    self.handle(kind, out)?;
+                    self.handle(&event, kind, out)?;
                 }
                 Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => return Ok(()),
                 Err(e) => return Err(e),
@@ -248,11 +259,17 @@ impl VideoEncoder {
         }
     }
 
-    fn handle(&mut self, kind: u32, out: &mut dyn FnMut(IMFSample) -> Result<()>) -> Result<()> {
+    /// `MEError` (the encoder failed, after a GPU reset for one) is the
+    /// error it carries: without it the encoder would just stop asking
+    /// for input and every frame would count as skipped.
+    fn handle(&mut self, event: &IMFMediaEvent, kind: u32, out: &mut dyn FnMut(IMFSample) -> Result<()>) -> Result<()> {
         if kind == METransformNeedInput.0 as u32 {
             self.wanted += 1;
         } else if kind == METransformHaveOutput.0 as u32 {
             self.output_one(out)?;
+        } else if kind == MEError.0 as u32 {
+            let status = unsafe { event.GetStatus() }.unwrap_or_else(|e| e.code());
+            return Err(windows::core::Error::from_hresult(if status.is_ok() { E_FAIL } else { status }));
         }
         Ok(())
     }
@@ -269,8 +286,11 @@ impl VideoEncoder {
         let sample = if self.provides_samples {
             None
         } else {
+            // An encoder that does not say how large a sample can be gets
+            // the size of a raw frame, which no compressed one exceeds.
+            let size = if self.output_size > 0 { self.output_size } else { self.width * self.height * 3 / 2 };
             let sample = unsafe { MFCreateSample()? };
-            unsafe { sample.AddBuffer(&MFCreateMemoryBuffer(self.output_size.max(1 << 16))?)? };
+            unsafe { sample.AddBuffer(&MFCreateMemoryBuffer(size.max(1 << 16))?)? };
             Some(sample)
         };
         let mut buffer = MFT_OUTPUT_DATA_BUFFER {
@@ -292,7 +312,10 @@ impl VideoEncoder {
             }
             Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(false),
             Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                // The encoder changed its output type (new parameters).
+                // The encoder changed its output type (new parameters). The
+                // file keeps the type it was opened with: an MP4 stream has
+                // one; the parameter sets in the samples carry the change.
+                log::warn!("the encoder changed its output type");
                 let new_type = unsafe { self.transform.GetOutputAvailableType(self.output_id, 0)? };
                 unsafe { self.transform.SetOutputType(self.output_id, &new_type, 0)? };
                 Ok(true)
@@ -363,12 +386,48 @@ fn staging_texture(device: &ID3D11Device, video: VideoConfig) -> Result<ID3D11Te
     Ok(texture.unwrap())
 }
 
-/// The H.264 encoders matching `flags`, best first.
-fn enumerate(flags: MFT_ENUM_FLAG) -> Result<Vec<IMFActivate>> {
+/// The colours of the frames, as the video processor makes them (BT.709,
+/// studio range): the encoder writes them into the stream (VUI) and the
+/// file, so that players do not guess BT.601 for a small picture.
+fn set_colours(media_type: &IMFMediaType) -> Result<()> {
+    unsafe {
+        media_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
+        media_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
+        media_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
+        media_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)
+    }
+}
+
+/// The LUID of the adapter `device` runs on, as `MFT_ENUM_ADAPTER_LUID`
+/// takes it.
+fn adapter_luid(device: &ID3D11Device) -> Option<[u8; 8]> {
+    let adapter = unsafe { device.cast::<IDXGIDevice>().ok()?.GetAdapter().ok()? };
+    let luid = unsafe { adapter.GetDesc().ok()? }.AdapterLuid;
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&luid.LowPart.to_le_bytes());
+    bytes[4..].copy_from_slice(&luid.HighPart.to_le_bytes());
+    Some(bytes)
+}
+
+/// The H.264 encoders matching `flags`, best first; with `adapter`, those
+/// of that adapter (`MFTEnum2`, Windows 10 1703 and later), all of them
+/// when that cannot be asked.
+fn enumerate(flags: MFT_ENUM_FLAG, adapter: Option<[u8; 8]>) -> Result<Vec<IMFActivate>> {
     let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
     let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
     let (mut list, mut count) = (std::ptr::null_mut(), 0u32);
-    unsafe { MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, Some(&input), Some(&output), &mut list, &mut count)? };
+    let on_adapter = adapter.and_then(|luid| {
+        let mut attributes = None;
+        unsafe { MFCreateAttributes(&mut attributes, 1).ok()? };
+        let attributes: IMFAttributes = attributes?;
+        unsafe { attributes.SetBlob(&MFT_ENUM_ADAPTER_LUID, &luid).ok()? };
+        unsafe { MFTEnum2(MFT_CATEGORY_VIDEO_ENCODER, flags, Some(&input), Some(&output), &attributes, &mut list, &mut count) }
+            .inspect_err(|e| log::debug!("MFTEnum2: {}", crate::win::describe(e)))
+            .ok()
+    });
+    if on_adapter.is_none() {
+        unsafe { MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, Some(&input), Some(&output), &mut list, &mut count)? };
+    }
     let mut activates = Vec::with_capacity(count as usize);
     if !list.is_null() {
         for i in 0..count as usize {

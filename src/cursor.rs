@@ -75,6 +75,9 @@ pub struct CursorDrawer {
     width: u32,
     height: u32,
     shape: Option<Shape>,
+    /// A shape that could not be drawn (a type unknown here), so that it
+    /// is not tried again each frame.
+    refused: Option<u64>,
 }
 
 /// The current pointer shape on the GPU, with a patch texture of its
@@ -127,6 +130,7 @@ impl CursorDrawer {
             width,
             height,
             shape: None,
+            refused: None,
         })
     }
 
@@ -137,8 +141,14 @@ impl CursorDrawer {
             return Ok(());
         }
         let Some(shape) = &cursor.shape else { return Ok(()) };
+        if self.refused == Some(shape.generation) {
+            return Ok(());
+        }
         if self.shape.as_ref().map(|s| s.generation) != Some(shape.generation) {
             self.shape = upload(&self.device, &self.context, shape)?;
+            if self.shape.is_none() {
+                self.refused = Some(shape.generation);
+            }
         }
         let Some(s) = &self.shape else { return Ok(()) };
         let (x, y) = (cursor.x - origin.0, cursor.y - origin.1);
