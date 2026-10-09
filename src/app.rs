@@ -1204,6 +1204,8 @@ pub(crate) enum TitleButton {
     Close,
     CloseToTray,
     About,
+    /// An "i" too, with this text as its tooltip.
+    Help(&'static str),
 }
 
 /// A 24 x 24 button of the title row: a dash that minimises (or hides
@@ -1233,12 +1235,15 @@ pub(crate) fn title_button(ui: &mut egui::Ui, kind: TitleButton) -> bool {
                 _ => tr!("Close", "Закрыть"),
             }
         }
-        TitleButton::About => {
+        TitleButton::About | TitleButton::Help(_) => {
             // An "i" in a circle.
             ui.painter().circle_stroke(c, r + 1.5, egui::Stroke::new(1.2, visuals.fg_stroke.color));
             ui.painter().circle_filled(c + Vec2::new(0.0, -2.8), 1.0, visuals.fg_stroke.color);
             ui.painter().line_segment([c + Vec2::new(0.0, -0.8), c + Vec2::new(0.0, 3.5)], stroke);
-            tr!("About", "О программе")
+            match kind {
+                TitleButton::Help(text) => text,
+                _ => tr!("About", "О программе"),
+            }
         }
     };
     response.on_hover_text(hint).clicked()

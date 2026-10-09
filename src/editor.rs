@@ -241,6 +241,9 @@ impl Editor {
                         if title_button(ui, TitleButton::Close) {
                             close = true;
                         }
+                        ui.add_space(4.0);
+                        // The keys, on hover; the button does nothing else.
+                        title_button(ui, TitleButton::Help(help_text()));
                     });
                 });
             });
@@ -754,8 +757,8 @@ impl Editor {
             });
         });
         ui.add_space(2.0);
-        // Two lines, whatever is on them, so the preview above keeps its size.
-        let height = ui.text_style_height(&egui::TextStyle::Body) * 2.0 + 4.0;
+        // A line, empty or not, so the preview above keeps its size.
+        let height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
         ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), height), egui::Layout::top_down(egui::Align::LEFT), |ui| {
             ui.set_min_height(height);
             ui.horizontal_wrapped(|ui| {
@@ -777,11 +780,6 @@ impl Editor {
                 if ui.link(name).on_hover_text(tr!("Show in Explorer", "Показать в Проводнике")).clicked() {
                     win::show_in_explorer(path);
                 }
-            } else {
-                ui.weak(tr!(
-                    "The start is a key frame (the marks under the timeline), the end any frame. Space: play or pause, Shift+Space: the stretch kept; arrows: a frame (Shift: a key frame, Ctrl: a second); I, O: the start, the end; Ctrl+S: save.",
-                    "Начало — на ключевом кадре (отметки под шкалой), конец — на любом. Пробел — воспроизведение и пауза, Shift+пробел — фрагмент; стрелки — кадр (Shift — ключевой, Ctrl — секунда); I, O — начало, конец; Ctrl+S — сохранить."
-                ));
             }
             });
         });
@@ -915,6 +913,29 @@ impl Drop for Editor {
             let _ = thread.join();
         }
     }
+}
+
+/// The tooltip of the "i" in the title row: the keys, and where a cut can
+/// start.
+fn help_text() -> &'static str {
+    tr!(
+        "Space — play or pause\n\
+         Shift+Space — play the stretch kept\n\
+         Left, Right — a frame back or on\n    \
+         with Shift — a key frame, with Ctrl — a second\n\
+         Home, End — the first or the last frame\n\
+         I, O — the start or the end of the stretch here\n\
+         Ctrl+S — save the cut\n\n\
+         The stretch starts on a key frame (the marks under the timeline), the one at or before the frame chosen; it ends on any frame.",
+        "Пробел — воспроизвести или поставить на паузу\n\
+         Shift+пробел — проиграть оставляемый фрагмент\n\
+         Стрелки влево и вправо — кадр назад или вперёд\n    \
+         с Shift — ключевой кадр, с Ctrl — секунда\n\
+         Home, End — первый или последний кадр\n\
+         I, O — начало или конец фрагмента здесь\n\
+         Ctrl+S — сохранить фрагмент\n\n\
+         Фрагмент начинается на ключевом кадре (отметки под шкалой) — на выбранном или предшествующем ему; заканчивается на любом кадре."
+    )
 }
 
 /// The play button: a triangle, or two bars while playing.
