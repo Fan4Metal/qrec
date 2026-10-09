@@ -77,6 +77,8 @@ The **i** button in the window's title row (or **About** in the icon's menu) sho
 
 Closing the window during a recording completes the file first.
 
+One copy of qrec runs at a time. Starting it again brings the running window to the front, even from the notification area, and an MP4 file given to the second start (Explorer's **Open with**) opens in the running copy's trimming window. The command line modes run alongside the window.
+
 ## Sound
 
 The sound is captured with the *process loopback* of Windows 10 version 2004 and later: the audio engine delivers everything that is played by other programs, in floating-point stereo at 48 kHz, regardless of the output device and without "Stereo Mix" or a virtual cable. qrec's own sounds, if any, are left out. Programs that play in WASAPI exclusive mode bypass the audio engine and are not captured.

@@ -23,6 +23,7 @@ mod editor;
 mod encoder;
 mod hotkey;
 mod icon;
+mod instance;
 mod overlay;
 mod recorder;
 mod region;
@@ -106,6 +107,15 @@ fn main() -> eframe::Result {
         }
         None => {}
     }
+
+    // One window at a time: a copy started while another runs brings that
+    // one to the front, or has it open the file given, and exits.
+    let Some(_claim) = instance::claim() else {
+        if !instance::hand_over(open.as_deref()) {
+            log::warn!("the running copy did not take the request");
+        }
+        return Ok(());
+    };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

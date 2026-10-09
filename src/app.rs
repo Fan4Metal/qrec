@@ -98,6 +98,8 @@ pub struct App {
     about: bool,
     /// The trimming window, while one is open.
     editor: Option<Editor>,
+    /// What copies of qrec started later ask of this one.
+    instance: Option<mpsc::Receiver<crate::instance::Request>>,
     /// Where the trimming window was last, in points on the screen (its
     /// outer position, its inner size): where it opens next (`x,y,w,h` in
     /// the settings).
@@ -206,6 +208,7 @@ impl App {
             lang,
             about: false,
             editor: None,
+            instance: crate::instance::listen(cc.egui_ctx.clone()).inspect_err(|e| log::warn!("no instance window: {e}")).ok(),
             editor_rect,
             editor_placement: None,
             trim_replace,
@@ -310,6 +313,19 @@ impl App {
                     self.about = true;
                 }
                 tray::Command::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            }
+        }
+        let requests: Vec<crate::instance::Request> = self.instance.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        for request in requests {
+            match request {
+                // While an area is selected the window stays hidden.
+                _ if self.selecting.is_some() => {}
+                crate::instance::Request::Show => {
+                    if let Some(hwnd) = self.window {
+                        win::show_window(hwnd, true);
+                    }
+                }
+                crate::instance::Request::Open(path) => self.open_editor(path, ctx),
             }
         }
         if self.recorder.as_ref().is_some_and(Recorder::failed) {
