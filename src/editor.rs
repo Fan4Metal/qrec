@@ -26,6 +26,8 @@ const CURSOR_COLOUR: Color32 = Color32::from_rgb(0xe5, 0x39, 0x35);
 enum Request {
     Frame(i64),
     Keys(Vec<i64>),
+    /// Close the file and end the thread.
+    Close,
 }
 
 /// What it answers: the file's headers first, then frames.
@@ -48,6 +50,9 @@ struct Export {
     progress: Arc<Progress>,
     done: mpsc::Receiver<Result<PathBuf, String>>,
     thread: Option<JoinHandle<()>>,
+    /// The cut is written beside the source under another name, to take
+    /// its place once complete.
+    replace: bool,
 }
 
 /// The state of the window.
@@ -75,6 +80,15 @@ pub struct Editor {
     /// The last cut written.
     saved: Option<PathBuf>,
     error: Option<String>,
+    /// Whether a cut takes the place of the file (the file goes to the
+    /// Recycle Bin) instead of going into a new one beside it.
+    pub replace: bool,
+    /// Whether the file on show is a cut that replaced the one opened.
+    replaced: bool,
+    /// The threads reading the file, joined before it is replaced.
+    readers: Vec<JoinHandle<()>>,
+    ctx: egui::Context,
+    viewport: egui::ViewportId,
     /// The window's handle once it exists (found by its title), and the
     /// size and radius its corners were last rounded for.
     window: Option<isize>,
@@ -86,6 +100,8 @@ impl Editor {
     /// from another, both told to repaint `viewport` of `ctx`.
     pub fn open(path: PathBuf, ctx: egui::Context, viewport: egui::ViewportId) -> Editor {
         let cancel = Arc::new(Progress::default());
+        let mut readers = Vec::new();
+        let editor_ctx = ctx.clone();
         let (requests, request_rx) = mpsc::channel::<Request>();
         let (reply_tx, replies) = mpsc::channel();
         let preview_path = path.clone();
@@ -105,13 +121,18 @@ impl Editor {
             while let Ok(request) = request_rx.recv() {
                 // Only the latest frame asked for is decoded.
                 let mut wanted = None;
+                let mut close = false;
                 let mut handle = |request| match request {
                     Request::Frame(t) => wanted = Some(t),
                     Request::Keys(keys) => preview.set_keys(keys),
+                    Request::Close => close = true,
                 };
                 handle(request);
                 while let Ok(request) = request_rx.try_recv() {
                     handle(request);
+                }
+                if close {
+                    break;
                 }
                 if let Some(time) = wanted {
                     let reply = match preview.frame(time, PREVIEW_SIDE) {
@@ -124,8 +145,9 @@ impl Editor {
                 }
             }
         });
-        if let Err(e) = spawned {
-            log::error!("no preview thread: {e}");
+        match spawned {
+            Ok(thread) => readers.push(thread),
+            Err(e) => log::error!("no preview thread: {e}"),
         }
         let (frames_tx, frames_rx) = mpsc::channel();
         let frames_path = path.clone();
@@ -136,8 +158,9 @@ impl Editor {
             let _ = frames_tx.send(trim::frames(&frames_path, &frames_cancel.cancel).map_err(|e| win::describe(&e)));
             frames_ctx.request_repaint_of(viewport);
         });
-        if let Err(e) = spawned {
-            log::error!("no frames thread: {e}");
+        match spawned {
+            Ok(thread) => readers.push(thread),
+            Err(e) => log::error!("no frames thread: {e}"),
         }
         Editor {
             path,
@@ -156,6 +179,11 @@ impl Editor {
             export: None,
             saved: None,
             error: None,
+            replace: false,
+            replaced: false,
+            readers,
+            ctx: editor_ctx,
+            viewport,
             window: None,
             rounded: None,
         }
@@ -292,6 +320,13 @@ impl Editor {
         }
         if let Some(export) = &mut self.export {
             match export.done.try_recv() {
+                Ok(Ok(path)) if export.replace => {
+                    if let Some(thread) = export.thread.take() {
+                        let _ = thread.join();
+                    }
+                    self.export = None;
+                    self.take_place(path);
+                }
                 Ok(Ok(path)) => {
                     self.saved = Some(path);
                     self.error = None;
@@ -305,6 +340,35 @@ impl Editor {
                 Err(mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
             }
         }
+    }
+
+    /// Puts the cut written to `cut` in the place of the file: the readers
+    /// let go of it, it goes to the Recycle Bin and the cut takes its name;
+    /// then the window shows the cut. When the file cannot be moved (open
+    /// in a player), the cut is deleted and the file stays as it was.
+    fn take_place(&mut self, cut: PathBuf) {
+        let _ = self.requests.send(Request::Close);
+        self.cancel.cancel.store(true, Relaxed);
+        for thread in self.readers.drain(..) {
+            let _ = thread.join();
+        }
+        let path = self.path.clone();
+        let result = win::recycle(&path).and_then(|()| std::fs::rename(&cut, &path).map_err(|e| e.to_string()));
+        let replace = self.replace;
+        match result {
+            Ok(()) => {
+                log::debug!("{} replaced by its cut", path.display());
+                *self = Editor::open(path, self.ctx.clone(), self.viewport);
+                self.replaced = true;
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&cut);
+                log::warn!("could not replace {}: {e}", path.display());
+                *self = Editor::open(path, self.ctx.clone(), self.viewport);
+                self.error = Some(format!("{}: {e}", tr!("The file could not be replaced", "Не удалось заменить файл")));
+            }
+        }
+        self.replace = replace;
     }
 
     /// Asks the preview thread for the frame at `time`, once.
@@ -549,14 +613,18 @@ impl Editor {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let can_save = ready && self.export.is_none() && self.end > self.start;
                 let save = egui::Button::new(RichText::new(tr!("Save the cut", "Сохранить фрагмент")).strong()).min_size(Vec2::new(0.0, 26.0));
-                if ui
-                    .add_enabled(can_save, save)
-                    .on_hover_text(tr!(
+                let hint = if self.replace {
+                    tr!(
+                        "In place of this file, without re-encoding; this file goes to the Recycle Bin (Ctrl+S)",
+                        "Вместо этого файла, без перекодирования; этот файл уходит в корзину (Ctrl+S)"
+                    )
+                } else {
+                    tr!(
                         "Into a new file beside this one, without re-encoding (Ctrl+S)",
                         "В новый файл рядом с этим, без перекодирования (Ctrl+S)"
-                    ))
-                    .clicked()
-                {
+                    )
+                };
+                if ui.add_enabled(can_save, save).on_hover_text(hint).clicked() {
                     self.save();
                 }
                 if let Some(export) = &self.export
@@ -587,6 +655,15 @@ impl Editor {
                     ui.weak(tr!("listing the frames…", "кадры перечисляются…"));
                 }
             }
+            // Under the save button, which it changes.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_enabled_ui(self.export.is_none(), |ui| {
+                    ui.checkbox(&mut self.replace, tr!("Replace the original", "Заменить исходный файл")).on_hover_text(tr!(
+                        "The cut takes the place of this file instead of going into a new one; this file goes to the Recycle Bin.",
+                        "Фрагмент сохраняется вместо этого файла, а не в новый; этот файл уходит в корзину."
+                    ));
+                });
+            });
         });
         ui.add_space(2.0);
         // Two lines, whatever is on them, so the preview above keeps its size.
@@ -601,6 +678,11 @@ impl Editor {
                 ui.weak(tr!("Saving…", "Сохраняется…"));
             } else if let Some(e) = &self.error {
                 ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
+            } else if self.replaced && self.saved.is_none() {
+                ui.label(tr!(
+                    "The file was replaced by the cut; the original is in the Recycle Bin.",
+                    "Файл заменён фрагментом; исходный — в корзине."
+                ));
             } else if let Some(path) = &self.saved {
                 ui.label(tr!("Saved:", "Сохранено:"));
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -700,7 +782,8 @@ impl Editor {
 
     /// Starts the cut into a new file beside the source.
     fn save(&mut self) {
-        let dst = cut_path(&self.path, self.start, self.end);
+        let replace = self.replace;
+        let dst = if replace { replacement_path(&self.path) } else { cut_path(&self.path, self.start, self.end) };
         let (src, start, end) = (self.path.clone(), self.start, self.end);
         let progress = Arc::new(Progress::default());
         let worker = Arc::clone(&progress);
@@ -722,7 +805,8 @@ impl Editor {
             .ok();
         self.saved = None;
         self.error = None;
-        self.export = Some(Export { progress, done, thread });
+        self.replaced = false;
+        self.export = Some(Export { progress, done, thread, replace });
     }
 }
 
@@ -736,6 +820,13 @@ impl Drop for Editor {
             }
         }
     }
+}
+
+/// Where a cut that is to replace `src` is written first: beside it,
+/// `<name>.trimming.mp4` (left over from an interrupted cut, overwritten).
+fn replacement_path(src: &Path) -> PathBuf {
+    let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "cut".into());
+    src.with_file_name(format!("{stem}.trimming.mp4"))
 }
 
 /// `<name>_<start>-<end>.mp4` beside `src`, with a counter when taken.

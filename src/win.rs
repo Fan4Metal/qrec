@@ -37,6 +37,28 @@ pub fn strip_caption(hwnd: isize) -> bool {
     }
 }
 
+/// Moves a file to the Recycle Bin (deleted outright on a drive without
+/// one), without asking or showing progress.
+pub fn recycle(path: &std::path::Path) -> Result<(), String> {
+    use windows::Win32::UI::Shell::{FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW, SHFileOperationW};
+    // A list of paths, each ended by a null, the list by another.
+    let mut from = wide(path);
+    from.push(0);
+    let mut op = SHFILEOPSTRUCTW {
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        fFlags: (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_NOERRORUI.0 | FOF_SILENT.0) as u16,
+        ..Default::default()
+    };
+    match unsafe { SHFileOperationW(&mut op) } {
+        0 if !op.fAnyOperationsAborted.as_bool() => Ok(()),
+        0 => Err("cancelled".into()),
+        // Mostly Win32 error codes (a sharing violation for a file open
+        // in a player).
+        code => Err(describe(&windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(code as u32)))),
+    }
+}
+
 /// The handle of the top-level window titled `title`, if there is one.
 pub fn find_window(title: &str) -> Option<isize> {
     use windows::Win32::UI::WindowsAndMessaging::FindWindowW;

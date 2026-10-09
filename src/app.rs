@@ -42,6 +42,7 @@ const MINIMISE_ON_RECORD_KEY: &str = "minimise_on_record";
 const TRIM_AFTER_RECORD_KEY: &str = "trim_after_record";
 const LANGUAGE_KEY: &str = "language";
 const EDITOR_RECT_KEY: &str = "editor_rect";
+const TRIM_REPLACE_KEY: &str = "trim_replace";
 
 /// Width of the language list in About, enough for its longest entry.
 const LANG_WIDTH: f32 = 220.0;
@@ -104,6 +105,8 @@ pub struct App {
     /// Where the open trimming window was placed, passed with its viewport
     /// every frame (a changed position would move it).
     editor_placement: Option<egui::Rect>,
+    /// Whether a cut replaces the file it was made from.
+    trim_replace: bool,
     /// The icon of About, rasterised at the display's pixel density.
     about_icon: Option<egui::TextureHandle>,
     /// The next key press becomes the hotkey.
@@ -152,6 +155,7 @@ impl App {
         let trim_after_record = get(TRIM_AFTER_RECORD_KEY).as_deref() == Some("true");
         let lang = get(LANGUAGE_KEY).and_then(|l| LangChoice::from_name(&l)).unwrap_or_default();
         let editor_rect = get(EDITOR_RECT_KEY).and_then(|r| rect_from_setting(&r));
+        let trim_replace = get(TRIM_REPLACE_KEY).as_deref() == Some("true");
         crate::i18n::set_lang(lang.resolve());
         let cursor = get(CURSOR_KEY).as_deref() != Some("false");
         let folder = get(FOLDER_KEY).map(PathBuf::from).unwrap_or_else(default_folder);
@@ -204,6 +208,7 @@ impl App {
             editor: None,
             editor_rect,
             editor_placement: None,
+            trim_replace,
             about_icon: None,
             hotkey: None,
             hotkey_error: None,
@@ -508,7 +513,9 @@ impl App {
                 (m.rect.left as f32..m.rect.right as f32).contains(&centre.x) && (m.rect.top as f32..m.rect.bottom as f32).contains(&centre.y)
             })
         });
-        self.editor = Some(Editor::open(path, ctx.clone(), editor_viewport()));
+        let mut editor = Editor::open(path, ctx.clone(), editor_viewport());
+        editor.replace = self.trim_replace;
+        self.editor = Some(editor);
     }
 
     /// The trimming window, a viewport of its own.
@@ -539,6 +546,7 @@ impl App {
         if let Some(rect) = rect {
             self.editor_rect = Some(rect);
         }
+        self.trim_replace = editor.replace;
         if close {
             self.editor = None;
         }
@@ -762,6 +770,7 @@ impl eframe::App for App {
         storage.set_string(TRIM_AFTER_RECORD_KEY, self.trim_after_record.to_string());
         storage.set_string(LANGUAGE_KEY, self.lang.name().to_owned());
         storage.set_string(EDITOR_RECT_KEY, self.editor_rect.map(rect_to_setting).unwrap_or_default());
+        storage.set_string(TRIM_REPLACE_KEY, self.trim_replace.to_string());
         storage.set_string(CURSOR_KEY, self.cursor.to_string());
         storage.set_string(FOLDER_KEY, self.folder.display().to_string());
         storage.set_string(HOTKEY_KEY, self.chord.map(|c| c.label()).unwrap_or_default());
