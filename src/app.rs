@@ -160,6 +160,9 @@ impl App {
 
         // Light, whatever Windows uses, like the other small tools.
         cc.egui_ctx.set_theme(egui::ThemePreference::Light);
+        // Tooltips are 500 points wide by default, wider than the window,
+        // which cuts them off at its edge: a long one wraps within it.
+        cc.egui_ctx.all_styles_mut(|style| style.spacing.tooltip_width = WINDOW_SIZE[0] - 80.0);
         let mut app = App {
             monitors,
             monitor,
