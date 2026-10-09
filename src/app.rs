@@ -288,6 +288,7 @@ impl App {
     }
 
     fn toggle(&mut self, ctx: &egui::Context) {
+        log::debug!("toggle: recording {}", self.recorder.is_some());
         if self.recorder.is_some() {
             self.stop();
         } else {
@@ -340,6 +341,7 @@ impl App {
         self.border = None;
         if let Some(recorder) = self.recorder.take() {
             let path = recorder.path.clone();
+            log::debug!("stopping");
             self.notice = match recorder.stop() {
                 Ok(_) => Notice::Saved(path),
                 Err(e) => Notice::Error(e),
@@ -454,6 +456,18 @@ impl App {
         });
         if modal.inner || modal.should_close() {
             self.about = false;
+        }
+    }
+
+    /// The icon's state: the clock while recording, and the menu's ticks.
+    fn update_tray(&self) {
+        if let Some((tray, _)) = &self.tray {
+            tray.set(tray::Status {
+                clock: self.clock(),
+                tray_only: !self.taskbar,
+                close_to_tray: self.close_to_tray,
+                minimise_on_record: self.minimise_on_record,
+            });
         }
     }
 
@@ -606,14 +620,7 @@ impl eframe::App for App {
 
         self.about_window(&ctx);
 
-        if let Some((tray, _)) = &self.tray {
-            tray.set(tray::Status {
-                clock: self.clock(),
-                tray_only: !self.taskbar,
-                close_to_tray: self.close_to_tray,
-                minimise_on_record: self.minimise_on_record,
-            });
-        }
+        self.update_tray();
         // winit sets the window's style again whenever it changes its
         // state (it shows the window after the first frame, for one).
         if let (Some(hwnd), true) = (self.window, self.tray_only()) {
@@ -622,6 +629,18 @@ impl eframe::App for App {
 
         if busy {
             ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
+    /// While the window is minimised or hidden, eframe runs no egui pass
+    /// and calls this instead of `ui`: the hotkey, the tray and a failed
+    /// recording are attended to all the same, so a recording can be
+    /// stopped while the window is out of the way.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll(ctx);
+        self.update_tray();
+        if self.recorder.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
 
