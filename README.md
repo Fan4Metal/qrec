@@ -15,7 +15,7 @@
 qrec records a rectangle of the screen, or a whole display, to an MP4 file: H.264 video encoded by the graphics card, the sound the computer plays as AAC, and the pointer. The window holds the few settings there are, and a global hotkey starts and stops the recording from anywhere.
 
 <p align="center">
-  <img src="images/screenshot.png" width="560" alt="The qrec window: display, area, frame rate, quality, sound and pointer, folder, hotkey, and the Record button">
+  <img src="images/screenshot.png" width="560" alt="The qrec window: display, proportions, frame rate, quality, sound and pointer, the sound source, folder, hotkey, the area buttons and the Record button">
 </p>
 
 *The window of version 0.1.0.*
