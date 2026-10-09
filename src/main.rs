@@ -36,8 +36,9 @@ mod win;
 
 use std::path::PathBuf;
 
-/// Version from Cargo.toml, shown in the window; a development version
-/// ("0.1.0-dev") carries the commit it was built from (`build.rs`).
+/// Version from Cargo.toml, shown in About; a development version
+/// ("0.1.0-dev") carries the commit it was built from (`build.rs`) and is
+/// also shown in the corner of the window.
 pub const VERSION: &str = env!("QREC_VERSION");
 /// eframe app id; also names the settings folder in `%APPDATA%`.
 pub const APP_ID: &str = "qrec";
@@ -46,10 +47,15 @@ pub const APP_ID: &str = "qrec";
 pub const SETTINGS_FILE: &str = "app.ron";
 
 /// The folder beside the exe when it holds `SETTINGS_FILE`: the program
-/// is portable and keeps its settings there.
+/// is portable and keeps its settings there. Looked up once: eframe takes
+/// the settings path at start-up, and About shows where they go.
 fn portable_dir() -> Option<PathBuf> {
-    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    dir.join(SETTINGS_FILE).is_file().then_some(dir)
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        dir.join(SETTINGS_FILE).is_file().then_some(dir)
+    })
+    .clone()
 }
 
 /// The settings file: beside the exe when portable, else where eframe

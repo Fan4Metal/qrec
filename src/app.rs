@@ -475,7 +475,7 @@ impl App {
                 }
                 ui.weak(tr!(format!("{LICENSE} License"), format!("Лицензия {LICENSE}")));
                 let place = if crate::portable_dir().is_some() {
-                    ui.weak(tr!("Settings: beside the program (portable)", "Настройки: рядом с программой (переносная версия)"))
+                    ui.weak(tr!("Settings: beside the program (portable)", "Настройки: рядом с программой (портативная версия)"))
                 } else {
                     ui.weak(tr!("Settings: in the user profile", "Настройки: в профиле пользователя"))
                 };
@@ -1058,9 +1058,13 @@ impl App {
                     ui.label(RichText::new(text).weak());
                 }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
-                ui.label(RichText::new(format!("qrec {}", crate::VERSION)).small().weak());
-            });
+            // A development build says which one it is; a release has it
+            // in About only.
+            if crate::VERSION.contains("-dev") {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
+                    ui.label(RichText::new(format!("qrec {}", crate::VERSION)).small().weak());
+                });
+            }
             if let Some(path) = trim {
                 self.open_editor(path, ui.ctx());
             }
