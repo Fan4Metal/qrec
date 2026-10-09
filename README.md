@@ -59,7 +59,7 @@ Requirements: Windows 10 version 2004 or later, 64-bit. On earlier builds of Win
 | Folder | Where the files go; `Videos` by default. **Open** shows the folder in Explorer. |
 | Hotkey | Starts and stops the recording from any window. A click on **Change**, then a key with `Ctrl`, `Alt` or `Win`, or a function key, sets another one; `Esc` or **Cancel** keeps the current one; the cross beside **Change** removes the hotkey. A combination held by another program is reported as not available. |
 
-**Record** starts the recording; while it runs, the button shows the time recorded and stops the recording when clicked. The number of frames skipped, if the computer could not keep up, appears below. A red frame surrounds the area while it is recorded. The file is named by the date and time, `qrec_2026-10-08_16-45-12.mp4`, and after the recording its name appears in the window as a link that shows it in Explorer.
+**Record** starts the recording; while it runs, the button shows the time recorded and stops the recording when clicked. The number of frames skipped, if the computer could not keep up, appears below. A red frame surrounds the area while it is recorded. The file is named by the date and time, `qrec_2026-10-08_16-45-12.mp4`, and after the recording its name appears in the window as a link that shows it in Explorer, with **Trim…** beside it (see [Trimming](#trimming)) and a button with a waste bin that moves the file to the Recycle Bin, for a take that is not worth keeping.
 
 ### Trimming
 

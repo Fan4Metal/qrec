@@ -812,6 +812,8 @@ impl Editor {
 }
 
 impl Drop for Editor {
+    /// Waits for the threads, so the file is no longer open once the
+    /// editor is gone (it may be deleted next).
     fn drop(&mut self) {
         self.cancel.cancel.store(true, Relaxed);
         if let Some(mut export) = self.export.take() {
@@ -819,6 +821,10 @@ impl Drop for Editor {
             if let Some(thread) = export.thread.take() {
                 let _ = thread.join();
             }
+        }
+        let _ = self.requests.send(Request::Close);
+        for thread in self.readers.drain(..) {
+            let _ = thread.join();
         }
     }
 }

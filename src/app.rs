@@ -1009,6 +1009,7 @@ impl App {
             ui.set_min_height(height);
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             let mut trim = None;
+            let mut discard = None;
             match &self.notice {
                 Notice::None => {
                     ui.label(RichText::new(self.area_label()).weak());
@@ -1022,6 +1023,9 @@ impl App {
                         }
                         if ui.small_button(tr!("Trim…", "Обрезать…")).on_hover_text(tr!("Cut the start and the end off, without re-encoding", "Отрезать начало и конец без перекодирования")).clicked() {
                             trim = Some(path.clone());
+                        }
+                        if trash_button(ui).on_hover_text(tr!("Move the file to the Recycle Bin", "Удалить файл в корзину")).clicked() {
+                            discard = Some(path.clone());
                         }
                     });
                 }
@@ -1044,7 +1048,23 @@ impl App {
             if let Some(path) = trim {
                 self.open_editor(path, ui.ctx());
             }
+            if let Some(path) = discard {
+                self.discard(&path);
+            }
         });
+    }
+
+    /// Moves a recording to the Recycle Bin, closing the trimming window
+    /// first when it shows that file (its readers hold the file open).
+    fn discard(&mut self, path: &Path) {
+        if self.editor.as_ref().is_some_and(|e| e.path == path) {
+            self.editor = None;
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.notice = match win::recycle(path) {
+            Ok(()) => Notice::Info(tr!(format!("{name} is in the Recycle Bin"), format!("{name} удалён в корзину"))),
+            Err(e) => Notice::Error(format!("{}: {e}", tr!("The file could not be deleted", "Не удалось удалить файл"))),
+        };
     }
 }
 
@@ -1218,6 +1238,28 @@ fn cross_button(ui: &mut egui::Ui) -> egui::Response {
     let stroke = egui::Stroke::new(1.5, visuals.fg_stroke.color);
     ui.painter().line_segment([c + Vec2::new(-r, -r), c + Vec2::new(r, r)], stroke);
     ui.painter().line_segment([c + Vec2::new(-r, r), c + Vec2::new(r, -r)], stroke);
+    response
+}
+
+/// A small button with a waste bin, as high as a small button's text.
+fn trash_button(ui: &mut egui::Ui) -> egui::Response {
+    let side = ui.text_style_height(&egui::TextStyle::Body) + 2.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    ui.painter().rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
+    let stroke = egui::Stroke::new(1.2, visuals.fg_stroke.color);
+    let c = rect.center();
+    let u = side / 16.0;
+    let p = |x: f32, y: f32| c + Vec2::new(x * u, y * u);
+    let painter = ui.painter();
+    // The lid with its handle, the body narrowing downwards, two ribs.
+    painter.line_segment([p(-5.0, -3.5), p(5.0, -3.5)], stroke);
+    painter.line_segment([p(-1.5, -3.5), p(-1.5, -5.5)], stroke);
+    painter.line_segment([p(-1.5, -5.5), p(1.5, -5.5)], stroke);
+    painter.line_segment([p(1.5, -5.5), p(1.5, -3.5)], stroke);
+    painter.add(egui::Shape::closed_line(vec![p(-4.0, -3.5), p(-3.2, 5.5), p(3.2, 5.5), p(4.0, -3.5)], stroke));
+    painter.line_segment([p(-1.2, -1.0), p(-1.0, 3.5)], stroke);
+    painter.line_segment([p(1.2, -1.0), p(1.0, 3.5)], stroke);
     response
 }
 
