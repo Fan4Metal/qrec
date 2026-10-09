@@ -45,10 +45,23 @@ fn coverage(d: f32, px: f32) -> f32 {
     (0.5 - d / px).clamp(0.0, 1.0)
 }
 
+/// Which icon is drawn.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    App,
+    /// The notification area: the frame near the edge and a larger dot.
+    /// Its dark square all but disappears on a dark taskbar, and with the
+    /// app's proportions only the frame inside showed, which made the
+    /// icon look smaller than its neighbours.
+    Tray,
+    /// The notification area while recording: the square red, the dot white.
+    TrayRecording,
+}
+
 /// Colour at `(fx, fy)` in 0..1 of the icon, `px` the size of a pixel.
-/// While recording (the icon in the notification area) the square is red
-/// and the dot white.
-fn sample(fx: f32, fy: f32, px: f32, recording: bool) -> Rgba {
+fn sample(fx: f32, fy: f32, px: f32, kind: Kind) -> Rgba {
+    let recording = kind == Kind::TrayRecording;
+    let (inset, radius) = if kind == Kind::App { (0.19, 0.17) } else { (0.1, 0.21) };
     let (x, y) = (fx - 0.5, fy - 0.5);
     let mut c = [0.0; 4];
     // The square.
@@ -58,7 +71,6 @@ fn sample(fx: f32, fy: f32, px: f32, recording: bool) -> Rgba {
     c = over(c, back);
     // The frame: a light rounded outline, at least one pixel thick, with
     // its corners emphasised so it reads as a selection.
-    let inset = 0.19;
     let thick = (0.045f32).max(px);
     let d = rounded_box(x, y, 0.5 - inset, 0.05).abs() - thick / 2.0;
     let mut frame = hex(0xdc_e3_ea);
@@ -74,7 +86,7 @@ fn sample(fx: f32, fy: f32, px: f32, recording: bool) -> Rgba {
     }
     c = over(c, frame);
     // The dot.
-    let dot = (x * x + y * y).sqrt() - 0.17;
+    let dot = (x * x + y * y).sqrt() - radius;
     let mut dot_colour = hex(if recording { 0xff_ff_ff } else { 0xe5_39_35 });
     dot_colour[3] = coverage(dot, px);
     c = over(c, dot_colour);
@@ -83,15 +95,15 @@ fn sample(fx: f32, fy: f32, px: f32, recording: bool) -> Rgba {
 
 /// The icon as straight RGBA, `size` x `size`, supersampled.
 pub fn rgba(size: u32) -> Vec<u8> {
-    rgba_of(size, false)
+    rgba_of(size, Kind::App)
 }
 
-/// The icon of the notification area while recording.
-pub fn recording_rgba(size: u32) -> Vec<u8> {
-    rgba_of(size, true)
+/// The icon of the notification area, idle or recording.
+pub fn tray_rgba(size: u32, recording: bool) -> Vec<u8> {
+    rgba_of(size, if recording { Kind::TrayRecording } else { Kind::Tray })
 }
 
-fn rgba_of(size: u32, recording: bool) -> Vec<u8> {
+fn rgba_of(size: u32, kind: Kind) -> Vec<u8> {
     const SS: u32 = 5;
     let n = size as usize;
     let px = 1.0 / size as f32;
@@ -104,7 +116,7 @@ fn rgba_of(size: u32, recording: bool) -> Vec<u8> {
                 for sx in 0..SS {
                     let fx = (x as f32 + (sx as f32 + 0.5) / SS as f32) * px;
                     let fy = (y as f32 + (sy as f32 + 0.5) / SS as f32) * px;
-                    let c = sample(fx, fy, px, recording);
+                    let c = sample(fx, fy, px, kind);
                     for i in 0..3 {
                         acc[i] += c[i] * c[3];
                     }
@@ -196,9 +208,9 @@ mod tests {
         assert_eq!(px[centre + 3], 255);
         assert!(px[centre] > 200 && px[centre + 1] < 80);
         // While recording: a red square, the dot white.
-        let rec = recording_rgba(32);
+        let rec = tray_rgba(32, true);
         assert!(rec[centre] > 240 && rec[centre + 1] > 240 && rec[centre + 2] > 240);
-        let edge = (16 * 32 + 3) * 4;
+        let edge = (16 * 32 + 1) * 4;
         assert!(rec[edge] > 200 && rec[edge + 1] < 80 && rec[edge + 3] == 255);
         let ico = ico(&[16, 32]);
         assert_eq!(&ico[..6], &[0, 0, 1, 0, 2, 0]);

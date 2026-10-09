@@ -199,7 +199,7 @@ unsafe fn create_window() -> Result<HWND, String> {
 /// 16 px at 100 %, 24 at 150 %).
 fn load_icon(recording: bool) -> HICON {
     let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.clamp(16, 64) as u32;
-    let rgba = if recording { crate::icon::recording_rgba(size) } else { crate::icon::rgba(size) };
+    let rgba = crate::icon::tray_rgba(size, recording);
     let entry = crate::icon::bmp_entry(size, &rgba);
     unsafe { CreateIconFromResourceEx(&entry, true, 0x0003_0000, size as i32, size as i32, LR_DEFAULTCOLOR) }.unwrap_or_default()
 }
