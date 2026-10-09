@@ -37,12 +37,17 @@ pub fn strip_caption(hwnd: isize) -> bool {
     }
 }
 
-/// Moves a file to the Recycle Bin (deleted outright on a drive without
-/// one), without asking or showing progress.
-pub fn recycle(path: &std::path::Path) -> Result<(), String> {
+/// Moves a file to the Recycle Bin, without asking or showing progress.
+/// `Ok(true)` when it went there, `Ok(false)` when it was deleted outright:
+/// a network or removable drive has no Recycle Bin.
+pub fn recycle(path: &std::path::Path) -> Result<bool, String> {
     use windows::Win32::UI::Shell::{FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW, SHFileOperationW};
+    // The shell wants a full path; a relative one is taken from its own
+    // current folder.
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let recycled = has_recycle_bin(&path);
     // A list of paths, each ended by a null, the list by another.
-    let mut from = wide(path);
+    let mut from = wide(&path);
     from.push(0);
     let mut op = SHFILEOPSTRUCTW {
         wFunc: FO_DELETE,
@@ -51,12 +56,25 @@ pub fn recycle(path: &std::path::Path) -> Result<(), String> {
         ..Default::default()
     };
     match unsafe { SHFileOperationW(&mut op) } {
-        0 if !op.fAnyOperationsAborted.as_bool() => Ok(()),
+        0 if !op.fAnyOperationsAborted.as_bool() => Ok(recycled),
         0 => Err("cancelled".into()),
         // Mostly Win32 error codes (a sharing violation for a file open
         // in a player).
         code => Err(describe(&windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(code as u32)))),
     }
+}
+
+/// Whether the drive of `path` has a Recycle Bin: a fixed drive whose bin
+/// the shell can query (network and removable drives have none).
+fn has_recycle_bin(path: &std::path::Path) -> bool {
+    use std::path::Component;
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows::Win32::UI::Shell::{SHQUERYRBINFO, SHQueryRecycleBinW};
+    const DRIVE_FIXED: u32 = 3;
+    let Some(Component::Prefix(prefix)) = path.components().next() else { return false };
+    let root = wide(format!("{}\\", prefix.as_os_str().to_string_lossy()));
+    let mut info = SHQUERYRBINFO { cbSize: std::mem::size_of::<SHQUERYRBINFO>() as u32, ..Default::default() };
+    unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) == DRIVE_FIXED && SHQueryRecycleBinW(PCWSTR(root.as_ptr()), &mut info).is_ok() }
 }
 
 /// The handle of the top-level window titled `title`, if there is one.
@@ -254,6 +272,11 @@ pub fn show_window(hwnd: isize, show: bool) {
     }
 }
 
+/// Whether the window is minimised.
+pub fn is_minimised(hwnd: isize) -> bool {
+    unsafe { windows::Win32::UI::WindowsAndMessaging::IsIconic(HWND(hwnd as *mut _)).as_bool() }
+}
+
 /// Puts the window's button on the taskbar or takes it off. winit marks
 /// its windows for the taskbar (`WS_EX_APPWINDOW`), so without a button
 /// the window is a tool window instead, which also leaves it out of
@@ -285,6 +308,15 @@ pub fn set_taskbar_button(hwnd: isize, show: bool, refresh: bool) {
             let _ = ShowWindow(hwnd, SW_SHOW);
             renew_exclusion(hwnd);
         }
+    }
+}
+
+/// Moves the window's outer top-left corner to `(x, y)`, physical pixels
+/// on the virtual screen.
+pub fn move_window(hwnd: isize, x: i32, y: i32) {
+    use windows::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos};
+    unsafe {
+        let _ = SetWindowPos(HWND(hwnd as *mut _), None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 

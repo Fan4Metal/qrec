@@ -24,6 +24,7 @@ mod encoder;
 mod hotkey;
 mod icon;
 mod instance;
+mod mp4;
 mod overlay;
 mod playback;
 mod recorder;
@@ -83,11 +84,14 @@ fn main() -> eframe::Result {
 
     // The command line modes: a recording without the window, a check of
     // the selection overlay, the icon for the installer, a cut.
+    // `args_os`: `args` panics on an argument that is not valid Unicode.
+    let args = || std::env::args_os().skip(2).map(|a| a.to_string_lossy().into_owned()).collect();
+    let first = std::env::args_os().nth(1).map(|a| a.to_string_lossy().into_owned());
     let mut open = None;
-    match std::env::args().nth(1).as_deref() {
+    match first.as_deref() {
         Some("--record") => {
             console_mode();
-            std::process::exit(cli::record(std::env::args().skip(2).collect()));
+            std::process::exit(cli::record(args()));
         }
         Some("--test-select") => {
             console_mode();
@@ -99,14 +103,18 @@ fn main() -> eframe::Result {
         }
         Some("--cut") => {
             console_mode();
-            std::process::exit(cli::cut(std::env::args().skip(2).collect()));
+            std::process::exit(cli::cut(args()));
         }
         Some("--info") => {
             console_mode();
             std::process::exit(cli::info(std::env::args_os().nth(2).map(PathBuf::from)));
         }
-        // A recording to trim, as Explorer's "Open with" passes it.
-        Some(file) if is_mp4(file) => open = Some(PathBuf::from(std::env::args_os().nth(1).unwrap_or_default())),
+        // A recording to trim, as Explorer's "Open with" passes it. Made
+        // absolute: a running copy, given it, has another current folder.
+        Some(file) if is_mp4(file) => {
+            let path = PathBuf::from(std::env::args_os().nth(1).unwrap_or_default());
+            open = Some(std::path::absolute(&path).unwrap_or(path));
+        }
         Some(other) => {
             console_mode();
             say!("qrec: unknown argument {other}");
@@ -120,6 +128,13 @@ fn main() -> eframe::Result {
     let Some(_claim) = instance::claim() else {
         if !instance::hand_over(open.as_deref()) {
             log::warn!("the running copy did not take the request");
+            win::error_box(
+                "qrec",
+                tr!(
+                    "qrec is already running, but did not answer. It may be busy or still starting; it can be closed from the icon in the notification area.",
+                    "qrec уже запущен, но не ответил. Возможно, он занят или ещё запускается; его можно закрыть через значок в области уведомлений."
+                ),
+            );
         }
         return Ok(());
     };

@@ -41,7 +41,9 @@ const CLOSE_TO_TRAY_KEY: &str = "close_to_tray";
 const MINIMISE_ON_RECORD_KEY: &str = "minimise_on_record";
 const TRIM_AFTER_RECORD_KEY: &str = "trim_after_record";
 const LANGUAGE_KEY: &str = "language";
-const EDITOR_RECT_KEY: &str = "editor_rect";
+/// Not `editor_rect`, which held the position in points: a value of that
+/// is not taken for pixels.
+const EDITOR_RECT_KEY: &str = "editor_window";
 const TRIM_REPLACE_KEY: &str = "trim_replace";
 
 /// Width of the language list in About, enough for its longest entry.
@@ -100,13 +102,20 @@ pub struct App {
     editor: Option<Editor>,
     /// What copies of qrec started later ask of this one.
     instance: Option<mpsc::Receiver<crate::instance::Request>>,
-    /// Where the trimming window was last, in points on the screen (its
-    /// outer position, its inner size): where it opens next (`x,y,w,h` in
-    /// the settings).
+    /// Where the trimming window was last: its outer position in physical
+    /// pixels on the virtual screen, its inner size in points; where it
+    /// opens next (`x,y,w,h` in the settings). Pixels for the position:
+    /// points differ between displays of different scales, and winit turns
+    /// a position in points into pixels by the scale of the display the
+    /// window is created on, not of the one it goes to.
     editor_rect: Option<egui::Rect>,
     /// Where the open trimming window was placed, passed with its viewport
-    /// every frame (a changed position would move it).
+    /// every frame (a changed position would move it): the position in
+    /// points by the main window's scale, a guess.
     editor_placement: Option<egui::Rect>,
+    /// The position in pixels the open trimming window still has to be
+    /// moved to, once its window exists, when the guess was off.
+    editor_move: Option<(i32, i32)>,
     /// Whether a cut replaces the file it was made from.
     trim_replace: bool,
     /// The icon of About, rasterised at the display's pixel density.
@@ -114,6 +123,9 @@ pub struct App {
     /// The next key press becomes the hotkey.
     capturing_hotkey: bool,
     recorder: Option<Recorder>,
+    /// Why the sound of the last recording stopped before it did, shown
+    /// beside the file when it did.
+    audio_warning: Option<String>,
     border: Option<Border>,
     selecting: Option<mpsc::Receiver<Option<Region>>>,
     notice: Notice,
@@ -211,6 +223,7 @@ impl App {
             instance: crate::instance::listen(cc.egui_ctx.clone()).inspect_err(|e| log::warn!("no instance window: {e}")).ok(),
             editor_rect,
             editor_placement: None,
+            editor_move: None,
             trim_replace,
             about_icon: None,
             hotkey: None,
@@ -221,16 +234,20 @@ impl App {
             border: None,
             selecting: None,
             notice: Notice::None,
+            audio_warning: None,
             window,
             rounded: None,
         };
         app.register_hotkey(&cc.egui_ctx);
-        if let Some(path) = open {
-            app.open_editor(path, &cc.egui_ctx);
-        }
         // Before eframe shows the window, so that no button appears.
         if let (Some(hwnd), true) = (app.window, app.tray_only()) {
             win::set_taskbar_button(hwnd, false, false);
+        }
+        // Not shown here: eframe shows the window after its first frame,
+        // and shown now it would appear empty, with a taskbar button its
+        // style had not settled.
+        if let Some(path) = open {
+            app.place_editor(path, &cc.egui_ctx);
         }
         app
     }
@@ -272,7 +289,14 @@ impl App {
                     }
                     ctx.request_repaint();
                 }
-                Err(mpsc::TryRecvError::Disconnected) => self.selecting = None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // The selection's thread is gone without a word (a
+                    // panic in a debug build): the window must come back.
+                    self.selecting = None;
+                    if let Some(hwnd) = self.window {
+                        win::show_window(hwnd, true);
+                    }
+                }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
@@ -285,12 +309,15 @@ impl App {
         if presses % 2 == 1 && self.selecting.is_none() {
             self.toggle(ctx);
         }
+        // While an area is selected the window stays hidden: the commands
+        // wait in their channels until it is done.
+        if self.selecting.is_some() {
+            return;
+        }
         let commands: Vec<tray::Command> = self.tray.as_ref().map(|(_, rx)| rx.try_iter().collect()).unwrap_or_default();
         for command in commands {
             log::debug!("tray: {command:?}");
             match command {
-                // While an area is selected the window stays hidden.
-                _ if self.selecting.is_some() => {}
                 tray::Command::Toggle => self.toggle(ctx),
                 tray::Command::Show => {
                     if let Some(hwnd) = self.window {
@@ -300,6 +327,11 @@ impl App {
                 tray::Command::Taskbar => {
                     self.taskbar = !self.taskbar;
                     if let Some(hwnd) = self.window {
+                        // A minimised tool window shows as a small title bar
+                        // at the edge of the screen: hidden instead.
+                        if self.tray_only() && win::is_minimised(hwnd) {
+                            win::show_window(hwnd, false);
+                        }
                         win::set_taskbar_button(hwnd, !self.tray_only(), true);
                     }
                 }
@@ -318,8 +350,6 @@ impl App {
         let requests: Vec<crate::instance::Request> = self.instance.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
         for request in requests {
             match request {
-                // While an area is selected the window stays hidden.
-                _ if self.selecting.is_some() => {}
                 crate::instance::Request::Show => {
                     if let Some(hwnd) = self.window {
                         win::show_window(hwnd, true);
@@ -330,6 +360,15 @@ impl App {
         }
         if self.recorder.as_ref().is_some_and(Recorder::failed) {
             self.stop(Some(ctx));
+        } else if let Some(e) = self.recorder.as_ref().and_then(Recorder::audio_error)
+            && self.audio_warning.is_none()
+        {
+            // The sound stopped; the picture goes on, the file is written
+            // all the same.
+            let warning = format!("{e}. {}", tr!("The recording goes on without sound", "Запись продолжается без звука"));
+            self.notice = Notice::Error(warning.clone());
+            self.audio_warning = Some(warning);
+            ctx.request_repaint();
         }
     }
 
@@ -355,6 +394,10 @@ impl App {
             self.notice = Notice::Error(tr!("The area is outside the display", "Область вне экрана").into());
             return;
         };
+        if !self.folder.is_absolute() {
+            self.notice = Notice::Error(tr!("Choose a folder for the recordings", "Выберите папку для записей").into());
+            return;
+        }
         if let Err(e) = std::fs::create_dir_all(&self.folder) {
             self.notice = Notice::Error(format!("{}: {e}", tr!("Cannot create the folder", "Не удаётся создать папку")));
             return;
@@ -374,6 +417,7 @@ impl App {
                     tr!("software encoder", "программный кодер")
                 };
                 self.notice = Notice::Info(format!("{}×{}, {} fps, {encoder}", region.width, region.height, self.fps));
+                self.audio_warning = None;
                 self.recorder = Some(recorder);
                 if self.minimise_on_record {
                     self.minimise(ctx);
@@ -390,6 +434,7 @@ impl App {
         if let Some(recorder) = self.recorder.take() {
             let path = recorder.path.clone();
             log::debug!("stopping");
+            self.audio_warning = recorder.audio_error();
             self.notice = match recorder.stop() {
                 Ok(_) => {
                     if let (true, Some(ctx)) = (self.trim_after_record, ctx) {
@@ -397,7 +442,14 @@ impl App {
                     }
                     Notice::Saved(path)
                 }
-                Err(e) => Notice::Error(e),
+                Err(e) => {
+                    // Out of the way while recording (minimise_on_record):
+                    // the error would go unseen.
+                    if let Some(hwnd) = self.window {
+                        win::show_window(hwnd, true);
+                    }
+                    Notice::Error(e)
+                }
             };
         }
     }
@@ -428,8 +480,13 @@ impl App {
 
     /// The window out of the way: hidden when it has no taskbar button
     /// (there is nothing to minimise to, and the icon brings it back),
-    /// minimised otherwise.
+    /// minimised otherwise. Not while the trimming window is open: it is
+    /// drawn with this window's pass, which a minimised or hidden window
+    /// does not run, so it would freeze.
     fn minimise(&self, ctx: &egui::Context) {
+        if self.editor.is_some() {
+            return;
+        }
         match (self.tray_only(), self.window) {
             (true, Some(hwnd)) => win::show_window(hwnd, false),
             _ => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
@@ -520,15 +577,23 @@ impl App {
         if let Some(hwnd) = self.window {
             win::show_window(hwnd, true);
         }
+        self.place_editor(path, ctx);
+    }
+
+    /// Opens the trimming window on `path` where it was last, the main
+    /// window left as it is.
+    fn place_editor(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.editor = None;
-        // Where it was last, when that is still on a display.
+        // Where it was last, when its title row is still on a display.
         let ppp = ctx.pixels_per_point();
-        self.editor_placement = self.editor_rect.filter(|r| {
-            let centre = r.center() * ppp;
-            self.monitors.iter().any(|m| {
-                (m.rect.left as f32..m.rect.right as f32).contains(&centre.x) && (m.rect.top as f32..m.rect.bottom as f32).contains(&centre.y)
-            })
+        let wanted = self.editor_rect.filter(|r| {
+            let (x, y) = (r.min.x + 100.0, r.min.y + 10.0);
+            self.monitors
+                .iter()
+                .any(|m| (m.rect.left as f32..m.rect.right as f32).contains(&x) && (m.rect.top as f32..m.rect.bottom as f32).contains(&y))
         });
+        self.editor_placement = wanted.map(|r| egui::Rect::from_min_size((r.min.to_vec2() / ppp).to_pos2(), r.size()));
+        self.editor_move = wanted.map(|r| (r.min.x.round() as i32, r.min.y.round() as i32));
         let mut editor = Editor::open(path, ctx.clone(), editor_viewport());
         editor.replace = self.trim_replace;
         self.editor = Some(editor);
@@ -555,15 +620,26 @@ impl App {
         }
         let (close, rect) = ctx.show_viewport_immediate(editor_viewport(), builder, |ui, _class| {
             // The outer position (winit leaves a pixel of non-client area
-            // above an undecorated window) with the inner size: what
-            // `with_position` and `with_inner_size` take.
+            // above an undecorated window) in pixels, by this window's own
+            // scale, with the inner size in points.
+            let ppp = ui.ctx().pixels_per_point();
             let rect = ui.ctx().input(|i| {
                 let v = i.viewport();
-                Some(egui::Rect::from_min_size(v.outer_rect?.min, v.inner_rect?.size()))
+                Some(egui::Rect::from_min_size((v.outer_rect?.min.to_vec2() * ppp).to_pos2(), v.inner_rect?.size()))
             });
             (editor.ui(ui), rect)
         });
-        if let Some(rect) = rect {
+        // The guessed position was off (the display there has another
+        // scale than the main window's): moved there in pixels, once.
+        if let (Some((x, y)), Some(hwnd)) = (self.editor_move, editor.window()) {
+            self.editor_move = None;
+            let (left, top, _, _) = win::window_rect(hwnd);
+            if (left, top) != (x, y) {
+                log::debug!("trimming window moved from ({left}, {top}) to ({x}, {y})");
+                win::move_window(hwnd, x, y);
+            }
+        }
+        if let (Some(rect), None) = (rect, self.editor_move) {
             self.editor_rect = Some(rect);
         }
         self.trim_replace = editor.replace;
@@ -681,7 +757,6 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.poll(&ctx);
         if self.capturing_hotkey {
             self.capture_hotkey(&ctx);
         }
@@ -721,7 +796,13 @@ impl eframe::App for App {
             let kind = if hide_on_close { TitleButton::CloseToTray } else { TitleButton::Close };
             if title_button(&mut ui.new_child(egui::UiBuilder::new().max_rect(corner(1.0))), kind) {
                 match (hide_on_close, self.window) {
-                    (true, Some(hwnd)) => win::show_window(hwnd, false),
+                    // Not hidden while the trimming window is open (see
+                    // `minimise`): the cross does nothing then.
+                    (true, Some(hwnd)) => {
+                        if self.editor.is_none() {
+                            win::show_window(hwnd, false);
+                        }
+                    }
                     _ => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 }
             }
@@ -756,10 +837,10 @@ impl eframe::App for App {
         }
     }
 
-    /// While the window is minimised or hidden, eframe runs no egui pass
-    /// and calls this instead of `ui`: the hotkey, the tray and a failed
-    /// recording are attended to all the same, so a recording can be
-    /// stopped while the window is out of the way.
+    /// Called before `ui` in every frame, and alone while the window is
+    /// minimised or hidden (eframe runs no egui pass then): the hotkey,
+    /// the tray and a failed recording are attended to all the same, so a
+    /// recording can be stopped while the window is out of the way.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
         self.update_tray();
@@ -898,8 +979,8 @@ impl App {
                 }
                 let text = if self.capturing_hotkey { tr!("Cancel", "Отмена") } else { tr!("Change", "Изменить") };
                 let button = ui.add_enabled(!recording, egui::Button::new(text)).on_hover_text(tr!(
-                    "Starts and stops the recording from anywhere. Click, then press a key with Ctrl, Alt or Win, or a function key.",
-                    "Начинает и останавливает запись из любого окна. Нажмите кнопку, затем клавишу с Ctrl, Alt или Win, или функциональную клавишу."
+                    "Starts and stops the recording from anywhere. Click, then press a key with Ctrl or Alt, or a function key.",
+                    "Начинает и останавливает запись из любого окна. Нажмите кнопку, затем клавишу с Ctrl или Alt, или функциональную клавишу."
                 ));
                 if button.clicked() {
                     self.capturing_hotkey = !self.capturing_hotkey;
@@ -1031,6 +1112,9 @@ impl App {
                     ui.label(RichText::new(self.area_label()).weak());
                 }
                 Notice::Saved(path) => {
+                    if let Some(warning) = &self.audio_warning {
+                        ui.label(RichText::new(warning).color(ui.visuals().error_fg_color));
+                    }
                     ui.horizontal_wrapped(|ui| {
                         ui.label(tr!("Saved:", "Сохранено:"));
                         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1082,7 +1166,8 @@ impl App {
         }
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         self.notice = match win::recycle(path) {
-            Ok(()) => Notice::Info(tr!(format!("{name} is in the Recycle Bin"), format!("{name} удалён в корзину"))),
+            Ok(true) => Notice::Info(tr!(format!("{name} is in the Recycle Bin"), format!("{name} удалён в корзину"))),
+            Ok(false) => Notice::Info(tr!(format!("{name} is deleted (the drive has no Recycle Bin)"), format!("{name} удалён (у диска нет корзины)"))),
             Err(e) => Notice::Error(format!("{}: {e}", tr!("The file could not be deleted", "Не удалось удалить файл"))),
         };
     }
@@ -1102,9 +1187,9 @@ fn title(ui: &egui::Ui, rect: egui::Rect) {
     painter.galley(pos, galley, DARK_COLOUR);
 }
 
-/// `x,y,w,h` of a rectangle in points, as the settings keep it.
+/// `x,y,w,h` of a rectangle, as the settings keep it.
 fn rect_to_setting(rect: egui::Rect) -> String {
-    // Not rounded: a point is a pixel and a half at 150 % scaling.
+    // Not rounded: a point of the size is a pixel and a half at 150 %.
     format!("{},{},{},{}", rect.min.x, rect.min.y, rect.width(), rect.height())
 }
 

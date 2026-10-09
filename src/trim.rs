@@ -14,12 +14,13 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_SUBTYPE, MF_PD_DURATION, MF_SINK_WRITER_DISABLE_THROTTLING, MF_SOURCE_READER_ANY_STREAM,
     MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, MF_SOURCE_READER_MEDIASOURCE, MF_SOURCE_READERF_ENDOFSTREAM, MF_TRANSCODE_CONTAINERTYPE,
     MFAudioFormat_AAC, MFAudioFormat_Float, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MFCreateAttributes, MFCreateMediaType, MFCreateSinkWriterFromURL, MFCreateSourceReaderFromURL, MFMediaType_Audio,
-    MFMediaType_Video, MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFTranscodeContainerType_MPEG4, MFVideoFormat_H264,
+    MFMediaType_Video, MFSampleExtension_CleanPoint, MFTranscodeContainerType_MPEG4, MFVideoFormat_H264,
     MFVideoFormat_RGB32,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::core::{Error, GUID, Interface, PCWSTR, Result};
 
+use crate::encoder::Mf;
 use crate::win;
 
 /// One second in the 100 ns units of Media Foundation.
@@ -44,6 +45,9 @@ pub struct Info {
     pub fps: f64,
     pub duration: i64,
     pub audio: bool,
+    /// The file has sound, but not AAC: it is neither played nor kept in
+    /// a cut.
+    pub other_audio: bool,
 }
 
 /// How a cut is getting on, shared with the thread that runs it.
@@ -63,29 +67,13 @@ pub struct Cut {
     pub frames: u32,
 }
 
-/// Media Foundation started for as long as the value lives.
-struct Mf;
-
-impl Mf {
-    fn start() -> Result<Mf> {
-        unsafe { MFStartup(crate::encoder::mf_version(), MFSTARTUP_FULL)? };
-        Ok(Mf)
-    }
-}
-
-impl Drop for Mf {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = MFShutdown();
-        }
-    }
-}
-
 /// A file open for reading: the reader and the streams it has.
 struct Source {
     reader: IMFSourceReader,
     video: u32,
     audio: Option<u32>,
+    /// A sound stream in another format than AAC.
+    other_audio: bool,
 }
 
 impl Source {
@@ -101,7 +89,7 @@ impl Source {
         }
         let url = win::wide(path);
         let reader = unsafe { MFCreateSourceReaderFromURL(PCWSTR(url.as_ptr()), Some(&attributes))? };
-        let (mut video, mut audio) = (None, None);
+        let (mut video, mut audio, mut other_audio) = (None, None, false);
         for stream in 0..8u32 {
             let Ok(native) = (unsafe { reader.GetNativeMediaType(stream, 0) }) else {
                 break;
@@ -112,6 +100,8 @@ impl Source {
                 video = Some(stream);
             } else if major == MFMediaType_Audio && subtype == MFAudioFormat_AAC && audio.is_none() {
                 audio = Some(stream);
+            } else if major == MFMediaType_Audio {
+                other_audio = true;
             }
             unsafe { reader.SetStreamSelection(stream, false)? };
         }
@@ -125,7 +115,8 @@ impl Source {
                 reader.SetCurrentMediaType(video, None, &rgb)?;
             }
         }
-        Ok(Source { reader, video, audio })
+        let other_audio = other_audio && audio.is_none();
+        Ok(Source { reader, video, audio, other_audio })
     }
 
     fn select_audio(&self) -> Result<()> {
@@ -149,17 +140,19 @@ impl Source {
             }
             Err(_) => 30.0,
         };
-        let duration = unsafe {
-            self.reader
-                .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)?
-        };
-        let duration = u64::try_from(&duration)? as i64;
+        // A fragmented file has no length in its headers: 0, and the
+        // trimming window takes it from the frames.
+        let duration = unsafe { self.reader.GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION) }
+            .ok()
+            .and_then(|d| u64::try_from(&d).ok())
+            .unwrap_or(0) as i64;
         Ok(Info {
             width,
             height,
             fps,
             duration,
             audio: self.audio.is_some(),
+            other_audio: self.other_audio,
         })
     }
 
@@ -168,9 +161,17 @@ impl Source {
         unsafe { self.reader.SetCurrentPosition(&GUID::zeroed(), &position) }
     }
 
-    /// The next sample of `stream` (or of any selected stream with
-    /// `MF_SOURCE_READER_ANY_STREAM`): its stream, or `None` at the end.
+    /// The next sample of `stream`: its stream, or `None` at the end.
     fn read(&self, stream: u32) -> Result<Option<(u32, IMFSample)>> {
+        let (stream, sample) = self.read_from(stream)?;
+        Ok(sample.map(|s| (stream, s)))
+    }
+
+    /// The next sample of `stream`, or of whichever selected stream has
+    /// one with `MF_SOURCE_READER_ANY_STREAM`: the stream it came from,
+    /// and `None` when that stream has reached its end (the others may
+    /// still have samples).
+    fn read_from(&self, stream: u32) -> Result<(u32, Option<IMFSample>)> {
         loop {
             let (mut actual, mut flags, mut sample) = (0u32, 0u32, None);
             unsafe {
@@ -178,10 +179,10 @@ impl Source {
                     .ReadSample(stream, 0, Some(&mut actual), Some(&mut flags), None, Some(&mut sample))?
             };
             if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
-                return Ok(None);
+                return Ok((actual, None));
             }
             if let Some(sample) = sample {
-                return Ok(Some((actual, sample)));
+                return Ok((actual, Some(sample)));
             }
         }
     }
@@ -193,9 +194,22 @@ pub fn info(path: &Path) -> Result<Info> {
     Source::open(path, false)?.info()
 }
 
-/// Every video frame of `path`, in order; `cancel` stops the listing
-/// (what was listed so far comes back).
+/// Every video frame of `path`, in order: from the file's index when it
+/// can be read (`mp4`), else by reading the samples; `cancel` stops the
+/// reading (what was listed so far comes back).
 pub fn frames(path: &Path, cancel: &AtomicBool) -> Result<Vec<Frame>> {
+    match crate::mp4::video_frames(path) {
+        Some(frames) => Ok(frames),
+        None => {
+            log::debug!("frames of {}: not from the index, read", path.display());
+            frames_by_reading(path, cancel)
+        }
+    }
+}
+
+/// Every video frame of `path` as the source reader delivers it, which
+/// reads the whole file.
+pub fn frames_by_reading(path: &Path, cancel: &AtomicBool) -> Result<Vec<Frame>> {
     let _mf = Mf::start()?;
     let source = Source::open(path, false)?;
     let mut frames = Vec::new();
@@ -222,8 +236,9 @@ pub struct Picture {
 
 /// A file open for decoding one frame at a time.
 pub struct Preview {
-    _mf: Mf,
+    // Released before Media Foundation is shut down.
     source: Source,
+    _mf: Mf,
     pub info: Info,
     /// Time of the next frame the reader delivers without a seek, when
     /// known.
@@ -410,15 +425,35 @@ fn pixels(sample: &IMFSample, width: usize, height: usize, stride: i32, factor: 
 /// `start` (the one the seek lands on), with the sound of the same
 /// stretch.
 pub fn cut(src: &Path, dst: &Path, start: i64, end: i64, progress: &Progress) -> Result<Cut> {
+    let result = copy_stretch(src, dst, start, end, progress);
+    if result.is_err() {
+        // Cancelled, or failed part-way: nothing of the file is kept.
+        let _ = std::fs::remove_file(dst);
+    }
+    result
+}
+
+fn copy_stretch(src: &Path, dst: &Path, start: i64, end: i64, progress: &Progress) -> Result<Cut> {
     let _mf = Mf::start()?;
     let source = Source::open(src, false)?;
-    source.select_audio()?;
     let video_type = source.native_video_type()?;
     let audio_type = match source.audio {
         Some(stream) => Some(unsafe { source.reader.GetNativeMediaType(stream, 0)? }),
         None => None,
     };
+    // The picture lands on the key frame at or before `start`, the sound
+    // on `start` itself: both are sought to that key frame, or the sound
+    // between it and `start` would be missing.
     source.seek(start)?;
+    let key = loop {
+        match source.read(source.video)? {
+            Some((_, sample)) if is_key(&sample) => break Some(unsafe { sample.GetSampleTime()? }),
+            Some(_) => {}
+            None => break None,
+        }
+    };
+    source.select_audio()?;
+    source.seek(key.unwrap_or(start).min(start))?;
 
     let mut writer: Option<Writer> = None;
     // Where the copy starts: the key frame the seek landed on.
@@ -429,12 +464,19 @@ pub fn cut(src: &Path, dst: &Path, start: i64, end: i64, progress: &Progress) ->
     let (mut video_done, mut audio_done) = (false, source.audio.is_none());
     while !(video_done && audio_done) {
         if progress.cancel.load(Relaxed) {
-            drop(writer);
-            let _ = std::fs::remove_file(dst);
             return Err(Error::new(windows::Win32::Foundation::E_ABORT, "cancelled"));
         }
-        let Some((stream, sample)) = source.read(MF_SOURCE_READER_ANY_STREAM.0 as u32)? else {
-            break;
+        // The end of one stream (the sound shorter than the picture in a
+        // file from elsewhere) is not the end of the other.
+        let (stream, sample) = source.read_from(MF_SOURCE_READER_ANY_STREAM.0 as u32)?;
+        let Some(sample) = sample else {
+            if stream == source.video {
+                video_done = true;
+            } else if Some(stream) == source.audio {
+                audio_done = true;
+            }
+            unsafe { source.reader.SetStreamSelection(stream, false)? };
+            continue;
         };
         let time = unsafe { sample.GetSampleTime()? };
         if stream == source.video {
@@ -456,7 +498,10 @@ pub fn cut(src: &Path, dst: &Path, start: i64, end: i64, progress: &Progress) ->
                     let video_type = with_sequence_header(&video_type, &sample)?;
                     let w = writer.insert(Writer::new(dst, &video_type, audio_type.as_ref())?);
                     for pending in pending_audio.drain(..) {
-                        w.write(w.audio, &pending, origin)?;
+                        // From the origin on, as the sound heard later is.
+                        if unsafe { pending.GetSampleTime()? } >= origin {
+                            w.write(w.audio, &pending, origin)?;
+                        }
                     }
                     w
                 }

@@ -92,8 +92,13 @@ pub struct Editor {
     /// Whether a cut takes the place of the file (the file goes to the
     /// Recycle Bin) instead of going into a new one beside it.
     pub replace: bool,
-    /// Whether the file on show is a cut that replaced the one opened.
-    replaced: bool,
+    /// Whether the file on show is a cut that replaced the one opened:
+    /// `Some(true)` when the original went to the Recycle Bin, `Some(false)`
+    /// when it was deleted (a drive without one).
+    replaced: Option<bool>,
+    /// Whether `error` came from the preview, which a frame decoded later
+    /// clears.
+    preview_failed: bool,
     /// The threads reading the file, joined before it is replaced.
     readers: Vec<JoinHandle<()>>,
     ctx: egui::Context,
@@ -190,7 +195,8 @@ impl Editor {
             saved: None,
             error: None,
             replace: false,
-            replaced: false,
+            replaced: None,
+            preview_failed: false,
             readers,
             ctx: editor_ctx,
             viewport,
@@ -291,6 +297,11 @@ impl Editor {
         }
     }
 
+    /// The window's handle, once it has been found.
+    pub fn window(&self) -> Option<isize> {
+        self.window
+    }
+
     /// Results from the threads.
     fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(reply) = self.replies.try_recv() {
@@ -309,8 +320,15 @@ impl Editor {
                         }
                         _ => self.texture = Some((picture.time, ctx.load_texture("preview", image, egui::TextureOptions::LINEAR))),
                     }
+                    if self.preview_failed {
+                        self.preview_failed = false;
+                        self.error = None;
+                    }
                 }
-                Reply::Error(e) => self.error = Some(e),
+                Reply::Error(e) => {
+                    self.error = Some(e);
+                    self.preview_failed = true;
+                }
             }
         }
         if let Some(rx) = &self.frames_rx {
@@ -320,10 +338,14 @@ impl Editor {
                     let keys: Vec<i64> = frames.iter().filter(|f| f.key).map(|f| f.time).collect();
                     let _ = self.requests.send(Request::Keys(keys));
                     if let Some(last) = frames.last() {
-                        self.end = self.end.min(last.time + last.duration);
+                        // Headers without a length (0) leave the end to the
+                        // frames.
+                        let length = last.time + last.duration;
+                        self.end = if self.end <= 0 { length } else { self.end.min(length) };
                     }
                     self.frames = Some(frames);
                     self.start = self.snap_start(self.start);
+                    self.cursor = self.frame_at(self.cursor);
                 }
                 Ok(Err(e)) => {
                     self.frames_rx = None;
@@ -360,7 +382,10 @@ impl Editor {
     /// Puts the cut written to `cut` in the place of the file: the readers
     /// let go of it, it goes to the Recycle Bin and the cut takes its name;
     /// then the window shows the cut. When the file cannot be moved (open
-    /// in a player), the cut is deleted and the file stays as it was.
+    /// in a player), the cut is deleted and the file stays as it was. When
+    /// the file is gone but the cut cannot take its name (something holds
+    /// the cut: a scanner, an indexer), the cut is kept under its own name
+    /// and shown, so nothing is lost.
     fn take_place(&mut self, cut: PathBuf) {
         self.playing = None;
         let _ = self.requests.send(Request::Close);
@@ -369,14 +394,25 @@ impl Editor {
             let _ = thread.join();
         }
         let path = self.path.clone();
-        let result = win::recycle(&path).and_then(|()| std::fs::rename(&cut, &path).map_err(|e| e.to_string()));
         let replace = self.replace;
-        match result {
-            Ok(()) => {
-                log::debug!("{} replaced by its cut", path.display());
-                *self = Editor::open(path, self.ctx.clone(), self.viewport);
-                self.replaced = true;
-            }
+        match win::recycle(&path) {
+            Ok(recycled) => match std::fs::rename(&cut, &path) {
+                Ok(()) => {
+                    log::debug!("{} replaced by its cut", path.display());
+                    *self = Editor::open(path, self.ctx.clone(), self.viewport);
+                    self.replaced = Some(recycled);
+                }
+                Err(e) => {
+                    log::warn!("{} is in the Recycle Bin, but the cut could not take its name: {e}", path.display());
+                    let name = cut.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    *self = Editor::open(cut, self.ctx.clone(), self.viewport);
+                    self.replaced = Some(recycled);
+                    self.error = Some(format!(
+                        "{}: {e}",
+                        tr!(format!("The original is in the Recycle Bin; the cut stays as {name}"), format!("Исходный файл в корзине, обрезка осталась как {name}"))
+                    ));
+                }
+            },
             Err(e) => {
                 let _ = std::fs::remove_file(&cut);
                 log::warn!("could not replace {}: {e}", path.display());
@@ -405,9 +441,21 @@ impl Editor {
         .max(1)
     }
 
+    /// The frames per second as the headers say, until the frames are
+    /// listed.
+    fn fps(&self) -> f64 {
+        self.info.as_ref().map_or(30.0, |i| i.fps).max(1.0)
+    }
+
     /// The length of one frame.
     fn step(&self) -> i64 {
-        self.info.as_ref().map_or(SECOND / 30, |i| (SECOND as f64 / i.fps.max(1.0)) as i64).max(1)
+        (SECOND as f64 / self.fps()).round().max(1.0) as i64
+    }
+
+    /// The time of frame `n` by the frame rate, rounded as the times in the
+    /// file are.
+    fn frame_time(&self, n: i64) -> i64 {
+        (n as f64 * SECOND as f64 / self.fps()).round() as i64
     }
 
     /// The time of the frame shown at `time`.
@@ -418,7 +466,11 @@ impl Editor {
                 let i = frames.partition_point(|f| f.time <= time).saturating_sub(1);
                 frames[i].time
             }
-            _ => time / self.step() * self.step(),
+            _ => {
+                let n = (time as f64 * self.fps() / SECOND as f64).floor() as i64;
+                // Rounding can put frame n just after `time`.
+                if self.frame_time(n) > time { self.frame_time(n - 1) } else { self.frame_time(n) }
+            }
         }
     }
 
@@ -515,7 +567,9 @@ impl Editor {
     fn set_start(&mut self, time: i64) {
         self.start = self.snap_start(time);
         if self.end <= self.start {
-            self.end = self.frame_from(self.start, 1).max(self.start + 1);
+            // The next frame, or the end of the file after the last one.
+            let next = self.frame_from(self.start, 1);
+            self.end = if next > self.start { next } else { self.length() };
         }
     }
 
@@ -537,7 +591,14 @@ impl Editor {
         // take it as a click.
         // Shift+Space first: the pattern without modifiers matches it too
         // (egui ignores an extra Shift).
+        // The key's repeat while held down is consumed but does nothing.
+        let first_press = ui.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Key { key: Key::Space, pressed: true, repeat: false, .. }))
+        });
         let (cut, space) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::SHIFT, Key::Space), i.consume_key(egui::Modifiers::NONE, Key::Space)));
+        let (cut, space) = (cut && first_press, space && first_press);
         if cut {
             self.play_cut();
         } else if space {
@@ -691,7 +752,7 @@ impl Editor {
                     self.set_cursor(self.start);
                 }
                 if ui.button(tr!("To end", "К концу")).clicked() {
-                    self.set_cursor(self.frame_from(self.end, -1));
+                    self.set_cursor(self.frame_at(self.end - 1));
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -742,6 +803,9 @@ impl Editor {
             }
             if let Some(info) = &self.info {
                 ui.weak(format!("{}×{}, {} {}", info.width, info.height, fmt_fps(info.fps), tr!("fps", "к/с")));
+                if info.other_audio {
+                    ui.label(RichText::new(tr!("the sound is not AAC: not played, not kept", "звук не в AAC: не воспроизводится и не сохраняется")).color(ui.visuals().warn_fg_color));
+                }
                 if self.frames_rx.is_some() {
                     ui.weak(tr!("listing the frames…", "кадры перечисляются…"));
                 }
@@ -769,11 +833,15 @@ impl Editor {
                 ui.weak(tr!("Saving…", "Сохраняется…"));
             } else if let Some(e) = &self.error {
                 ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
-            } else if self.replaced && self.saved.is_none() {
-                ui.label(tr!(
-                    "The file was replaced by the cut; the original is in the Recycle Bin.",
-                    "Файл заменён фрагментом; исходный — в корзине."
-                ));
+            } else if let (Some(recycled), None) = (self.replaced, &self.saved) {
+                ui.label(if recycled {
+                    tr!("The file was replaced by the cut; the original is in the Recycle Bin.", "Файл заменён фрагментом; исходный — в корзине.")
+                } else {
+                    tr!(
+                        "The file was replaced by the cut; the original is deleted (the drive has no Recycle Bin).",
+                        "Файл заменён фрагментом; исходный удалён (у диска нет корзины)."
+                    )
+                });
             } else if let Some(path) = &self.saved {
                 ui.label(tr!("Saved:", "Сохранено:"));
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -892,18 +960,30 @@ impl Editor {
             .ok();
         self.saved = None;
         self.error = None;
-        self.replaced = false;
+        self.replaced = None;
+        if thread.is_none() {
+            self.error = Some(tr!("The cut could not be started", "Не удалось начать сохранение").into());
+            return;
+        }
         self.export = Some(Export { progress, done, thread, replace });
     }
 }
 
 impl Drop for Editor {
     /// Waits for the threads, so the file is no longer open once the
-    /// editor is gone (it may be deleted next).
+    /// editor is gone (it may be deleted next). A cut into a new file is
+    /// let finish (a copy without re-encoding takes seconds), so closing
+    /// the program or opening another file does not lose it; one that
+    /// would replace the file is cancelled, which leaves the file as it
+    /// was.
     fn drop(&mut self) {
         self.cancel.cancel.store(true, Relaxed);
         if let Some(mut export) = self.export.take() {
-            export.progress.cancel.store(true, Relaxed);
+            if export.replace {
+                export.progress.cancel.store(true, Relaxed);
+            } else {
+                log::debug!("waiting for the cut to finish");
+            }
             if let Some(thread) = export.thread.take() {
                 let _ = thread.join();
             }

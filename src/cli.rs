@@ -87,6 +87,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let (frames, dropped) = (recorder.frames(), recorder.dropped());
+    if let Some(e) = recorder.audio_error() {
+        say!("the sound stopped: {e}");
+    }
     recorder.stop()?;
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     say!("{frames} frames written, {dropped} skipped, {} bytes: {}", size, path.display());
@@ -113,8 +116,18 @@ pub fn cut(args: Vec<String>) -> i32 {
             }
         }
         let src = src.ok_or("usage: qrec --cut FILE --from SECONDS --to SECONDS [--out FILE]")?;
+        if from.is_nan() || from < 0.0 || to <= from {
+            return Err(format!("--from ({from}) must be at least 0 and before --to ({to})"));
+        }
         let seconds = |s: f64| if s.is_finite() { (s * crate::trim::SECOND as f64) as i64 } else { i64::MAX };
         let dst = out.unwrap_or_else(|| src.with_extension("cut.mp4"));
+        let same = |a: &std::path::Path, b: &std::path::Path| match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if same(&src, &dst) {
+            return Err("--out is the file being cut".into());
+        }
         let progress = crate::trim::Progress::default();
         let started = std::time::Instant::now();
         let cut = crate::trim::cut(&src, &dst, seconds(from), seconds(to), &progress).map_err(|e| win::describe(&e))?;
@@ -151,12 +164,30 @@ pub fn info(path: Option<PathBuf>) -> i32 {
             info.height,
             info.fps,
             info.duration as f64 / crate::trim::SECOND as f64,
-            if info.audio { "with audio" } else { "no audio" }
+            match (info.audio, info.other_audio) {
+                (true, _) => "with audio",
+                (false, true) => "with audio that is not AAC (not kept in a cut)",
+                (false, false) => "no audio",
+            }
         );
         let started = std::time::Instant::now();
         let frames = crate::trim::frames(&path, &std::sync::atomic::AtomicBool::new(false)).map_err(|e| win::describe(&e))?;
+        let listed = started.elapsed().as_secs_f64();
         let keys: Vec<String> = frames.iter().filter(|f| f.key).map(|f| crate::editor::clock(f.time)).collect();
-        say!("{} frames listed in {:.2} s, {} key frames: {}", frames.len(), started.elapsed().as_secs_f64(), keys.len(), keys.join(" "));
+        say!("{} frames listed in {listed:.3} s, {} key frames: {}", frames.len(), keys.len(), keys.join(" "));
+        // The index against the samples: what the trimming window relies on.
+        if crate::mp4::video_frames(&path).is_some() {
+            let started = std::time::Instant::now();
+            let read = crate::trim::frames_by_reading(&path, &std::sync::atomic::AtomicBool::new(false)).map_err(|e| win::describe(&e))?;
+            let first_difference = frames.iter().zip(&read).position(|(a, b)| a != b);
+            match (first_difference, frames.len() == read.len()) {
+                (None, true) => say!("from the index; reading the samples ({:.3} s) gives the same", started.elapsed().as_secs_f64()),
+                (Some(i), _) => say!("from the index; reading the samples differs at frame {i}: {:?} against {:?}", frames[i], read[i]),
+                (None, false) => say!("from the index; reading the samples gives {} frames", read.len()),
+            }
+        } else {
+            say!("by reading the samples: the index was not read");
+        }
         Ok(())
     })();
     match result {
