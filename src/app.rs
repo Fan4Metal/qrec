@@ -20,7 +20,7 @@ use crate::tray::{self, Tray};
 use crate::win;
 
 /// The window's size in points.
-pub const WINDOW_SIZE: [f32; 2] = [460.0, 398.0];
+pub const WINDOW_SIZE: [f32; 2] = [460.0, 406.0];
 /// The window's corners, painted over a transparent window (as Windows 11
 /// rounds its own).
 pub(crate) const CORNER_RADIUS: f32 = 8.0;
@@ -676,7 +676,7 @@ impl eframe::App for App {
         self.round_corners(&ctx);
         egui::Panel::bottom("bar")
             .show_separator_line(false)
-            .frame(egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 8 }))
+            .frame(egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 12, top: 14, bottom: 12 }))
             .show(ui, |ui| self.bottom_bar(ui, busy));
         egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(12)).show(ui, |ui| {
             let drag = ui.interact(ui.max_rect(), ui.id().with("drag"), egui::Sense::click_and_drag());
@@ -988,7 +988,7 @@ impl App {
                 }
             });
         });
-        ui.add_space(6.0);
+        ui.add_space(8.0);
         // Two lines of text at most; wrapped, so a long message stays in
         // the window.
         let height = ui.text_style_height(&egui::TextStyle::Body) * 2.0 + 4.0;
