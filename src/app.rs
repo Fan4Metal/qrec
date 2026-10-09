@@ -39,6 +39,7 @@ const ASPECT_KEY: &str = "aspect";
 const TASKBAR_KEY: &str = "taskbar";
 const CLOSE_TO_TRAY_KEY: &str = "close_to_tray";
 const MINIMISE_ON_RECORD_KEY: &str = "minimise_on_record";
+const TRIM_AFTER_RECORD_KEY: &str = "trim_after_record";
 const LANGUAGE_KEY: &str = "language";
 
 /// Width of the language list in About, enough for its longest entry.
@@ -87,6 +88,8 @@ pub struct App {
     close_to_tray: bool,
     /// Whether the window is put out of the way when a recording starts.
     minimise_on_record: bool,
+    /// Whether a recording opens in the trimming window when it ends.
+    trim_after_record: bool,
     /// Interface language, chosen in About.
     lang: LangChoice,
     /// Whether the About window is open.
@@ -138,6 +141,7 @@ impl App {
         let taskbar = get(TASKBAR_KEY).as_deref() != Some("false");
         let close_to_tray = get(CLOSE_TO_TRAY_KEY).as_deref() == Some("true");
         let minimise_on_record = get(MINIMISE_ON_RECORD_KEY).as_deref() == Some("true");
+        let trim_after_record = get(TRIM_AFTER_RECORD_KEY).as_deref() == Some("true");
         let lang = get(LANGUAGE_KEY).and_then(|l| LangChoice::from_name(&l)).unwrap_or_default();
         crate::i18n::set_lang(lang.resolve());
         let cursor = get(CURSOR_KEY).as_deref() != Some("false");
@@ -185,6 +189,7 @@ impl App {
             taskbar,
             close_to_tray,
             minimise_on_record,
+            trim_after_record,
             lang,
             about: false,
             editor: None,
@@ -281,6 +286,7 @@ impl App {
                 }
                 tray::Command::CloseToTray => self.close_to_tray = !self.close_to_tray,
                 tray::Command::MinimiseOnRecord => self.minimise_on_record = !self.minimise_on_record,
+                tray::Command::TrimAfterRecord => self.trim_after_record = !self.trim_after_record,
                 tray::Command::About => {
                     if let Some(hwnd) = self.window {
                         win::show_window(hwnd, true);
@@ -291,14 +297,14 @@ impl App {
             }
         }
         if self.recorder.as_ref().is_some_and(Recorder::failed) {
-            self.stop();
+            self.stop(Some(ctx));
         }
     }
 
     fn toggle(&mut self, ctx: &egui::Context) {
         log::debug!("toggle: recording {}", self.recorder.is_some());
         if self.recorder.is_some() {
-            self.stop();
+            self.stop(Some(ctx));
         } else {
             self.start(ctx);
         }
@@ -345,13 +351,20 @@ impl App {
         }
     }
 
-    fn stop(&mut self) {
+    /// Stops the recording; with `ctx` (not at exit) the file opens in
+    /// the trimming window when that is wanted.
+    fn stop(&mut self, ctx: Option<&egui::Context>) {
         self.border = None;
         if let Some(recorder) = self.recorder.take() {
             let path = recorder.path.clone();
             log::debug!("stopping");
             self.notice = match recorder.stop() {
-                Ok(_) => Notice::Saved(path),
+                Ok(_) => {
+                    if let (true, Some(ctx)) = (self.trim_after_record, ctx) {
+                        self.open_editor(path.clone(), ctx);
+                    }
+                    Notice::Saved(path)
+                }
                 Err(e) => Notice::Error(e),
             };
         }
@@ -470,6 +483,11 @@ impl App {
     /// Opens the trimming window on `path` (one at a time: a second file
     /// replaces the first).
     fn open_editor(&mut self, path: PathBuf, ctx: &egui::Context) {
+        // The trimming window is drawn with the main window's pass, which
+        // a minimised or hidden window has none of: shown first.
+        if let Some(hwnd) = self.window {
+            win::show_window(hwnd, true);
+        }
         self.editor = None;
         self.editor = Some(Editor::open(path, ctx.clone(), editor_viewport()));
     }
@@ -505,6 +523,7 @@ impl App {
                 tray_only: !self.taskbar,
                 close_to_tray: self.close_to_tray,
                 minimise_on_record: self.minimise_on_record,
+                trim_after_record: self.trim_after_record,
             });
         }
     }
@@ -703,6 +722,7 @@ impl eframe::App for App {
         storage.set_string(TASKBAR_KEY, self.taskbar.to_string());
         storage.set_string(CLOSE_TO_TRAY_KEY, self.close_to_tray.to_string());
         storage.set_string(MINIMISE_ON_RECORD_KEY, self.minimise_on_record.to_string());
+        storage.set_string(TRIM_AFTER_RECORD_KEY, self.trim_after_record.to_string());
         storage.set_string(LANGUAGE_KEY, self.lang.name().to_owned());
         storage.set_string(CURSOR_KEY, self.cursor.to_string());
         storage.set_string(FOLDER_KEY, self.folder.display().to_string());
@@ -712,7 +732,7 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // A recording still running is completed, so the file is playable.
-        self.stop();
+        self.stop(None);
     }
 }
 

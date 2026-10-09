@@ -38,6 +38,8 @@ pub enum Command {
     CloseToTray,
     /// Whether the window is minimised when a recording starts.
     MinimiseOnRecord,
+    /// Whether the trimming window opens when a recording ends.
+    TrimAfterRecord,
     /// Show the window with About open.
     About,
     /// Close the program.
@@ -59,6 +61,7 @@ const MENU_TASKBAR: usize = 4;
 const MENU_CLOSE_TO_TRAY: usize = 5;
 const MENU_MINIMISE_ON_RECORD: usize = 6;
 const MENU_ABOUT: usize = 7;
+const MENU_TRIM_AFTER_RECORD: usize = 8;
 
 /// What the icon and its menu show.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -71,6 +74,8 @@ pub struct Status {
     pub close_to_tray: bool,
     /// Whether a recording that starts minimises the window.
     pub minimise_on_record: bool,
+    /// Whether a recording that ends opens in the trimming window.
+    pub trim_after_record: bool,
 }
 
 /// The icon; removed when dropped. Commands arrive on the receiver, and
@@ -249,6 +254,7 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
     let taskbar = wide(tr!("Not on the taskbar", "Не показывать на панели задач"));
     let close_to_tray = wide(tr!("Hide when closed", "Сворачивать в трей при закрытии"));
     let minimise_on_record = wide(tr!("Minimise when recording starts", "Сворачивать при начале записи"));
+    let trim_after_record = wide(tr!("Trim after recording", "Подрезать после записи"));
     let about = wide(tr!("About…", "О программе…"));
     let exit = wide(tr!("Exit", "Выход"));
     unsafe {
@@ -260,6 +266,7 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
         let _ = AppendMenuW(menu, check(state.tray_only), MENU_TASKBAR, PCWSTR(taskbar.as_ptr()));
         let _ = AppendMenuW(menu, check(state.close_to_tray), MENU_CLOSE_TO_TRAY, PCWSTR(close_to_tray.as_ptr()));
         let _ = AppendMenuW(menu, check(state.minimise_on_record), MENU_MINIMISE_ON_RECORD, PCWSTR(minimise_on_record.as_ptr()));
+        let _ = AppendMenuW(menu, check(state.trim_after_record), MENU_TRIM_AFTER_RECORD, PCWSTR(trim_after_record.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, MENU_ABOUT, PCWSTR(about.as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, PCWSTR(exit.as_ptr()));
@@ -276,6 +283,7 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
             MENU_TASKBAR => Some(Command::Taskbar),
             MENU_CLOSE_TO_TRAY => Some(Command::CloseToTray),
             MENU_MINIMISE_ON_RECORD => Some(Command::MinimiseOnRecord),
+            MENU_TRIM_AFTER_RECORD => Some(Command::TrimAfterRecord),
             MENU_ABOUT => Some(Command::About),
             MENU_EXIT => Some(Command::Exit),
             _ => None,
