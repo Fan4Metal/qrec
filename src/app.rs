@@ -23,7 +23,7 @@ use crate::win;
 pub const WINDOW_SIZE: [f32; 2] = [460.0, 398.0];
 /// The window's corners, painted over a transparent window (as Windows 11
 /// rounds its own).
-const CORNER_RADIUS: f32 = 8.0;
+pub(crate) const CORNER_RADIUS: f32 = 8.0;
 
 const MONITOR_KEY: &str = "monitor";
 const REGION_KEY: &str = "region";
@@ -495,11 +495,14 @@ impl App {
     /// The trimming window, a viewport of its own.
     fn editor_window(&mut self, ctx: &egui::Context) {
         let Some(editor) = &mut self.editor else { return };
-        let name = editor.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // Styled like the main window: its own title row and rounded
+        // corners over a transparent window.
         let builder = egui::ViewportBuilder::default()
-            .with_title(format!("{} — {name}", tr!("Trim", "Подрезка")))
+            .with_title(editor.title())
             .with_inner_size(crate::editor::WINDOW_SIZE)
             .with_min_inner_size(crate::editor::MIN_WINDOW_SIZE)
+            .with_decorations(false)
+            .with_transparent(true)
             .with_icon(crate::embedded_icon());
         let close = ctx.show_viewport_immediate(editor_viewport(), builder, |ui, _class| editor.ui(ui));
         if close {
@@ -1097,7 +1100,7 @@ fn record_button(ui: &mut egui::Ui, clock: Option<&str>, enabled: bool) -> bool 
 }
 
 #[derive(Clone, Copy)]
-enum TitleButton {
+pub(crate) enum TitleButton {
     Minimise,
     Hide,
     Close,
@@ -1108,7 +1111,7 @@ enum TitleButton {
 /// A 24 x 24 button of the title row: a dash that minimises (or hides
 /// the window when it has no taskbar button) or a cross that closes (or
 /// hides the window), as the dialogs of qview have it. True when clicked.
-fn title_button(ui: &mut egui::Ui, kind: TitleButton) -> bool {
+pub(crate) fn title_button(ui: &mut egui::Ui, kind: TitleButton) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(24.0), egui::Sense::click());
     let visuals = ui.style().interact(&response);
     if response.hovered() {

@@ -13,6 +13,37 @@ pub fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
 }
 
+/// Takes the caption out of a window's style. winit keeps `WS_CAPTION` on
+/// an undecorated window (its `WM_NCCALCSIZE` gives the whole window to
+/// the client area instead), and once the window has a region
+/// (`round_window`) DWM no longer composes its frame and Windows paints
+/// its basic title bar over the top of the client area. Whether the
+/// style changed.
+pub fn strip_caption(hwnd: isize) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_STYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_CAPTION,
+        WS_SYSMENU,
+    };
+    let hwnd = HWND(hwnd as *mut _);
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let wanted = style & !((WS_CAPTION.0 | WS_SYSMENU.0) as isize);
+        if wanted == style {
+            return false;
+        }
+        SetWindowLongPtrW(hwnd, GWL_STYLE, wanted);
+        let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        true
+    }
+}
+
+/// The handle of the top-level window titled `title`, if there is one.
+pub fn find_window(title: &str) -> Option<isize> {
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    let title = wide(title);
+    unsafe { FindWindowW(None, PCWSTR(title.as_ptr())) }.ok().map(|h| h.0 as isize)
+}
+
 /// Whether Windows shows its interface in Russian (primary language of
 /// the user's UI language, `LANG_RUSSIAN`).
 pub fn ui_language_is_russian() -> bool {

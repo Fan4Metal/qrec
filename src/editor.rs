@@ -9,6 +9,7 @@ use std::thread::JoinHandle;
 
 use egui::{Color32, Key, RichText, Sense, Vec2};
 
+use crate::app::{CORNER_RADIUS, TitleButton, title_button};
 use crate::trim::{self, Frame, Info, Picture, Progress, SECOND};
 use crate::win;
 
@@ -74,6 +75,10 @@ pub struct Editor {
     /// The last cut written.
     saved: Option<PathBuf>,
     error: Option<String>,
+    /// The window's handle once it exists (found by its title), and the
+    /// size and radius its corners were last rounded for.
+    window: Option<isize>,
+    rounded: Option<(Vec2, i32)>,
 }
 
 impl Editor {
@@ -151,17 +156,54 @@ impl Editor {
             export: None,
             saved: None,
             error: None,
+            window: None,
+            rounded: None,
         }
+    }
+
+    /// The window's title: what the taskbar shows, and how the window is
+    /// found for its rounded corners.
+    pub fn title(&self) -> String {
+        let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        format!("{} — {name}", tr!("Trim", "Подрезка"))
     }
 
     /// The window's contents; `true` when it is to close.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> bool {
-        self.poll(ui.ctx());
+        let ctx = ui.ctx().clone();
+        self.poll(&ctx);
         self.keys(ui);
-        let mut close = ui.ctx().input(|i| i.viewport().close_requested());
-        // The panels have no fill of their own (the main window's are
-        // painted over a transparent window): one background under both.
-        ui.painter().rect_filled(ui.ctx().content_rect(), 0.0, ui.visuals().panel_fill);
+        let mut close = ctx.input(|i| i.viewport().close_requested());
+        // As the main window: no title bar of Windows, one rounded
+        // background with a thin line at its edge over a transparent
+        // window, the title row with the cross the program's own, and the
+        // row drags the window.
+        ui.painter().rect(
+            ctx.content_rect(),
+            CORNER_RADIUS,
+            ui.visuals().panel_fill,
+            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            egui::StrokeKind::Inside,
+        );
+        self.round_corners(&ctx);
+        egui::Panel::top("title")
+            .show_separator_line(false)
+            .frame(egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 8, top: 8, bottom: 0 }))
+            .show(ui, |ui| {
+                let row = ui.max_rect();
+                let drag = ui.interact(row, ui.id().with("drag"), Sense::click_and_drag());
+                if drag.drag_started_by(egui::PointerButton::Primary) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                ui.allocate_ui_with_layout(Vec2::new(row.width(), 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(self.title()).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if title_button(ui, TitleButton::Close) {
+                            close = true;
+                        }
+                    });
+                });
+            });
         egui::Panel::bottom("controls")
             .show_separator_line(false)
             .frame(egui::Frame::new().inner_margin(12))
@@ -185,6 +227,25 @@ impl Editor {
             }
         }
         close
+    }
+
+    /// Clips the window to rounded corners (`win::round_window`), again
+    /// whenever its size changes; the window is found by its title once
+    /// it exists. The caption is taken out of its style first, or Windows
+    /// would paint its own title bar over the row (`win::strip_caption`).
+    fn round_corners(&mut self, ctx: &egui::Context) {
+        if self.window.is_none() {
+            self.window = win::find_window(&self.title());
+        }
+        let Some(hwnd) = self.window else { return };
+        if win::strip_caption(hwnd) {
+            self.rounded = None;
+        }
+        let ppp = ctx.pixels_per_point();
+        let wanted = ((ctx.content_rect().size() * ppp).round(), (CORNER_RADIUS * ppp).round() as i32 - 1);
+        if self.rounded != Some(wanted) && win::round_window(hwnd, wanted.1) {
+            self.rounded = Some(wanted);
+        }
     }
 
     /// Results from the threads.
