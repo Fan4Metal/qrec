@@ -41,7 +41,9 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; Windows 10 2004: the process loopback (the sound) and windows left out
 ; of the recording (WDA_EXCLUDEFROMCAPTURE).
 MinVersion=10.0.19041
-; A running qrec is closed before its exe is replaced.
+; A running qrec is closed before its exe is replaced (and by its own
+; --quit in [Code], which also completes a recording and saves the
+; settings; the uninstaller has only that).
 CloseApplications=yes
 
 [Languages]
@@ -64,11 +66,27 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
 
+[UninstallRun]
+; The running copy is asked to close, so that its exe can be removed.
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--quit"; RunOnceId: "quit"; Flags: runhidden waituntilterminated
+
 [CustomMessages]
 english.DeleteSettings=Delete the settings of qrec as well (%1)?
 russian.DeleteSettings=Удалить и настройки qrec (%1)?
 
 [Code]
+// A copy already installed is asked to close before its exe is replaced.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Exe: String;
+  Code: Integer;
+begin
+  Result := '';
+  Exe := ExpandConstant('{app}\{#MyAppExeName}');
+  if FileExists(Exe) then
+    Exec(Exe, '--quit', '', SW_HIDE, ewWaitUntilTerminated, Code);
+end;
+
 // The settings are left unless the user wants them gone; a silent
 // uninstallation (an update) leaves them.
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

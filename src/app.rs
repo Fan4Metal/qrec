@@ -356,6 +356,7 @@ impl App {
                     }
                 }
                 crate::instance::Request::Open(path) => self.open_editor(path, ctx),
+                crate::instance::Request::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }
         if self.recorder.as_ref().is_some_and(Recorder::failed) {

@@ -150,6 +150,27 @@ pub fn cut(args: Vec<String>) -> i32 {
     }
 }
 
+/// `qrec --quit`: closes the running window, as its cross would (a
+/// recording is completed, the settings saved), and returns once it is
+/// gone. For the installer, which cannot replace or remove the exe of a
+/// running program. 0 when none runs or it went, 1 when it did not.
+pub fn quit() -> i32 {
+    match crate::instance::quit_running(std::time::Duration::from_secs(30)) {
+        None => {
+            say!("qrec is not running");
+            0
+        }
+        Some(true) => {
+            say!("qrec closed");
+            0
+        }
+        Some(false) => {
+            say!("qrec: the running copy did not close");
+            1
+        }
+    }
+}
+
 /// `qrec --info FILE`: what a recording holds, and where its key frames are.
 pub fn info(path: Option<PathBuf>) -> i32 {
     let Some(path) = path else {

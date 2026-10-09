@@ -1,8 +1,8 @@
 //! One window of qrec at a time. The first copy holds a named mutex and a
 //! message-only window; a copy started after it hands its request to that
 //! window with `WM_COPYDATA` and exits: the running window comes to the
-//! front, or opens the file given in the trimming window. The command line
-//! modes do not take part.
+//! front, or opens the file given in the trimming window, or (`--quit`,
+//! for the installer) closes. The command line modes do not take part.
 
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
@@ -26,13 +26,17 @@ pub enum Request {
     Show,
     /// Open the file in the trimming window.
     Open(PathBuf),
+    /// Close the program, as the cross would: a recording is completed,
+    /// the settings saved.
+    Quit,
 }
 
 const MUTEX: PCWSTR = w!("Local\\qrec_single_instance");
 const CLASS: PCWSTR = w!("qrec_instance");
-/// `COPYDATASTRUCT::dwData` of the two requests; a file comes as UTF-16.
+/// `COPYDATASTRUCT::dwData` of the requests; a file comes as UTF-16.
 const SHOW: usize = 1;
 const OPEN: usize = 2;
+const QUIT: usize = 3;
 
 /// The mutex that marks the running copy, held until the process ends.
 pub struct Claim(#[allow(dead_code)] HANDLE);
@@ -51,6 +55,29 @@ pub fn claim() -> Option<Claim> {
 /// waits a few seconds for its window when it is still starting. Whether
 /// the request was delivered.
 pub fn hand_over(open: Option<&Path>) -> bool {
+    deliver(if open.is_some() { OPEN } else { SHOW }, open)
+}
+
+/// Asks the running copy to close and waits for it to be gone (the mutex
+/// free), up to `timeout`. `None` when no copy runs; else whether it went.
+pub fn quit_running(timeout: Duration) -> Option<bool> {
+    if claim().is_some() {
+        return None;
+    }
+    if !deliver(QUIT, None) {
+        return Some(false);
+    }
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if claim().is_some() {
+            return Some(true);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Some(false)
+}
+
+fn deliver(request: usize, open: Option<&Path>) -> bool {
     let started = Instant::now();
     let hwnd = loop {
         if let Ok(hwnd) = unsafe { FindWindowExW(Some(HWND_MESSAGE), None, CLASS, None) } {
@@ -70,7 +97,7 @@ pub fn hand_over(open: Option<&Path>) -> bool {
     let _ = unsafe { AllowSetForegroundWindow(pid) };
     let path: Vec<u16> = open.map(crate::win::wide).unwrap_or_default();
     let data = COPYDATASTRUCT {
-        dwData: if open.is_some() { OPEN } else { SHOW },
+        dwData: request,
         cbData: (path.len() * 2) as u32,
         lpData: path.as_ptr() as *mut _,
     };
@@ -164,6 +191,7 @@ unsafe extern "system" fn instance_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
     let data = unsafe { &*(lparam.0 as *const COPYDATASTRUCT) };
     let request = match data.dwData {
         SHOW => Request::Show,
+        QUIT => Request::Quit,
         OPEN if !data.lpData.is_null() => {
             let units = unsafe { std::slice::from_raw_parts(data.lpData as *const u16, data.cbData as usize / 2) };
             let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());

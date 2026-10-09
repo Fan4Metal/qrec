@@ -109,6 +109,10 @@ fn main() -> eframe::Result {
             console_mode();
             std::process::exit(cli::info(std::env::args_os().nth(2).map(PathBuf::from)));
         }
+        Some("--quit") => {
+            console_mode();
+            std::process::exit(cli::quit());
+        }
         // A recording to trim, as Explorer's "Open with" passes it. Made
         // absolute: a running copy, given it, has another current folder.
         Some(file) if is_mp4(file) => {
