@@ -214,6 +214,7 @@ impl Editor {
             egui::StrokeKind::Inside,
         );
         self.round_corners(&ctx);
+        resize_edges(ui);
         egui::Panel::top("title")
             .show_separator_line(false)
             .frame(egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 8, top: 8, bottom: 0 }))
@@ -819,6 +820,38 @@ impl Drop for Editor {
                 let _ = thread.join();
             }
         }
+    }
+}
+
+/// The edges and corners of the window resize it, as a sizing frame would
+/// (the window has none, see `App::editor_window`): a strip a few points
+/// wide along each edge, with the resize pointer, hands a drag to Windows
+/// (`ViewportCommand::BeginResize`). Placed before the panels, so their
+/// widgets near an edge still take clicks first.
+fn resize_edges(ui: &mut egui::Ui) {
+    use egui::{CursorIcon, ResizeDirection as D};
+    const EDGE: f32 = 5.0;
+    const CORNER: f32 = 14.0;
+    let r = ui.ctx().content_rect();
+    let grips = [
+        (D::NorthWest, egui::Rect::from_min_size(r.left_top(), Vec2::splat(CORNER)), CursorIcon::ResizeNwSe),
+        (D::NorthEast, egui::Rect::from_min_size(r.right_top() - Vec2::new(CORNER, 0.0), Vec2::splat(CORNER)), CursorIcon::ResizeNeSw),
+        (D::SouthWest, egui::Rect::from_min_size(r.left_bottom() - Vec2::new(0.0, CORNER), Vec2::splat(CORNER)), CursorIcon::ResizeNeSw),
+        (D::SouthEast, egui::Rect::from_min_size(r.right_bottom() - Vec2::splat(CORNER), Vec2::splat(CORNER)), CursorIcon::ResizeNwSe),
+        (D::North, egui::Rect::from_min_max(r.left_top(), egui::pos2(r.right(), r.top() + EDGE)), CursorIcon::ResizeVertical),
+        (D::South, egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - EDGE), r.right_bottom()), CursorIcon::ResizeVertical),
+        (D::West, egui::Rect::from_min_max(r.left_top(), egui::pos2(r.left() + EDGE, r.bottom())), CursorIcon::ResizeHorizontal),
+        (D::East, egui::Rect::from_min_max(egui::pos2(r.right() - EDGE, r.top()), r.right_bottom()), CursorIcon::ResizeHorizontal),
+    ];
+    // Corners first: where a corner and an edge overlap, the corner wins.
+    let pointer = ui.ctx().pointer_hover_pos();
+    let Some((direction, rect, icon)) = grips.into_iter().find(|(_, rect, _)| pointer.is_some_and(|p| rect.contains(p))) else { return };
+    let response = ui.interact(rect, ui.id().with(("resize", direction as u8)), Sense::drag());
+    if response.hovered() || response.dragged() {
+        ui.ctx().set_cursor_icon(icon);
+    }
+    if response.drag_started_by(egui::PointerButton::Primary) {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
     }
 }
 

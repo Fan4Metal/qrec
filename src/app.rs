@@ -528,6 +528,10 @@ impl App {
             .with_inner_size(self.editor_placement.map_or(crate::editor::WINDOW_SIZE.into(), |r| r.size()))
             .with_min_inner_size(crate::editor::MIN_WINDOW_SIZE)
             .with_decorations(false)
+            // Not resizable for Windows: DWM draws its rectangular shadow
+            // around a window with a sizing frame whatever its region, and
+            // the transparent corners show. The editor's edges resize it.
+            .with_resizable(false)
             .with_transparent(true)
             .with_icon(crate::embedded_icon());
         if let Some(placement) = self.editor_placement {
