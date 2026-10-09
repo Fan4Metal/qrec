@@ -165,7 +165,7 @@ impl Editor {
     /// found for its rounded corners.
     pub fn title(&self) -> String {
         let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        format!("{} — {name}", tr!("Trim", "Подрезка"))
+        format!("{} — {name}", tr!("Trim", "Обрезка"))
     }
 
     /// The window's contents; `true` when it is to close.
@@ -525,7 +525,7 @@ impl Editor {
                     .button(tr!("[ Start here", "[ Начало здесь"))
                     .on_hover_text(tr!(
                         "The stretch kept starts on the key frame at or before this one (I)",
-                        "Оставляемый отрезок начнётся с ключевого кадра на этом или перед ним (I)"
+                        "Оставляемый фрагмент начнётся с ключевого кадра на этом или перед ним (I)"
                     ))
                     .clicked()
                 {
@@ -548,7 +548,7 @@ impl Editor {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let can_save = ready && self.export.is_none() && self.end > self.start;
-                let save = egui::Button::new(RichText::new(tr!("Save the cut", "Сохранить отрезок")).strong()).min_size(Vec2::new(0.0, 26.0));
+                let save = egui::Button::new(RichText::new(tr!("Save the cut", "Сохранить фрагмент")).strong()).min_size(Vec2::new(0.0, 26.0));
                 if ui
                     .add_enabled(can_save, save)
                     .on_hover_text(tr!(

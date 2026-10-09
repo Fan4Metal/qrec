@@ -1007,7 +1007,7 @@ impl App {
                         if ui.link(name).on_hover_text(tr!("Show in Explorer", "Показать в Проводнике")).clicked() {
                             win::show_in_explorer(path);
                         }
-                        if ui.small_button(tr!("Trim…", "Подрезать…")).on_hover_text(tr!("Cut the start and the end off, without re-encoding", "Отрезать начало и конец без перекодирования")).clicked() {
+                        if ui.small_button(tr!("Trim…", "Обрезать…")).on_hover_text(tr!("Cut the start and the end off, without re-encoding", "Отрезать начало и конец без перекодирования")).clicked() {
                             trim = Some(path.clone());
                         }
                     });

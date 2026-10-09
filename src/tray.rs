@@ -254,7 +254,7 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
     let taskbar = wide(tr!("Not on the taskbar", "Не показывать на панели задач"));
     let close_to_tray = wide(tr!("Hide when closed", "Сворачивать в трей при закрытии"));
     let minimise_on_record = wide(tr!("Minimise when recording starts", "Сворачивать при начале записи"));
-    let trim_after_record = wide(tr!("Trim after recording", "Подрезать после записи"));
+    let trim_after_record = wide(tr!("Trim after recording", "Обрезать после записи"));
     let about = wide(tr!("About…", "О программе…"));
     let exit = wide(tr!("Exit", "Выход"));
     unsafe {
