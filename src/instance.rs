@@ -56,7 +56,8 @@ pub fn hand_over(open: Option<&Path>) -> bool {
         if let Ok(hwnd) = unsafe { FindWindowExW(Some(HWND_MESSAGE), None, CLASS, None) } {
             break hwnd;
         }
-        if started.elapsed() > Duration::from_secs(5) {
+        // A first start of the GL window can take a while.
+        if started.elapsed() > Duration::from_secs(10) {
             log::warn!("no window of the running copy");
             return false;
         }
@@ -129,10 +130,21 @@ pub fn listen(ctx: egui::Context) -> Result<mpsc::Receiver<Request>, String> {
                 Some(instance.into()),
                 None,
             );
-            if let Err(e) = created {
-                let _ = ready_tx.send(Err(crate::win::describe(&e)));
-                return;
-            }
+            let hwnd = match created {
+                Ok(hwnd) => hwnd,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(crate::win::describe(&e)));
+                    return;
+                }
+            };
+            // A copy started without administrator rights may still talk
+            // to one that has them.
+            let _ = windows::Win32::UI::WindowsAndMessaging::ChangeWindowMessageFilterEx(
+                hwnd,
+                windows::Win32::UI::WindowsAndMessaging::WM_COPYDATA,
+                windows::Win32::UI::WindowsAndMessaging::MSGFLT_ALLOW,
+                None,
+            );
             let _ = ready_tx.send(Ok(()));
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {

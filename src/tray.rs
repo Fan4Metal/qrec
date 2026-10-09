@@ -15,7 +15,7 @@ use windows::Win32::UI::Shell::{
     NOTIFY_ICON_MESSAGE, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DispatchMessageW,
+    AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
     GetMessageW, GetSystemMetrics, HICON, LR_DEFAULTCOLOR, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
     RegisterClassExW, RegisterWindowMessageW, SM_CXSMICON, SetForegroundWindow, SetMenuDefaultItem, TPM_NONOTIFY, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_NULL,
@@ -50,6 +50,11 @@ pub enum Command {
 const WM_TRAY: u32 = WM_APP + 1;
 /// The state changed: the icon and the tooltip are set again.
 const WM_STATE: u32 = WM_APP + 2;
+/// From `Drop`: the window is destroyed and the thread ends. Not
+/// `WM_CLOSE`, which anything can send a top-level window (taskkill, a
+/// window cleaner): that would take the icon away, and with it the one
+/// way back to a hidden window.
+const WM_EXIT: u32 = WM_APP + 3;
 /// The icon's id among the window's icons.
 const ICON_ID: u32 = 1;
 /// A selection with the keyboard (`NIN_SELECT | NINF_KEY`), missing from the crate.
@@ -123,7 +128,7 @@ impl Tray {
                 CONTEXT.with_borrow_mut(|c| *c = Some(Context { tx, ctx, state: shared, icons }));
                 if !notify(hwnd, NIM_ADD) {
                     let _ = ready_tx.send(Err("the notification area refused the icon".into()));
-                    let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+                    let _ = DestroyWindow(hwnd);
                 } else {
                     let _ = ready_tx.send(Ok(hwnd.0 as isize));
                 }
@@ -167,7 +172,7 @@ impl Tray {
 impl Drop for Tray {
     fn drop(&mut self) {
         unsafe {
-            let _ = PostMessageW(Some(HWND(self.hwnd as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0));
+            let _ = PostMessageW(Some(HWND(self.hwnd as *mut _)), WM_EXIT, WPARAM(0), LPARAM(0));
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -189,9 +194,19 @@ unsafe fn create_window() -> Result<HWND, String> {
             ..Default::default()
         };
         RegisterClassExW(&wc);
-        TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Relaxed);
-        CreateWindowExW(WINDOW_EX_STYLE(0), class, w!("qrec"), WS_POPUP, 0, 0, 0, 0, None, None, Some(instance.into()), None)
-            .map_err(|e| crate::win::describe(&e))
+        let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
+        TASKBAR_CREATED.store(taskbar_created, Relaxed);
+        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), class, w!("qrec"), WS_POPUP, 0, 0, 0, 0, None, None, Some(instance.into()), None)
+            .map_err(|e| crate::win::describe(&e))?;
+        // Explorer's broadcast reaches a program with administrator rights
+        // only when it is let through.
+        let _ = windows::Win32::UI::WindowsAndMessaging::ChangeWindowMessageFilterEx(
+            hwnd,
+            taskbar_created,
+            windows::Win32::UI::WindowsAndMessaging::MSGFLT_ALLOW,
+            None,
+        );
+        Ok(hwnd)
     }
 }
 
@@ -307,6 +322,10 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         },
         WM_STATE => {
             notify(hwnd, NIM_MODIFY);
+        }
+        WM_CLOSE => {}
+        WM_EXIT => {
+            let _ = unsafe { DestroyWindow(hwnd) };
         }
         WM_DESTROY => {
             notify(hwnd, NIM_DELETE);

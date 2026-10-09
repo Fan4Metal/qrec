@@ -137,8 +137,10 @@ fn run_selection(monitors: Vec<Monitor>, aspect: Aspect) -> Option<Region> {
         let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut pixels, None, 0).ok()?;
         let dc = CreateCompatibleDC(None);
         let old_bitmap = SelectObject(dc, bitmap.into());
+        // 12 points at the system's scale (18 pixels at 150 %, 12 at 100 %).
+        let dpi = windows::Win32::UI::HiDpi::GetDpiForSystem().max(96) as i32;
         let font = CreateFontW(
-            -18,
+            -(12 * dpi / 72),
             0,
             0,
             0,
@@ -345,13 +347,24 @@ fn paint_selection(hwnd: HWND, all: bool) {
                 None => format!("{} × {} ({})", r.width(), r.height(), tr!("too small", "слишком мало")),
             };
             let (tw, th) = text_size(s.dc, &text);
-            let mut left = r.left;
+            // Kept on the monitor the drag started on: the virtual screen
+            // can have parts no monitor shows.
+            let bounds = s
+                .start
+                .and_then(|p| display::monitor_at(&s.monitors, p.0, p.1))
+                .map_or(whole, |m| Rect {
+                    left: m.rect.left - s.origin.0,
+                    top: m.rect.top - s.origin.1,
+                    right: m.rect.right - s.origin.0,
+                    bottom: m.rect.bottom - s.origin.1,
+                });
+            let mut left = r.left.max(bounds.left);
             let mut top = r.bottom + 6;
-            if top + th + 8 > h {
-                top = (r.top - th - 14).max(0);
+            if top + th + 8 > bounds.bottom {
+                top = (r.top - th - 14).max(bounds.top);
             }
-            if left + tw + 16 > w {
-                left = (w - tw - 16).max(0);
+            if left + tw + 16 > bounds.right {
+                left = (bounds.right - tw - 16).max(bounds.left);
             }
             (Rect { left, top, right: left + tw + 16, bottom: top + th + 8 }, text)
         });
@@ -475,7 +488,10 @@ impl Border {
                 run_border(region, ready_tx);
             })
             .ok();
-        let _ = ready_rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Not joined when it did not answer in time and has no thread id
+        // yet: `Drop` could not tell it to end and would wait for ever.
+        let answered = ready_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+        let thread = thread.filter(|_| answered || thread_id.load(Relaxed) != 0);
         Border { thread_id, thread }
     }
 }

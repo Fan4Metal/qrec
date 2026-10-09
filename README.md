@@ -39,11 +39,11 @@ qrec records a rectangle of the screen, or a whole display, to an MP4 file: H.26
 
 The installer and the portable archive are published on the [Releases](https://github.com/Fan4Metal/qrec/releases) page.
 
-The installer, `qrec_<version>_Setup.exe`, needs no administrator rights: the program is placed in `%LOCALAPPDATA%\Programs\qrec`. The installed program keeps its settings in `%APPDATA%\qrec`.
+The installer, `qrec_<version>_Setup.exe`, needs no administrator rights: the program is placed in `%LOCALAPPDATA%\Programs\qrec`. The installed program keeps its settings in `%APPDATA%\qrec`; when the program is uninstalled, a question decides whether they are deleted too.
 
 The portable archive, `qrec_<version>_portable.zip`, contains the program in a `qrec` folder and runs without installation. It also contains an empty `app.ron` file: while it lies beside `qrec.exe`, the settings are kept in that folder, so the program can be carried on a removable drive (the folder must be writable); without it they are kept in `%APPDATA%\qrec`, as for the installed program.
 
-Requirements: Windows 10 version 2004 or later, 64-bit. On earlier builds of Windows 10 the program runs, but the sound is captured from the default output device instead of through the process loopback (see [Sound](#sound)), the sound of one program cannot be recorded, and the windows of qrec may appear in the recording.
+Requirements: Windows 10 version 2004 or later, 64-bit; the installer does not run on earlier versions. On earlier builds of Windows 10 the portable version runs, but the sound is captured from the default output device instead of through the process loopback (see [Sound](#sound)), the sound of one program cannot be recorded, and the windows of qrec may appear in the recording.
 
 ## Usage
 

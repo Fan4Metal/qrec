@@ -147,7 +147,8 @@ def close_running_exe(exe: Path) -> None:
     """A running exe is locked by Windows, and cargo or the installer could not overwrite it.
 
     The copy started from `exe` is closed: WM_CLOSE first (taskkill without /F), so that it
-    completes a recording and saves its settings, then by force after 10 seconds."""
+    completes a recording and saves its settings, then by force after 10 seconds. WM_CLOSE is
+    sent again every 2 seconds: with the trimming window open, the first one closes only that."""
     if not exe_locked(exe):
         return
     query = f"(Get-Process qrec -ErrorAction SilentlyContinue | Where-Object Path -eq '{exe}').Id"
@@ -155,9 +156,13 @@ def close_running_exe(exe: Path) -> None:
     pids = out.stdout.split()
     for pid in pids:
         print(f"  closing qrec.exe (PID {pid})")
-        subprocess.run(["taskkill", "/PID", pid], capture_output=True)
-    deadline = time.monotonic() + 10
-    while exe_locked(exe) and time.monotonic() < deadline:
+    started = time.monotonic()
+    asked = None
+    while exe_locked(exe) and time.monotonic() < started + 10:
+        if asked is None or time.monotonic() > asked + 2:
+            asked = time.monotonic()
+            for pid in pids:
+                subprocess.run(["taskkill", "/PID", pid], capture_output=True)
         time.sleep(0.2)
     if exe_locked(exe):
         for pid in pids:
@@ -215,6 +220,8 @@ def main() -> int:
         steps.next("Checks")
         version = extract_version(CARGO_TOML)
         print(f"  version:               {version} (from {CARGO_TOML.name})")
+        if "-dev" in version:
+            print("  note: a development version; a release drops -dev in Cargo.toml first")
         cargo, iscc = check_prerequisites()
 
         if not args.no_tests:

@@ -178,7 +178,8 @@ impl Region {
         let mut parts = s.split(',').map(str::trim);
         let mut next = || parts.next()?.parse::<i64>().ok();
         let (x, y, w, h) = (next()?, next()?, next()?, next()?);
-        if parts.next().is_some() || w <= 0 || h <= 0 || w > u32::MAX as i64 || h > u32::MAX as i64 {
+        // Within i32 on both ends, so that `rect` cannot overflow.
+        if parts.next().is_some() || w <= 0 || h <= 0 || x + w > i32::MAX as i64 || y + h > i32::MAX as i64 {
             return None;
         }
         Some(Region { x: i32::try_from(x).ok()?, y: i32::try_from(y).ok()?, width: w as u32, height: h as u32 })

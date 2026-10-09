@@ -165,7 +165,16 @@ impl Hotkey {
                 let _ = thread.join();
                 Err(e)
             }
-            Err(_) => Err("no answer from the hotkey thread".into()),
+            Err(_) => {
+                // Told to end, not waited for: the thread may be stuck.
+                let id = thread_id.load(Relaxed);
+                if id != 0 {
+                    unsafe {
+                        let _ = PostThreadMessageW(id, WM_QUIT, WPARAM(0), LPARAM(0));
+                    }
+                }
+                Err("no answer from the hotkey thread".into())
+            }
         }
     }
 }

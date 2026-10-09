@@ -38,6 +38,9 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+; Windows 10 2004: the process loopback (the sound) and windows left out
+; of the recording (WDA_EXCLUDEFROMCAPTURE).
+MinVersion=10.0.19041
 ; A running qrec is closed before its exe is replaced.
 CloseApplications=yes
 
@@ -60,3 +63,23 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
+
+[CustomMessages]
+english.DeleteSettings=Delete the settings of qrec as well (%1)?
+russian.DeleteSettings=Удалить и настройки qrec (%1)?
+
+[Code]
+// The settings are left unless the user wants them gone; a silent
+// uninstallation (an update) leaves them.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Settings: String;
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    Settings := ExpandConstant('{userappdata}\{#MyAppName}');
+    if DirExists(Settings) and not UninstallSilent then
+      if MsgBox(FmtMessage(CustomMessage('DeleteSettings'), [Settings]), mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+        DelTree(Settings, True, True, True);
+  end;
+end;
