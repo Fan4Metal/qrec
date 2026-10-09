@@ -9,11 +9,13 @@
 //!   program's choice (32-bit float stereo at 48 kHz, turned into the
 //!   16-bit samples the encoder takes), the stream runs on while nothing
 //!   plays, and it works where capture on the endpoint itself is refused.
-//! - *Endpoint loopback*: the default output device opened for capture.
-//!   The packets come in the device's mix format (floating point as a
-//!   rule) and are turned into 16-bit stereo. Such a stream only delivers
-//!   packets while something is rendered, so a silent render stream on
-//!   the same device keeps it flowing.
+//! - *Endpoint loopback*: the default output device opened for capture,
+//!   asked for the same format as the process loopback: the audio engine
+//!   converts the device's mix format (a rate the AAC encoder does not
+//!   take, 96 kHz say; 5.1 channels, mixed down with the centre kept). The
+//!   mix format itself is the fallback when that is refused. Such a stream
+//!   only delivers packets while something is rendered, so a silent
+//!   render stream on the same device keeps it flowing.
 //!
 //! The sound of one program is the process loopback asked for that
 //! program's process tree, brought to full volume when it is boosted: the
@@ -29,7 +31,8 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE};
 use windows::Win32::Media::Audio::{
-    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
     AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
     ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
     IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient, IAudioRenderClient,
@@ -38,7 +41,7 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0};
 use windows::Win32::System::Com::{BLOB, CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
-use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId};
+use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, WaitForSingleObject};
 use windows::Win32::System::Variant::VT_BLOB;
 use windows::core::{GUID, IUnknown, Interface, Ref, Result, implement};
 
@@ -50,8 +53,20 @@ const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 const SUBTYPE_PCM: GUID = GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
 const SUBTYPE_IEEE_FLOAT: GUID = GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
 
-/// The format asked of the process loopback.
+/// The rate asked of the process loopback, and of the endpoint when the
+/// engine converts for it.
 const PROCESS_RATE: u32 = 48000;
+
+/// 32-bit float stereo at `PROCESS_RATE`.
+const STEREO_FLOAT: WAVEFORMATEX = WAVEFORMATEX {
+    wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+    nChannels: 2,
+    nSamplesPerSec: PROCESS_RATE,
+    nAvgBytesPerSec: PROCESS_RATE * 8,
+    nBlockAlign: 8,
+    wBitsPerSample: 32,
+    cbSize: 0,
+};
 
 /// Whose sound is recorded.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,8 +90,9 @@ enum Samples {
 pub struct Packet<'a> {
     /// Interleaved 16-bit stereo.
     pub samples: &'a [i16],
-    /// When the first frame was recorded, performance counter in 100 ns.
-    pub qpc: i64,
+    /// When the first frame was recorded, performance counter in 100 ns;
+    /// `None` when the device gave no usable time for it.
+    pub qpc: Option<i64>,
 }
 
 pub struct Loopback {
@@ -136,15 +152,17 @@ impl Loopback {
     }
 
     fn open_process(pid: u32, mode: PROCESS_LOOPBACK_MODE) -> Result<Loopback> {
-        let mut params = AUDIOCLIENT_ACTIVATION_PARAMS { ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, ..Default::default() };
+        // On the heap: when the activation times out it may still read them,
+        // and they are then left to it (a few bytes, once).
+        let mut params = Box::new(AUDIOCLIENT_ACTIVATION_PARAMS { ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, ..Default::default() });
         params.Anonymous.ProcessLoopbackParams =
             AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS { TargetProcessId: pid, ProcessLoopbackMode: mode };
         let blob = BLOB {
             cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-            pBlobData: (&mut params as *mut AUDIOCLIENT_ACTIVATION_PARAMS).cast(),
+            pBlobData: (&mut *params as *mut AUDIOCLIENT_ACTIVATION_PARAMS).cast(),
         };
         // Never dropped: the crate's `PROPVARIANT` clears itself on drop, which
-        // would free the blob pointer, and that points to the stack.
+        // would free the blob pointer, and that is the box's.
         let activation = std::mem::ManuallyDrop::new(PROPVARIANT {
             Anonymous: PROPVARIANT_0 {
                 Anonymous: std::mem::ManuallyDrop::new(PROPVARIANT_0_0 {
@@ -165,18 +183,13 @@ impl Loopback {
         };
         let client = match rx.recv_timeout(Duration::from_secs(5)) {
             Ok(result) => result.map_err(|e| context("activation", e))?,
-            Err(_) => return Err(windows::core::Error::new(E_FAIL, "activation timed out")),
+            Err(_) => {
+                Box::leak(params);
+                return Err(windows::core::Error::new(E_FAIL, "activation timed out"));
+            }
         };
         log::debug!("process loopback: activated");
-        let format = WAVEFORMATEX {
-            wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
-            nChannels: 2,
-            nSamplesPerSec: PROCESS_RATE,
-            nAvgBytesPerSec: PROCESS_RATE * 8,
-            nBlockAlign: 8,
-            wBitsPerSample: 32,
-            cbSize: 0,
-        };
+        let format = STEREO_FLOAT;
         unsafe {
             client
                 .Initialize(
@@ -221,10 +234,23 @@ impl Loopback {
         let format = unsafe { client.GetMixFormat() }.map_err(|e| context("GetMixFormat", e))?;
         let parsed = unsafe { parse_format(format) };
         let result = (|| {
-            let (rate, channels, samples, block_align) = parsed?;
-            log::debug!("mix format: {rate} Hz, {channels} channels, {samples:?}, {block_align} bytes per frame");
-            unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 10_000_000, 0, format, None) }
-                .map_err(|e| context("Initialize (loopback)", e))?;
+            let mix = parsed?;
+            log::debug!("mix format: {} Hz, {} channels, {:?}, {} bytes per frame", mix.0, mix.1, mix.2, mix.3);
+            // The engine converts to stereo at 48 kHz; the mix format as it
+            // is when it will not.
+            let converted = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+            let (client, (rate, channels, samples, block_align)) =
+                match unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, converted, 10_000_000, 0, &STEREO_FLOAT, None) } {
+                    Ok(()) => (client, (PROCESS_RATE, 2, Samples::Float32, 8)),
+                    Err(e) => {
+                        log::warn!("the endpoint loopback will not convert ({}); its mix format is taken", crate::win::describe(&e));
+                        // A client whose Initialize failed is not tried again.
+                        let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(|e| context("Activate", e))?;
+                        unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 10_000_000, 0, format, None) }
+                            .map_err(|e| context("Initialize (loopback)", e))?;
+                        (client, mix)
+                    }
+                };
             let capture: IAudioCaptureClient = unsafe { client.GetService() }.map_err(|e| context("GetService", e))?;
             let keepalive = (|| -> Result<Keepalive> {
                 let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
@@ -262,6 +288,17 @@ impl Loopback {
     /// Samples per second of the packets.
     pub fn rate(&self) -> u32 {
         self.rate
+    }
+
+    /// Waits up to `timeout` for packets: for the stream's event when it
+    /// has one, else the whole time.
+    pub fn wait(&self, timeout: Duration) {
+        match self.event {
+            Some(event) => unsafe {
+                WaitForSingleObject(event, timeout.as_millis() as u32);
+            },
+            None => std::thread::sleep(timeout),
+        }
     }
 
     pub fn start(&self) -> Result<()> {
@@ -305,7 +342,11 @@ impl Loopback {
                 convert(bytes, self.channels, self.samples, (self.gain, target), &mut self.scratch);
             }
             self.gain = target;
-            f(Packet { samples: &self.scratch, qpc: qpc as i64 });
+            // A packet without a time (the flag, or a zero some drivers
+            // give) continues the track; counted as before the start it
+            // would be dropped, and a track of them would be silent.
+            let qpc = (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0 && qpc != 0).then_some(qpc as i64);
+            f(Packet { samples: &self.scratch, qpc });
             unsafe { self.capture.ReleaseBuffer(frames as u32)? };
         }
         if let Some(k) = &self.keepalive {
@@ -386,24 +427,32 @@ unsafe fn parse_format(format: *const WAVEFORMATEX) -> Result<(u32, usize, Sampl
     if f.nChannels == 0 || f.nSamplesPerSec == 0 {
         return Err(windows::core::Error::new(E_FAIL, "empty mix format"));
     }
+    // `convert` reads the frames by this layout.
+    let (align, channels) = (f.nBlockAlign, f.nChannels);
+    if usize::from(align) != usize::from(channels) * usize::from(bits / 8) {
+        return Err(windows::core::Error::new(E_FAIL, format!("mix format with padded frames: {align} bytes for {channels} channels")));
+    }
     Ok((f.nSamplesPerSec, f.nChannels as usize, kind, f.nBlockAlign as usize))
 }
 
 /// Frames of the device's format into interleaved 16-bit stereo: the
 /// first two channels (a mono device fills both), multiplied by a gain
-/// that goes from `gain.0` to `gain.1` across the frames. What goes past
-/// full scale is clipped.
+/// that goes from `gain.0` to `gain.1` across the frames. A boosted sound
+/// is bent softly towards full scale over its top fifth (`soft_limit`)
+/// instead of being cut off flat there; anything else past full scale is
+/// clipped.
 fn convert(bytes: &[u8], channels: usize, samples: Samples, gain: (f32, f32), out: &mut [i16]) {
     let frames = out.len() / 2;
     let step = (gain.1 - gain.0) / frames.max(1) as f32;
     let sample = |frame: usize, channel: usize, gain: f32| -> i16 {
         let i = frame * channels + channel;
         let v = match samples {
-            Samples::Float32 => f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()) * 32767.0,
-            Samples::Int16 => f32::from(i16::from_le_bytes(bytes[i * 2..i * 2 + 2].try_into().unwrap())),
-            Samples::Int32 => (i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()) >> 16) as f32,
+            Samples::Float32 => f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()),
+            Samples::Int16 => f32::from(i16::from_le_bytes(bytes[i * 2..i * 2 + 2].try_into().unwrap())) / 32768.0,
+            Samples::Int32 => i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()) as f32 / 2_147_483_648.0,
         };
-        (v * gain).clamp(-32768.0, 32767.0) as i16
+        let v = if gain > 1.0 { soft_limit(v * gain) } else { v * gain };
+        (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16
     };
     for frame in 0..frames {
         let gain = gain.0 + step * (frame + 1) as f32;
@@ -412,6 +461,18 @@ fn convert(bytes: &[u8], channels: usize, samples: Samples, gain: (f32, f32), ou
         out[frame * 2] = left;
         out[frame * 2 + 1] = right;
     }
+}
+
+/// `v` (full scale at 1) unchanged below 0.8, bent towards 1 above it
+/// (tanh): a boosted quiet program's loud moments are rounded off rather
+/// than cut flat.
+fn soft_limit(v: f32) -> f32 {
+    const KNEE: f32 = 0.8;
+    let a = v.abs();
+    if a <= KNEE {
+        return v;
+    }
+    (KNEE + (1.0 - KNEE) * ((a - KNEE) / (1.0 - KNEE)).tanh()).copysign(v)
 }
 
 /// The error with the name of the call that failed in its message.
@@ -429,7 +490,7 @@ mod tests {
         let bytes: Vec<u8> = frames.iter().flat_map(|f| f.to_le_bytes()).collect();
         let mut out = vec![0i16; 4];
         convert(&bytes, 2, Samples::Float32, (1.0, 1.0), &mut out);
-        assert_eq!(out, vec![16383, -16383, 32767, 0]);
+        assert_eq!(out, vec![16384, -16384, 32767, 0]);
     }
 
     #[test]
@@ -446,9 +507,19 @@ mod tests {
         let bytes: Vec<u8> = frames.iter().flat_map(|f| f.to_le_bytes()).collect();
         let mut out = vec![0i16; 8];
         convert(&bytes, 2, Samples::Float32, (1.0, 5.0), &mut out);
-        assert_eq!(out, vec![655, 655, 983, 983, 1310, 1310, 1638, 1638]);
-        // A quiet program at full volume: clipped, not wrapped.
+        assert_eq!(out, vec![655, 655, 983, 983, 1311, 1311, 1638, 1638]);
+        // A quiet program at full volume: limited, not wrapped.
         convert(&bytes, 2, Samples::Float32, (400.0, 400.0), &mut out);
-        assert_eq!(out, vec![32767; 8]);
+        assert!(out.iter().all(|&s| s > 32700));
+    }
+
+    #[test]
+    fn boosted_sound_is_bent_not_cut() {
+        assert_eq!(soft_limit(0.5), 0.5);
+        assert_eq!(soft_limit(-0.8), -0.8);
+        // Above the knee: still rising, below full scale, symmetric.
+        let (a, b) = (soft_limit(0.9), soft_limit(1.5));
+        assert!(0.8 < a && a < b && b < 1.0);
+        assert_eq!(soft_limit(-1.5), -b);
     }
 }

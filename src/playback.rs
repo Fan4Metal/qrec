@@ -82,8 +82,7 @@ impl Playback {
         }
     }
 
-    /// Whether the sound has run out before the stretch did (the end of
-    /// the file).
+    /// Whether the stretch has been played to its end.
     pub fn finished(&self) -> bool {
         self.shared.finished.load(Relaxed)
     }
@@ -98,7 +97,9 @@ impl Drop for Playback {
     }
 }
 
-/// Plays the sound; `Ok(false)` when the file has none.
+/// Plays the sound; `Ok(false)` when the file has none, or has none left
+/// before `until` (the track shorter than the picture): the wall clock
+/// takes over from the position reached.
 fn run(path: &Path, from: i64, until: i64, shared: &Shared) -> Result<bool> {
     let Some(sound) = Sound::open(path)? else { return Ok(false) };
     sound.seek(from)?;
@@ -129,6 +130,7 @@ fn run(path: &Path, from: i64, until: i64, shared: &Shared) -> Result<bool> {
     let mut origin: Option<i64> = None;
     let mut written = 0u64;
     let (mut ended, mut started) = (false, false);
+    let mut drained_at: Option<Instant> = None;
     while !shared.stop.load(Relaxed) {
         while !ended && queue.len() < size as usize * channels * 2 {
             match sound.next()? {
@@ -150,8 +152,7 @@ fn run(path: &Path, from: i64, until: i64, shared: &Shared) -> Result<bool> {
         }
         let Some(origin) = origin else {
             // No sound after `from`.
-            shared.finished.store(true, Relaxed);
-            break;
+            return Ok(false);
         };
         let limit = ((until - origin).max(0) as i128 * rate as i128 / SECOND as i128) as u64;
         let padding = unsafe { client.GetCurrentPadding()? };
@@ -176,9 +177,21 @@ fn run(path: &Path, from: i64, until: i64, shared: &Shared) -> Result<bool> {
         unsafe { clock.GetPosition(&mut heard, None)? };
         let played = (heard as i128 * SECOND as i128 / frequency as i128) as i64;
         shared.position.store(origin + played, Relaxed);
-        if left == 0 && padding == 0 {
-            // All written has been heard: the end of the stretch or of the
-            // file.
+        // The buffer is empty some 10 to 20 ms before its last frame is
+        // heard: the clock says when (or a fifth of a second, should it
+        // stop short).
+        let heard_frames = (heard as i128 * rate as i128 / frequency as i128) as u64;
+        let drained = left == 0 && padding == 0;
+        let since = if drained { *drained_at.get_or_insert_with(Instant::now) } else { Instant::now() };
+        if drained && (heard_frames >= written || since.elapsed() > Duration::from_millis(200)) {
+            // All written has been heard: the end of the stretch, or of the
+            // sound before it.
+            if written < limit {
+                unsafe {
+                    let _ = client.Stop();
+                }
+                return Ok(false);
+            }
             shared.finished.store(true, Relaxed);
             break;
         }

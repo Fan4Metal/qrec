@@ -19,6 +19,7 @@ use crate::audio::{Loopback, Source};
 use crate::capture::{Capturer, PollError};
 use crate::convert::Converter;
 use crate::cursor::CursorDrawer;
+use windows::Win32::Foundation::E_ACCESSDENIED;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use crate::display::Monitor;
 use crate::encoder::{AudioConfig, Encoder, VideoConfig};
@@ -105,6 +106,8 @@ struct Shared {
     /// Ticks skipped because the encoder was behind.
     dropped: AtomicU64,
     error: Mutex<Option<String>>,
+    /// Why the sound stopped, when it did; the picture goes on.
+    audio_error: Mutex<Option<String>>,
 }
 
 pub struct Recorder {
@@ -140,7 +143,14 @@ impl Recorder {
                 Err(e)
             }
             Err(_) => {
+                // Told to stop; it ends on a thread of its own, which also
+                // removes what it wrote, so that no file of a recording
+                // that never started is left.
                 shared.stop.store(true, Relaxed);
+                let _ = std::thread::Builder::new().name("abandoned".into()).spawn(move || {
+                    let _ = thread.join();
+                    let _ = std::fs::remove_file(&path);
+                });
                 Err(tr!("the recording did not start in time", "запись не началась вовремя").into())
             }
         }
@@ -163,12 +173,20 @@ impl Recorder {
         self.thread.as_ref().is_some_and(|t| t.is_finished())
     }
 
+    /// Why the sound stopped, when it did: the recording goes on without
+    /// it, and the file is complete all the same.
+    pub fn audio_error(&self) -> Option<String> {
+        self.shared.audio_error.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Stops and completes the file; blocks until the index is written.
     pub fn stop(mut self) -> Result<Info, String> {
+        let asked = Instant::now();
         self.shared.stop.store(true, Relaxed);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        log::debug!("stopped in {:.0} ms", asked.elapsed().as_secs_f64() * 1e3);
         match self.error() {
             Some(e) => Err(e),
             None => Ok(self.info.clone()),
@@ -203,6 +221,11 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
                 Some(Loopback::open_app(root, *boost).map_err(audio_error)?)
             }
         };
+        // The file is opened with the first encoded frame, after the start
+        // is reported: a folder that cannot be written is found now.
+        std::fs::File::create(&config.path)
+            .and_then(|_| std::fs::remove_file(&config.path))
+            .map_err(|e| format!("{}: {e}", tr!("Cannot write the file", "Не удаётся записать файл")))?;
         let (width, height) = (config.region.width, config.region.height);
         let video = VideoConfig { width, height, fps: config.fps, bitrate: bitrate(width, height, config.fps, config.quality) };
         let audio = loopback.as_ref().map(|l| AudioConfig { sample_rate: l.rate() });
@@ -260,7 +283,7 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
                 let _com = win::com_init_mta();
                 if let Err(e) = run_audio(loopback, &encoder, start, &shared) {
                     log::error!("audio stopped: {e}");
-                    shared.error.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
+                    shared.audio_error.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
                 }
             })
             .ok()
@@ -275,29 +298,36 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
         let target = start + tick * interval;
         loop {
             let remaining = target - win::qpc_100ns();
-            if remaining <= 0 {
-                break;
-            }
-            let timeout = ((remaining + 9_999) / 10_000).clamp(1, 50) as u32;
+            // Behind the clock (the encoder slower than the frame rate):
+            // still one poll without waiting, or the capture would never
+            // be read again and the file would repeat one frame.
+            let timeout = if remaining <= 0 { 0 } else { ((remaining + 9_999) / 10_000).clamp(1, 50) as u32 };
             match capturer.poll(timeout) {
                 Ok(_) => {}
                 Err(PollError::AccessLost) => {
                     // A mode change or the secure desktop: duplicate again,
-                    // the last frame stands in meanwhile.
+                    // the last frame stands in meanwhile. The secure desktop
+                    // (Win+L, a UAC prompt) refuses the duplication for as
+                    // long as it is up, which is no reason to stop.
                     let since = *lost_since.get_or_insert_with(Instant::now);
-                    if capturer.recreate().is_ok() {
-                        lost_since = None;
-                    } else if since.elapsed() > Duration::from_secs(15) {
-                        result = Err(tr!("the display was lost", "экран стал недоступен").into());
-                        break 'record;
-                    } else {
-                        std::thread::sleep(Duration::from_millis(50));
+                    match capturer.recreate() {
+                        Ok(()) => lost_since = None,
+                        Err(e) if e.code() == E_ACCESSDENIED || since.elapsed() <= Duration::from_secs(15) => {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        Err(e) => {
+                            result = Err(format!("{}: {}", tr!("the display was lost", "экран стал недоступен"), win::describe(&e)));
+                            break 'record;
+                        }
                     }
                 }
                 Err(PollError::Other(e)) => {
                     result = Err(format!("{}: {}", tr!("screen capture", "захват экрана"), win::describe(&e)));
                     break 'record;
                 }
+            }
+            if remaining <= 0 {
+                break;
             }
         }
         if !capturer.has_frame() {
@@ -355,111 +385,254 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
     result
 }
 
-/// Gaps and overlaps smaller than this are jitter of the device clock and
-/// are ignored; larger ones are filled with silence or trimmed.
+/// Gaps and overlaps larger than this are filled with silence or trimmed
+/// at once (the sound stopped, the device was busy).
 const AUDIO_TOLERANCE: i64 = 300_000;
+/// Within the tolerance, a track more than this off the packets' times
+/// (the device's clock drifting against the performance counter) is
+/// brought back a frame per packet: a frame added or left out is not
+/// heard, a jump of 30 ms is.
+const AUDIO_DRIFT: i64 = 100_000;
 
 fn run_audio(mut loopback: Loopback, encoder: &Encoder, start: i64, shared: &Shared) -> Result<(), String> {
     let describe = |e: windows::core::Error| format!("{}: {}", tr!("audio capture", "захват звука"), win::describe(&e));
-    let rate = i64::from(loopback.rate());
-    let to_time = |frames: i64| frames * 10_000_000 / rate;
-    let to_frames = |time: i64| time * rate / 10_000_000;
+    let mut write = |samples: &[i16], time: i64, duration: i64| {
+        encoder.write_audio(samples, time, duration).map_err(|e| format!("{}: {}", tr!("encoder", "кодер"), win::describe(&e)))
+    };
+    let mut track = Track::new(i64::from(loopback.rate()));
     loopback.start().map_err(describe)?;
-    // Where the next sample goes on the timeline; `buffer` holds samples
-    // from `buffer_start` not written yet.
-    let mut next: i64 = 0;
-    let mut buffer: Vec<i16> = Vec::new();
-    let mut buffer_start: i64 = 0;
-    let mut packets: Vec<(Vec<i16>, i64)> = Vec::new();
+    let mut packets: Vec<(Vec<i16>, Option<i64>)> = Vec::new();
     let mut result = Ok(());
-    while !shared.stop.load(Relaxed) {
-        std::thread::sleep(Duration::from_millis(10));
+    let mut logged = 0;
+    loop {
+        loopback.wait(Duration::from_millis(10));
         packets.clear();
         if let Err(e) = loopback.drain(|p| packets.push((p.samples.to_vec(), p.qpc))) {
             result = Err(describe(e));
             break;
         }
         for (samples, qpc) in packets.drain(..) {
-            let mut time = qpc - start;
-            let mut samples = &samples[..];
-            if time < 0 {
-                // Recorded before the video started: drop that part.
-                let skip = to_frames(-time) as usize * 2;
-                if skip >= samples.len() {
-                    continue;
-                }
-                samples = &samples[skip..];
-                time = 0;
-            }
-            let gap = time - next;
-            if gap > AUDIO_TOLERANCE {
-                flush(encoder, &mut buffer, buffer_start, to_time)?;
-                write_silence(encoder, next, gap, to_frames, to_time)?;
-                next = time;
-            } else if gap < -AUDIO_TOLERANCE {
-                let skip = to_frames(-gap) as usize * 2;
-                if skip >= samples.len() {
-                    continue;
-                }
-                samples = &samples[skip..];
-            }
-            if buffer.is_empty() {
-                buffer_start = next;
-            }
-            buffer.extend_from_slice(samples);
-            next += to_time(samples.len() as i64 / 2);
-            if buffer.len() >= rate as usize / 5 * 2 {
-                flush(encoder, &mut buffer, buffer_start, to_time)?;
-            }
+            track.add(&samples, qpc.map(|qpc| qpc - start), &mut write)?;
         }
-        flush(encoder, &mut buffer, buffer_start, to_time)?;
-        // Nothing played for a while and no keep-alive: keep the track going.
+        track.flush(&mut write)?;
         let now = win::qpc_100ns() - start;
-        if now / 50_000_000 != (now - 100_000) / 50_000_000 {
-            log::debug!("audio at {:.2} s lags the clock by {} ms", next as f64 / 1e7, (now - next) / 10_000);
+        if now / 50_000_000 > logged {
+            logged = now / 50_000_000;
+            log::debug!(
+                "audio at {:.2} s lags the clock by {} ms, {} frames added or left out",
+                track.end() as f64 / 1e7,
+                (now - track.end()) / 10_000,
+                track.corrections
+            );
         }
-        if now - next > 5_000_000 {
-            let gap = now - next - 1_000_000;
-            write_silence(encoder, next, gap, to_frames, to_time)?;
-            next += to_time(to_frames(gap));
+        // Nothing played for a while and no keep-alive: keep the track going.
+        track.keep_up(now, &mut write)?;
+        // Once more after the stop, for the packets of the last moment.
+        if shared.stop.load(Relaxed) {
+            break;
         }
     }
     loopback.stop();
     result
 }
 
-fn flush(encoder: &Encoder, buffer: &mut Vec<i16>, start: i64, to_time: impl Fn(i64) -> i64) -> Result<(), String> {
-    if buffer.is_empty() {
-        return Ok(());
-    }
-    let duration = to_time(buffer.len() as i64 / 2);
-    let r = encoder.write_audio(buffer, start, duration);
-    buffer.clear();
-    r.map_err(|e| format!("{}: {}", tr!("encoder", "кодер"), win::describe(&e)))
+/// The sound track as it is laid down: where the next sample goes,
+/// counted in frames so that rounding does not add up over a long
+/// recording, and the samples not written yet.
+struct Track {
+    rate: i64,
+    /// The frame the next sample takes; `None` before the first packet.
+    position: Option<i64>,
+    buffer: Vec<i16>,
+    /// The frame of the first sample in `buffer`.
+    buffer_start: i64,
+    /// Frames added or left out against drift.
+    corrections: u64,
 }
 
-fn write_silence(
-    encoder: &Encoder,
-    mut at: i64,
-    gap: i64,
-    to_frames: impl Fn(i64) -> i64,
-    to_time: impl Fn(i64) -> i64,
-) -> Result<(), String> {
-    let mut frames = to_frames(gap);
-    while frames > 0 {
-        let chunk = frames.min(to_frames(10_000_000));
-        let silence = vec![0i16; chunk as usize * 2];
-        let duration = to_time(chunk);
-        encoder.write_audio(&silence, at, duration).map_err(|e| format!("{}: {}", tr!("encoder", "кодер"), win::describe(&e)))?;
-        at += duration;
-        frames -= chunk;
+impl Track {
+    fn new(rate: i64) -> Track {
+        Track { rate, position: None, buffer: Vec::new(), buffer_start: 0, corrections: 0 }
     }
-    Ok(())
+
+    fn time(&self, frames: i64) -> i64 {
+        frames * 10_000_000 / self.rate
+    }
+
+    fn frames(&self, time: i64) -> i64 {
+        time * self.rate / 10_000_000
+    }
+
+    /// Where the track has got to, in 100 ns units.
+    fn end(&self) -> i64 {
+        self.time(self.position.unwrap_or(0))
+    }
+
+    /// Lays down a packet recorded at `time` (on the recording's clock;
+    /// `None` when the device gave no time: it continues the track).
+    fn add(&mut self, samples: &[i16], time: Option<i64>, write: &mut impl FnMut(&[i16], i64, i64) -> Result<(), String>) -> Result<(), String> {
+        let mut samples = samples;
+        let mut at = time.map_or(self.position.unwrap_or(0), |t| self.frames(t));
+        if at < 0 {
+            // Recorded before the video started: that part is dropped.
+            let skip = (-at) as usize * 2;
+            if skip >= samples.len() {
+                return Ok(());
+            }
+            samples = &samples[skip..];
+            at = 0;
+        }
+        // The track starts where the first packet is, not at 0.
+        let position = *self.position.get_or_insert(at);
+        let gap = at - position;
+        let mut extra = None;
+        if gap > self.frames(AUDIO_TOLERANCE) {
+            self.flush(write)?;
+            self.silence(gap, write)?;
+        } else if gap < -self.frames(AUDIO_TOLERANCE) {
+            let skip = (-gap) as usize * 2;
+            if skip >= samples.len() {
+                return Ok(());
+            }
+            samples = &samples[skip..];
+        } else if gap > self.frames(AUDIO_DRIFT) && samples.len() >= 2 {
+            // Behind the packets: the first frame twice.
+            extra = Some([samples[0], samples[1]]);
+            self.corrections += 1;
+        } else if gap < -self.frames(AUDIO_DRIFT) && samples.len() >= 4 {
+            // Ahead of them: the first frame left out.
+            samples = &samples[2..];
+            self.corrections += 1;
+        }
+        let position = self.position.unwrap_or(0);
+        if self.buffer.is_empty() {
+            self.buffer_start = position;
+        }
+        if let Some(frame) = extra {
+            self.buffer.extend_from_slice(&frame);
+        }
+        self.buffer.extend_from_slice(samples);
+        self.position = Some(self.buffer_start + self.buffer.len() as i64 / 2);
+        if self.buffer.len() as i64 >= self.rate / 5 * 2 {
+            self.flush(write)?;
+        }
+        Ok(())
+    }
+
+    /// Writes the samples waiting.
+    fn flush(&mut self, write: &mut impl FnMut(&[i16], i64, i64) -> Result<(), String>) -> Result<(), String> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let end = self.buffer_start + self.buffer.len() as i64 / 2;
+        let (time, duration) = (self.time(self.buffer_start), self.time(end) - self.time(self.buffer_start));
+        let result = write(&self.buffer, time, duration);
+        self.buffer.clear();
+        self.buffer_start = end;
+        result
+    }
+
+    /// `frames` of silence from the position on; the buffer is empty.
+    fn silence(&mut self, frames: i64, write: &mut impl FnMut(&[i16], i64, i64) -> Result<(), String>) -> Result<(), String> {
+        let mut at = self.position.unwrap_or(0);
+        let end = at + frames;
+        while at < end {
+            let chunk = (end - at).min(self.rate);
+            let silence = vec![0i16; chunk as usize * 2];
+            write(&silence, self.time(at), self.time(at + chunk) - self.time(at))?;
+            at += chunk;
+        }
+        self.position = Some(end);
+        self.buffer_start = end;
+        Ok(())
+    }
+
+    /// Silence up to a second before `now` when the track has fallen more
+    /// than five behind: a stream that delivers nothing while nothing
+    /// plays.
+    fn keep_up(&mut self, now: i64, write: &mut impl FnMut(&[i16], i64, i64) -> Result<(), String>) -> Result<(), String> {
+        let lag = self.frames(now) - self.position.unwrap_or(0);
+        if lag > self.frames(5 * 10_000_000) {
+            self.flush(write)?;
+            self.position.get_or_insert(0);
+            self.silence(lag - self.frames(10_000_000), write)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a track writes, as (first frame, frames, the samples' first value).
+    fn lay(track: &mut Track, packets: &[(usize, Option<i64>, i16)]) -> Vec<(i64, i64, i16)> {
+        let mut out = Vec::new();
+        let rate = track.rate;
+        let mut write = |s: &[i16], time: i64, duration: i64| {
+            out.push((time * rate / 10_000_000, (duration * rate + 5_000_000) / 10_000_000, s[0]));
+            Ok(())
+        };
+        for &(frames, time, value) in packets {
+            track.add(&vec![value; frames * 2], time, &mut write).unwrap();
+        }
+        track.flush(&mut write).unwrap();
+        out
+    }
+
+    #[test]
+    fn track_starts_at_the_first_packet() {
+        let mut track = Track::new(48_000);
+        // 10 ms in: the track starts there, the next packet follows on.
+        let out = lay(&mut track, &[(480, Some(100_000), 1), (480, Some(200_000), 2)]);
+        assert_eq!(out, vec![(480, 960, 1)]);
+    }
+
+    #[test]
+    fn track_fills_gaps_and_trims_overlaps() {
+        let mut track = Track::new(48_000);
+        // A second without packets: silence, then the packet in its place.
+        let out = lay(&mut track, &[(480, Some(0), 1), (480, Some(10_100_000), 2)]);
+        assert_eq!(out, vec![(0, 480, 1), (480, 48_000, 0), (48_480, 480, 2)]);
+        // A packet 50 ms early: its first 50 ms are dropped.
+        let mut track = Track::new(48_000);
+        let out = lay(&mut track, &[(4800, Some(0), 1), (4800, Some(500_000), 2)]);
+        assert_eq!(out, vec![(0, 4800 + 2400, 1)]);
+    }
+
+    #[test]
+    fn track_follows_drift_a_frame_at_a_time() {
+        // A device clock 0.1 % slow against the counter: packets of 10 ms
+        // 10 µs late each. Without correction 30 s of them would be 30 ms
+        // behind and get a jump of silence; the track adds a frame now and
+        // then and stays within 10 ms.
+        let mut track = Track::new(48_000);
+        let packets: Vec<(usize, Option<i64>, i16)> = (0..3000).map(|i| (480, Some(i * 100_100), 1)).collect();
+        let out = lay(&mut track, &packets);
+        let behind = track.frames(2999 * 100_100) - (track.position.unwrap() - 480);
+        assert!(track.corrections > 0);
+        assert!(behind.abs() <= track.frames(AUDIO_DRIFT) + 1, "{behind} frames behind");
+        assert!(out.iter().all(|&(_, _, v)| v == 1), "no silence written");
+        // Packets without a time continue the track.
+        let mut track = Track::new(48_000);
+        let out = lay(&mut track, &[(480, Some(0), 1), (480, None, 2)]);
+        assert_eq!(out, vec![(0, 960, 1)]);
+    }
+
+    #[test]
+    fn track_keeps_up_with_the_clock() {
+        let mut track = Track::new(48_000);
+        let mut out = Vec::new();
+        let mut write = |_: &[i16], time: i64, duration: i64| {
+            out.push((time, duration));
+            Ok(())
+        };
+        track.keep_up(4 * 10_000_000, &mut write).unwrap();
+        assert_eq!(track.end(), 0);
+        track.keep_up(6 * 10_000_000, &mut write).unwrap();
+        assert_eq!(track.end(), 5 * 10_000_000);
+        assert_eq!(out.first(), Some(&(0, 10_000_000)));
+    }
 
     #[test]
     fn bitrate_follows_area_and_rate() {

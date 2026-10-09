@@ -10,11 +10,14 @@
 //! device applies it in hardware, as it does on the development machine.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, MAX_PATH};
 use windows::Win32::Media::Audio::{
-    AudioSessionStateActive, DEVICE_STATE_ACTIVE, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator,
+    AudioSessionStateActive, AudioSessionStateExpired, DEVICE_STATE_ACTIVE, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator,
     ISimpleAudioVolume, MMDeviceEnumerator, eRender,
 };
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
@@ -130,39 +133,89 @@ pub fn find(program: &str) -> Option<u32> {
         .or(roots.first().copied())
 }
 
-/// The volume of a program's sessions, followed while it is recorded.
+/// The volume of a program's sessions, followed while it is recorded, on
+/// a thread of its own: listing the sessions takes 10 to 30 ms, which the
+/// audio thread is better without.
 pub struct Volume {
-    root: u32,
-    sessions: Vec<ISimpleAudioVolume>,
-    listed: Option<Instant>,
+    /// The gain of [`Sessions::gain`], as `f32` bits.
+    gain: Arc<AtomicU32>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
 }
-
-// The session objects are free-threaded: made on one recording thread,
-// read on the audio thread.
-unsafe impl Send for Volume {}
 
 /// The quietest volume undone; below it the sound is mostly lost.
 const MIN_VOLUME: f32 = 0.01;
+/// How often the volume is read; the sessions are listed every second.
+const VOLUME_PERIOD: Duration = Duration::from_millis(50);
 
 impl Volume {
-    /// The sessions of the process tree from `root`.
+    /// Follows the sessions of the process tree from `root`; the gain is
+    /// known when this returns.
     pub fn new(root: u32) -> Volume {
-        Volume { root, sessions: Vec::new(), listed: None }
+        let mut sessions = Sessions { root, sessions: Vec::new(), listed: None };
+        let gain = Arc::new(AtomicU32::new(sessions.gain().to_bits()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (shared, stopped) = (Arc::clone(&gain), Arc::clone(&stop));
+        // The session objects are made again on the thread, which keeps
+        // them to itself.
+        drop(sessions);
+        let thread = std::thread::Builder::new()
+            .name("volume".into())
+            .spawn(move || {
+                let _com = win::com_init_mta();
+                let mut sessions = Sessions { root, sessions: Vec::new(), listed: None };
+                while !stopped.load(Relaxed) {
+                    shared.store(sessions.gain().to_bits(), Relaxed);
+                    std::thread::sleep(VOLUME_PERIOD);
+                }
+            })
+            .ok();
+        Volume { gain, stop, thread }
     }
 
-    /// The factor that brings the captured sound to full volume: `1/v`
-    /// for the loudest of the program's sessions that is not muted. The
-    /// sessions are listed again every second, as the program opens new
-    /// ones or new child processes.
+    /// The factor that brings the captured sound to full volume, as last
+    /// read (see [`Sessions::gain`]).
     pub fn gain(&mut self) -> f32 {
+        f32::from_bits(self.gain.load(Relaxed))
+    }
+}
+
+impl Drop for Volume {
+    fn drop(&mut self) {
+        self.stop.store(true, Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The sessions of a program's process tree.
+struct Sessions {
+    root: u32,
+    sessions: Vec<(IAudioSessionControl2, ISimpleAudioVolume)>,
+    listed: Option<Instant>,
+}
+
+impl Sessions {
+    /// `1/v` for the loudest of the program's sessions that is not muted,
+    /// among those playing now when any is (a browser keeps old sessions
+    /// at full volume beside the one that plays), never an expired one.
+    /// The sessions are listed again every second, as the program opens
+    /// new ones or new child processes.
+    fn gain(&mut self) -> f32 {
         if self.listed.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
             self.list();
         }
+        let states: Vec<_> = self.sessions.iter().map(|(c, _)| unsafe { c.GetState() }.ok()).collect();
+        let playing = states.contains(&Some(AudioSessionStateActive));
         let loudest = self
             .sessions
             .iter()
-            .filter(|s| !unsafe { s.GetMute() }.is_ok_and(|m| m.as_bool()))
-            .filter_map(|s| unsafe { s.GetMasterVolume() }.ok())
+            .zip(&states)
+            .filter(|(_, state)| if playing { **state == Some(AudioSessionStateActive) } else { **state != Some(AudioSessionStateExpired) })
+            .map(|((_, v), _)| v)
+            .filter(|v| !unsafe { v.GetMute() }.is_ok_and(|m| m.as_bool()))
+            .filter_map(|v| unsafe { v.GetMasterVolume() }.ok())
             .fold(None, |max: Option<f32>, v| Some(max.map_or(v, |m| m.max(v))));
         match loudest {
             Some(v) => gain_for(v),
@@ -171,17 +224,19 @@ impl Volume {
     }
 
     fn list(&mut self) {
-        self.listed = Some(Instant::now());
+        let started = Instant::now();
+        self.listed = Some(started);
         let parents: HashMap<u32, u32> = processes().iter().map(|p| (p.pid, p.parent)).collect();
         let before = self.sessions.len();
         self.sessions = sessions()
             .into_iter()
             .filter(|s| unsafe { s.GetProcessId() }.is_ok_and(|pid| in_tree(pid, self.root, &parents)))
-            .filter_map(|s| s.cast::<ISimpleAudioVolume>().ok())
+            .filter_map(|s| s.cast::<ISimpleAudioVolume>().ok().map(|v| (s, v)))
             .collect();
         if self.sessions.len() != before {
             log::debug!("audio: {} sessions of process {}", self.sessions.len(), self.root);
         }
+        log::trace!("audio: sessions listed in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
     }
 }
 
