@@ -41,6 +41,7 @@ const CLOSE_TO_TRAY_KEY: &str = "close_to_tray";
 const MINIMISE_ON_RECORD_KEY: &str = "minimise_on_record";
 const TRIM_AFTER_RECORD_KEY: &str = "trim_after_record";
 const LANGUAGE_KEY: &str = "language";
+const EDITOR_RECT_KEY: &str = "editor_rect";
 
 /// Width of the language list in About, enough for its longest entry.
 const LANG_WIDTH: f32 = 220.0;
@@ -96,6 +97,13 @@ pub struct App {
     about: bool,
     /// The trimming window, while one is open.
     editor: Option<Editor>,
+    /// Where the trimming window was last, in points on the screen (its
+    /// outer position, its inner size): where it opens next (`x,y,w,h` in
+    /// the settings).
+    editor_rect: Option<egui::Rect>,
+    /// Where the open trimming window was placed, passed with its viewport
+    /// every frame (a changed position would move it).
+    editor_placement: Option<egui::Rect>,
     /// The icon of About, rasterised at the display's pixel density.
     about_icon: Option<egui::TextureHandle>,
     /// The next key press becomes the hotkey.
@@ -143,6 +151,7 @@ impl App {
         let minimise_on_record = get(MINIMISE_ON_RECORD_KEY).as_deref() == Some("true");
         let trim_after_record = get(TRIM_AFTER_RECORD_KEY).as_deref() == Some("true");
         let lang = get(LANGUAGE_KEY).and_then(|l| LangChoice::from_name(&l)).unwrap_or_default();
+        let editor_rect = get(EDITOR_RECT_KEY).and_then(|r| rect_from_setting(&r));
         crate::i18n::set_lang(lang.resolve());
         let cursor = get(CURSOR_KEY).as_deref() != Some("false");
         let folder = get(FOLDER_KEY).map(PathBuf::from).unwrap_or_else(default_folder);
@@ -193,6 +202,8 @@ impl App {
             lang,
             about: false,
             editor: None,
+            editor_rect,
+            editor_placement: None,
             about_icon: None,
             hotkey: None,
             hotkey_error: None,
@@ -489,6 +500,14 @@ impl App {
             win::show_window(hwnd, true);
         }
         self.editor = None;
+        // Where it was last, when that is still on a display.
+        let ppp = ctx.pixels_per_point();
+        self.editor_placement = self.editor_rect.filter(|r| {
+            let centre = r.center() * ppp;
+            self.monitors.iter().any(|m| {
+                (m.rect.left as f32..m.rect.right as f32).contains(&centre.x) && (m.rect.top as f32..m.rect.bottom as f32).contains(&centre.y)
+            })
+        });
         self.editor = Some(Editor::open(path, ctx.clone(), editor_viewport()));
     }
 
@@ -497,14 +516,29 @@ impl App {
         let Some(editor) = &mut self.editor else { return };
         // Styled like the main window: its own title row and rounded
         // corners over a transparent window.
-        let builder = egui::ViewportBuilder::default()
+        let mut builder = egui::ViewportBuilder::default()
             .with_title(editor.title())
-            .with_inner_size(crate::editor::WINDOW_SIZE)
+            .with_inner_size(self.editor_placement.map_or(crate::editor::WINDOW_SIZE.into(), |r| r.size()))
             .with_min_inner_size(crate::editor::MIN_WINDOW_SIZE)
             .with_decorations(false)
             .with_transparent(true)
             .with_icon(crate::embedded_icon());
-        let close = ctx.show_viewport_immediate(editor_viewport(), builder, |ui, _class| editor.ui(ui));
+        if let Some(placement) = self.editor_placement {
+            builder = builder.with_position(placement.min);
+        }
+        let (close, rect) = ctx.show_viewport_immediate(editor_viewport(), builder, |ui, _class| {
+            // The outer position (winit leaves a pixel of non-client area
+            // above an undecorated window) with the inner size: what
+            // `with_position` and `with_inner_size` take.
+            let rect = ui.ctx().input(|i| {
+                let v = i.viewport();
+                Some(egui::Rect::from_min_size(v.outer_rect?.min, v.inner_rect?.size()))
+            });
+            (editor.ui(ui), rect)
+        });
+        if let Some(rect) = rect {
+            self.editor_rect = Some(rect);
+        }
         if close {
             self.editor = None;
         }
@@ -727,6 +761,7 @@ impl eframe::App for App {
         storage.set_string(MINIMISE_ON_RECORD_KEY, self.minimise_on_record.to_string());
         storage.set_string(TRIM_AFTER_RECORD_KEY, self.trim_after_record.to_string());
         storage.set_string(LANGUAGE_KEY, self.lang.name().to_owned());
+        storage.set_string(EDITOR_RECT_KEY, self.editor_rect.map(rect_to_setting).unwrap_or_default());
         storage.set_string(CURSOR_KEY, self.cursor.to_string());
         storage.set_string(FOLDER_KEY, self.folder.display().to_string());
         storage.set_string(HOTKEY_KEY, self.chord.map(|c| c.label()).unwrap_or_default());
@@ -1014,6 +1049,20 @@ fn title(ui: &egui::Ui, rect: egui::Rect) {
     painter.galley(pos, galley, DARK_COLOUR);
 }
 
+/// `x,y,w,h` of a rectangle in points, as the settings keep it.
+fn rect_to_setting(rect: egui::Rect) -> String {
+    // Not rounded: a point is a pixel and a half at 150 % scaling.
+    format!("{},{},{},{}", rect.min.x, rect.min.y, rect.width(), rect.height())
+}
+
+fn rect_from_setting(setting: &str) -> Option<egui::Rect> {
+    let v: Vec<f32> = setting.split(',').map(|s| s.trim().parse().ok()).collect::<Option<_>>()?;
+    match v[..] {
+        [x, y, w, h] if w >= 64.0 && h >= 64.0 => Some(egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h))),
+        _ => None,
+    }
+}
+
 /// The trimming window's viewport.
 fn editor_viewport() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("editor")
@@ -1189,7 +1238,16 @@ fn elide(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::elide;
+    use super::{elide, rect_from_setting, rect_to_setting};
+
+    #[test]
+    fn keeps_the_editor_rect() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.5), egui::vec2(860.0, 640.0));
+        assert_eq!(rect_to_setting(rect), "100,50.5,860,640");
+        assert_eq!(rect_from_setting("100,50.5,860,640"), Some(rect));
+        assert_eq!(rect_from_setting(""), None);
+        assert_eq!(rect_from_setting("1,2,3,4"), None);
+    }
 
     #[test]
     fn elides_in_the_middle() {
