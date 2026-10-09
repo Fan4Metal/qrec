@@ -1,5 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+/// A line to stderr in the command line modes. Unlike `eprintln!` it does
+/// not panic when stderr is a pipe already closed (`qrec --info f |
+/// Select-Object -First 1`): what cannot be written is dropped.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 #[macro_use]
 mod i18n;
 mod app;
@@ -68,30 +78,30 @@ fn main() -> eframe::Result {
     let mut open = None;
     match std::env::args().nth(1).as_deref() {
         Some("--record") => {
-            win::attach_parent_console();
+            console_mode();
             std::process::exit(cli::record(std::env::args().skip(2).collect()));
         }
         Some("--test-select") => {
-            win::attach_parent_console();
+            console_mode();
             std::process::exit(cli::test_select());
         }
         Some("--export-icon") => {
-            win::attach_parent_console();
+            console_mode();
             std::process::exit(cli::export_icon(std::env::args_os().nth(2).map(PathBuf::from)));
         }
         Some("--cut") => {
-            win::attach_parent_console();
+            console_mode();
             std::process::exit(cli::cut(std::env::args().skip(2).collect()));
         }
         Some("--info") => {
-            win::attach_parent_console();
+            console_mode();
             std::process::exit(cli::info(std::env::args_os().nth(2).map(PathBuf::from)));
         }
         // A recording to trim, as Explorer's "Open with" passes it.
         Some(file) if is_mp4(file) => open = Some(PathBuf::from(std::env::args_os().nth(1).unwrap_or_default())),
         Some(other) => {
-            win::attach_parent_console();
-            eprintln!("qrec: unknown argument {other}");
+            console_mode();
+            say!("qrec: unknown argument {other}");
             std::process::exit(2);
         }
         None => {}
@@ -122,12 +132,26 @@ fn is_mp4(arg: &str) -> bool {
     std::path::Path::new(arg).extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
 }
 
+/// Whether the program runs in a command line mode, with the console of
+/// the process that started it.
+static CONSOLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn console_mode() {
+    CONSOLE.store(true, std::sync::atomic::Ordering::Relaxed);
+    win::attach_parent_console();
+}
+
 /// The release build aborts on a panic and has no console, so the window
-/// would vanish without a word: say what happened in a message box.
+/// would vanish without a word: say what happened in a message box. A
+/// command line mode has the console for that, and a message box would
+/// hold up the script that ran it.
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default(info);
+        if CONSOLE.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let text = tr!(
             format!("qrec stopped because of an internal error.\n\n{info}"),
             format!("qrec остановлен из-за внутренней ошибки.\n\n{info}")

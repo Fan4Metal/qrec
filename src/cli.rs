@@ -17,7 +17,7 @@ pub fn record(args: Vec<String>) -> i32 {
     match run(args) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("qrec: {e}");
+            say!("qrec: {e}");
             1
         }
     }
@@ -71,13 +71,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
         Some(Source::App { program, boost: false }) => format!("of {program}"),
     };
     let config = Config { monitor, region, fps, quality, audio, cursor, path: path.clone() };
-    eprintln!("recording {}x{} at ({}, {}) for {seconds} s, {fps} fps, {} quality, sound {sound}", region.width, region.height, region.x, region.y, quality.name());
+    say!("recording {}x{} at ({}, {}) for {seconds} s, {fps} fps, {} quality, sound {sound}", region.width, region.height, region.x, region.y, quality.name());
 
     let recorder = Recorder::start(config)?;
     let _border = border.then(|| crate::overlay::Border::show(region));
-    eprintln!("encoder: {} ({})", recorder.info.encoder, if recorder.info.hardware { "hardware" } else { "software" });
+    say!("encoder: {} ({})", recorder.info.encoder, if recorder.info.hardware { "hardware" } else { "software" });
     if let Some(rate) = recorder.info.audio_rate {
-        eprintln!("audio: {rate} Hz");
+        say!("audio: {rate} Hz");
     }
     let started = std::time::Instant::now();
     while started.elapsed().as_secs_f64() < seconds {
@@ -89,7 +89,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     let (frames, dropped) = (recorder.frames(), recorder.dropped());
     recorder.stop()?;
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    eprintln!("{frames} frames written, {dropped} skipped, {} bytes: {}", size, path.display());
+    say!("{frames} frames written, {dropped} skipped, {} bytes: {}", size, path.display());
     Ok(())
 }
 
@@ -119,7 +119,7 @@ pub fn cut(args: Vec<String>) -> i32 {
         let started = std::time::Instant::now();
         let cut = crate::trim::cut(&src, &dst, seconds(from), seconds(to), &progress).map_err(|e| win::describe(&e))?;
         let size = std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
-        eprintln!(
+        say!(
             "{} frames from {} in {:.2} s, {size} bytes: {}",
             cut.frames,
             crate::editor::clock(cut.start),
@@ -131,7 +131,7 @@ pub fn cut(args: Vec<String>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("qrec: {e}");
+            say!("qrec: {e}");
             1
         }
     }
@@ -140,12 +140,12 @@ pub fn cut(args: Vec<String>) -> i32 {
 /// `qrec --info FILE`: what a recording holds, and where its key frames are.
 pub fn info(path: Option<PathBuf>) -> i32 {
     let Some(path) = path else {
-        eprintln!("usage: qrec --info FILE");
+        say!("usage: qrec --info FILE");
         return 2;
     };
     let result = (|| -> Result<(), String> {
         let info = crate::trim::info(&path).map_err(|e| win::describe(&e))?;
-        eprintln!(
+        say!(
             "{}x{} at {} fps, {} s, {}",
             info.width,
             info.height,
@@ -156,13 +156,13 @@ pub fn info(path: Option<PathBuf>) -> i32 {
         let started = std::time::Instant::now();
         let frames = crate::trim::frames(&path, &std::sync::atomic::AtomicBool::new(false)).map_err(|e| win::describe(&e))?;
         let keys: Vec<String> = frames.iter().filter(|f| f.key).map(|f| crate::editor::clock(f.time)).collect();
-        eprintln!("{} frames listed in {:.2} s, {} key frames: {}", frames.len(), started.elapsed().as_secs_f64(), keys.len(), keys.join(" "));
+        say!("{} frames listed in {:.2} s, {} key frames: {}", frames.len(), started.elapsed().as_secs_f64(), keys.len(), keys.join(" "));
         Ok(())
     })();
     match result {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("qrec: {e}");
+            say!("qrec: {e}");
             1
         }
     }
@@ -183,7 +183,7 @@ pub fn test_select() -> i32 {
         unsafe { FindWindowW(w!("qrec_select"), None) }.ok()
     });
     let Some(hwnd) = hwnd else {
-        eprintln!("the selection window did not appear");
+        say!("the selection window did not appear");
         return 1;
     };
     let origin = unsafe { (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN)) };
@@ -201,15 +201,15 @@ pub fn test_select() -> i32 {
     post(WM_LBUTTONUP, 739, 459);
     match rx.recv_timeout(std::time::Duration::from_secs(5)) {
         Ok(Some(r)) => {
-            eprintln!("selected {}x{} at ({}, {})", r.width, r.height, r.x, r.y);
+            say!("selected {}x{} at ({}, {})", r.width, r.height, r.x, r.y);
             0
         }
         Ok(None) => {
-            eprintln!("selection cancelled");
+            say!("selection cancelled");
             1
         }
         Err(_) => {
-            eprintln!("no result from the selection");
+            say!("no result from the selection");
             1
         }
     }
@@ -219,7 +219,7 @@ pub fn test_select() -> i32 {
 /// installer, or its 256 px layer as a PNG for the documentation.
 pub fn export_icon(path: Option<PathBuf>) -> i32 {
     let Some(path) = path else {
-        eprintln!("usage: qrec --export-icon <file.ico|file.png>");
+        say!("usage: qrec --export-icon <file.ico|file.png>");
         return 2;
     };
     let bytes = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")) {
@@ -230,7 +230,7 @@ pub fn export_icon(path: Option<PathBuf>) -> i32 {
     match std::fs::write(&path, bytes) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("cannot write {}: {e}", path.display());
+            say!("cannot write {}: {e}", path.display());
             1
         }
     }
