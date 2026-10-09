@@ -25,6 +25,7 @@ mod hotkey;
 mod icon;
 mod instance;
 mod overlay;
+mod playback;
 mod recorder;
 mod region;
 mod sessions;

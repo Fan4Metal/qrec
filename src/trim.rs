@@ -3,7 +3,8 @@
 //! source reader and the sink writer, with their timestamps moved back.
 //! A cut starts on a key frame (the stretch's first) and ends on any
 //! frame. Also what the editor needs to choose the stretch: the frames
-//! of a file, and any one of them decoded for the preview.
+//! of a file, any one of them decoded for the preview, and the sound
+//! decoded for playing it back.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
@@ -12,7 +13,7 @@ use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer, IMFAttributes, IMFMediaType, IMFSample, IMFSinkWriter, IMFSourceReader, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_SUBTYPE, MF_PD_DURATION, MF_SINK_WRITER_DISABLE_THROTTLING, MF_SOURCE_READER_ANY_STREAM,
     MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, MF_SOURCE_READER_MEDIASOURCE, MF_SOURCE_READERF_ENDOFSTREAM, MF_TRANSCODE_CONTAINERTYPE,
-    MFAudioFormat_AAC, MFCreateAttributes, MFCreateMediaType, MFCreateSinkWriterFromURL, MFCreateSourceReaderFromURL, MFMediaType_Audio,
+    MFAudioFormat_AAC, MFAudioFormat_Float, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MFCreateAttributes, MFCreateMediaType, MFCreateSinkWriterFromURL, MFCreateSourceReaderFromURL, MFMediaType_Audio,
     MFMediaType_Video, MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFTranscodeContainerType_MPEG4, MFVideoFormat_H264,
     MFVideoFormat_RGB32,
 };
@@ -292,6 +293,58 @@ impl Preview {
                 }));
             }
         }
+    }
+}
+
+/// The sound of a file decoded to interleaved 32-bit float samples, in
+/// the order of the file, for playing it back.
+pub struct Sound {
+    // Released before Media Foundation is shut down.
+    source: Source,
+    _mf: Mf,
+    stream: u32,
+    pub rate: u32,
+    pub channels: u16,
+}
+
+impl Sound {
+    /// `None` when the file has no AAC track.
+    pub fn open(path: &Path) -> Result<Option<Sound>> {
+        let mf = Mf::start()?;
+        let source = Source::open(path, false)?;
+        let Some(stream) = source.audio else { return Ok(None) };
+        unsafe {
+            source.reader.SetStreamSelection(source.video, false)?;
+            source.reader.SetStreamSelection(stream, true)?;
+            let float = MFCreateMediaType()?;
+            float.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+            float.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_Float)?;
+            source.reader.SetCurrentMediaType(stream, None, &float)?;
+        }
+        let current = unsafe { source.reader.GetCurrentMediaType(stream)? };
+        let rate = unsafe { current.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)? };
+        let channels = unsafe { current.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)? } as u16;
+        Ok(Some(Sound { source, _mf: mf, stream, rate, channels }))
+    }
+
+    /// The next samples come from `time` on (or a little before it: from
+    /// the start of the block that holds it).
+    pub fn seek(&self, time: i64) -> Result<()> {
+        self.source.seek(time)
+    }
+
+    /// The next block: the time of its first frame and its samples;
+    /// `None` at the end.
+    pub fn next(&self) -> Result<Option<(i64, Vec<f32>)>> {
+        let Some((_, sample)) = self.source.read(self.stream)? else { return Ok(None) };
+        let time = unsafe { sample.GetSampleTime()? };
+        let buffer = unsafe { sample.ConvertToContiguousBuffer()? };
+        let (mut data, mut length) = (std::ptr::null_mut(), 0u32);
+        unsafe { buffer.Lock(&mut data, None, Some(&mut length))? };
+        let bytes = unsafe { std::slice::from_raw_parts(data, length as usize) };
+        let floats = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+        unsafe { buffer.Unlock()? };
+        Ok(Some((time, floats)))
     }
 }
 

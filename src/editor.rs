@@ -1,6 +1,7 @@
 //! The window that trims a recording: the frame under the cursor, a
 //! timeline with the key frames, the start and the end of the stretch
-//! kept, and the cut itself (`trim::cut`, without re-encoding).
+//! kept, playback with sound (`playback`), and the cut itself
+//! (`trim::cut`, without re-encoding).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
@@ -10,6 +11,7 @@ use std::thread::JoinHandle;
 use egui::{Color32, Key, RichText, Sense, Vec2};
 
 use crate::app::{CORNER_RADIUS, TitleButton, title_button};
+use crate::playback::Playback;
 use crate::trim::{self, Frame, Info, Picture, Progress, SECOND};
 use crate::win;
 
@@ -55,6 +57,12 @@ struct Export {
     replace: bool,
 }
 
+/// Playback under way, up to `until`.
+struct Playing {
+    playback: Playback,
+    until: i64,
+}
+
 /// The state of the window.
 pub struct Editor {
     pub path: PathBuf,
@@ -76,6 +84,7 @@ pub struct Editor {
     start: i64,
     end: i64,
     drag: Option<Mark>,
+    playing: Option<Playing>,
     export: Option<Export>,
     /// The last cut written.
     saved: Option<PathBuf>,
@@ -176,6 +185,7 @@ impl Editor {
             start: 0,
             end: 0,
             drag: None,
+            playing: None,
             export: None,
             saved: None,
             error: None,
@@ -200,6 +210,7 @@ impl Editor {
     pub fn ui(&mut self, ui: &mut egui::Ui) -> bool {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
+        self.follow();
         self.keys(ui);
         let mut close = ctx.input(|i| i.viewport().close_requested());
         // As the main window: no title bar of Windows, one rounded
@@ -348,6 +359,7 @@ impl Editor {
     /// then the window shows the cut. When the file cannot be moved (open
     /// in a player), the cut is deleted and the file stays as it was.
     fn take_place(&mut self, cut: PathBuf) {
+        self.playing = None;
         let _ = self.requests.send(Request::Close);
         self.cancel.cancel.store(true, Relaxed);
         for thread in self.readers.drain(..) {
@@ -444,9 +456,57 @@ impl Editor {
         frames.iter().rev().find(|f| f.key && f.time <= time).map_or(0, |f| f.time)
     }
 
+    /// Moves the cursor by hand: playback stops.
     fn set_cursor(&mut self, time: i64) {
+        self.playing = None;
+        self.show(time);
+    }
+
+    /// The cursor on the frame shown at `time`, and that frame on show.
+    fn show(&mut self, time: i64) {
         self.cursor = self.frame_at(time);
         self.ask(self.cursor);
+    }
+
+    /// Plays from `from` up to `until`, with sound.
+    fn play(&mut self, from: i64, until: i64) {
+        if self.info.is_none() || until <= from {
+            return;
+        }
+        log::debug!("play from {} to {}", clock(from), clock(until));
+        self.playing = None;
+        self.show(from);
+        self.playing = Some(Playing { playback: Playback::start(&self.path, from, until), until });
+    }
+
+    /// Plays from the cursor to the end of the file (from the start when
+    /// the cursor is on the last frame), or pauses.
+    fn toggle_play(&mut self) {
+        if self.playing.take().is_some() {
+            return;
+        }
+        let last = self.frame_at(self.length() - 1);
+        let from = if self.cursor >= last { 0 } else { self.cursor };
+        self.play(from, self.length());
+    }
+
+    /// Plays the stretch kept.
+    fn play_cut(&mut self) {
+        self.play(self.start, self.end);
+    }
+
+    /// The cursor follows playback; at the end the last frame played
+    /// stays on show.
+    fn follow(&mut self) {
+        let Some(playing) = &self.playing else { return };
+        let (position, until) = (playing.playback.position(), playing.until);
+        if playing.playback.finished() || position >= until {
+            self.playing = None;
+            self.show(until - 1);
+        } else {
+            self.show(position);
+            self.ctx.request_repaint_of(self.viewport);
+        }
     }
 
     fn set_start(&mut self, time: i64) {
@@ -469,6 +529,16 @@ impl Editor {
     fn keys(&mut self, ui: &egui::Ui) {
         if self.info.is_none() || ui.ctx().egui_wants_keyboard_input() {
             return;
+        }
+        // Space belongs to the editor: a button that has the focus would
+        // take it as a click.
+        // Shift+Space first: the pattern without modifiers matches it too
+        // (egui ignores an extra Shift).
+        let (cut, space) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::SHIFT, Key::Space), i.consume_key(egui::Modifiers::NONE, Key::Space)));
+        if cut {
+            self.play_cut();
+        } else if space {
+            self.toggle_play();
         }
         let presses: Vec<(Key, egui::Modifiers)> = ui.input(|i| {
             i.events
@@ -553,6 +623,16 @@ impl Editor {
             ui.add_enabled_ui(ready && self.export.is_none(), |ui| {
                 let button =
                     |ui: &mut egui::Ui, text: &str, hint: &str| ui.add(egui::Button::new(text).min_size(Vec2::new(32.0, 26.0))).on_hover_text(hint);
+                let playing = self.playing.is_some();
+                let hint = if playing {
+                    tr!("Pause (Space)", "Пауза (пробел)")
+                } else {
+                    tr!("Play from the cursor (Space)", "Воспроизвести с курсора (пробел)")
+                };
+                if play_button(ui, playing).on_hover_text(hint).clicked() {
+                    self.toggle_play();
+                }
+                ui.add_space(6.0);
                 if button(ui, "⏮", tr!("First frame (Home)", "Первый кадр (Home)")).clicked() {
                     self.set_cursor(0);
                 }
@@ -650,6 +730,13 @@ impl Editor {
                 ))
                 .monospace(),
             );
+            if ui
+                .add_enabled(self.info.is_some() && kept > 0, egui::Button::new(tr!("▶ Play", "▶ Проиграть")).small())
+                .on_hover_text(tr!("Play the stretch kept (Shift+Space)", "Проиграть оставляемый фрагмент (Shift+пробел)"))
+                .clicked()
+            {
+                self.play_cut();
+            }
             if let Some(info) = &self.info {
                 ui.weak(format!("{}×{}, {} {}", info.width, info.height, fmt_fps(info.fps), tr!("fps", "к/с")));
                 if self.frames_rx.is_some() {
@@ -692,8 +779,8 @@ impl Editor {
                 }
             } else {
                 ui.weak(tr!(
-                    "The start can only be a key frame (the marks under the timeline); the end any frame. Drag the marks or the cursor; the arrow keys step by a frame (Shift: a key frame, Ctrl: a second); I and O mark the start and the end; Ctrl+S saves.",
-                    "Начало — только ключевой кадр (отметки под шкалой), конец — любой. Метки и курсор перетаскиваются; стрелки шагают по кадрам (Shift — по ключевым, Ctrl — по секундам); I и O ставят начало и конец; Ctrl+S сохраняет."
+                    "The start is a key frame (the marks under the timeline), the end any frame. Space: play or pause, Shift+Space: the stretch kept; arrows: a frame (Shift: a key frame, Ctrl: a second); I, O: the start, the end; Ctrl+S: save.",
+                    "Начало — на ключевом кадре (отметки под шкалой), конец — на любом. Пробел — воспроизведение и пауза, Shift+пробел — фрагмент; стрелки — кадр (Shift — ключевой, Ctrl — секунда); I, O — начало, конец; Ctrl+S — сохранить."
                 ));
             }
             });
@@ -783,6 +870,7 @@ impl Editor {
 
     /// Starts the cut into a new file beside the source.
     fn save(&mut self) {
+        self.playing = None;
         let replace = self.replace;
         let dst = if replace { replacement_path(&self.path) } else { cut_path(&self.path, self.start, self.end) };
         let (src, start, end) = (self.path.clone(), self.start, self.end);
@@ -827,6 +915,23 @@ impl Drop for Editor {
             let _ = thread.join();
         }
     }
+}
+
+/// The play button: a triangle, or two bars while playing.
+fn play_button(ui: &mut egui::Ui, playing: bool) -> egui::Response {
+    let response = ui.add(egui::Button::new("").min_size(Vec2::new(40.0, 26.0)));
+    let colour = ui.style().interact(&response).fg_stroke.color;
+    let c = response.rect.center();
+    let painter = ui.painter();
+    if playing {
+        for x in [-3.5, 3.5] {
+            painter.rect_filled(egui::Rect::from_center_size(c + Vec2::new(x, 0.0), Vec2::new(3.5, 12.0)), 0.5, colour);
+        }
+    } else {
+        let points = vec![c + Vec2::new(-4.5, -6.5), c + Vec2::new(6.5, 0.0), c + Vec2::new(-4.5, 6.5)];
+        painter.add(egui::Shape::convex_polygon(points, colour, egui::Stroke::NONE));
+    }
+    response
 }
 
 /// The edges and corners of the window resize it, as a sizing frame would
