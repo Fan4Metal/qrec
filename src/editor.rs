@@ -231,7 +231,7 @@ impl Editor {
             egui::StrokeKind::Inside,
         );
         self.round_corners(&ctx);
-        resize_edges(ui);
+        resize_edges(ui, None);
         egui::Panel::top("title")
             .show_separator_line(false)
             .frame(egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 8, top: 8, bottom: 0 }))
@@ -1094,7 +1094,7 @@ fn time_link(ui: &mut egui::Ui, time: i64) -> egui::Response {
 /// wide along each edge, with the resize pointer, hands a drag to Windows
 /// (`ViewportCommand::BeginResize`). Placed before the panels, so their
 /// widgets near an edge still take clicks first.
-fn resize_edges(ui: &mut egui::Ui) {
+pub(crate) fn resize_edges(ui: &mut egui::Ui, only: Option<egui::ResizeDirection>) {
     use egui::{CursorIcon, ResizeDirection as D};
     const EDGE: f32 = 5.0;
     const CORNER: f32 = 14.0;
@@ -1111,6 +1111,12 @@ fn resize_edges(ui: &mut egui::Ui) {
     ];
     // Corners first: where a corner and an edge overlap, the corner wins.
     let pointer = ui.ctx().pointer_hover_pos();
+    // A docked window is resized by its outer edge only, over its whole
+    // height.
+    let grips = grips.into_iter().filter(|(d, ..)| only.is_none_or(|o| o == *d)).map(|(d, rect, icon)| match only {
+        Some(_) => (d, rect.expand2(Vec2::new(0.0, CORNER)), icon),
+        None => (d, rect, icon),
+    });
     let Some((direction, rect, icon)) = grips.into_iter().find(|(_, rect, _)| pointer.is_some_and(|p| rect.contains(p))) else { return };
     let response = ui.interact(rect, ui.id().with(("resize", direction as u8)), Sense::drag());
     if response.hovered() || response.dragged() {

@@ -1,19 +1,24 @@
-//! The latest recordings in the folder, for the window's list and the
-//! menu of the icon in the notification area: the files qrec wrote
-//! (`qrec_*.mp4`, its cuts included), newest first, with their length,
-//! size and picture size, and a small picture of each, decoded on a
-//! thread of its own.
+//! The recordings in the folder, for the card of the last one, the
+//! window that lists them and the menu of the icon in the notification
+//! area: the files qrec wrote (`qrec_*.mp4`, its cuts included), newest
+//! first, with their length, size and picture size and a picture of each,
+//! read on a thread of its own.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use crate::trim::{Picture, SECOND};
 
-/// How many recordings are listed.
-pub const COUNT: usize = 8;
+/// How many recordings are listed, newest first.
+pub const COUNT: usize = 50;
+
+/// The longer side of a picture as decoded: a whole factor down from the
+/// frame, enough for the window's pictures on a display at 150 %.
+const PICTURE_SIDE: usize = 480;
 
 /// One recording.
 #[derive(Clone, Debug, PartialEq)]
@@ -21,8 +26,8 @@ pub struct Recording {
     pub path: PathBuf,
     pub modified: SystemTime,
     pub bytes: u64,
-    /// From the file's headers; `None` when they cannot be read (a file
-    /// still being written by another program, or not a video).
+    /// From the file's headers, once read; `None` until then, or when they
+    /// cannot be read (a file still being written by another program).
     pub duration: Option<i64>,
     pub width: u32,
     pub height: u32,
@@ -47,17 +52,71 @@ impl Recording {
     }
 }
 
-/// The recordings of a folder, with what was read of each file kept until
-/// it changes: its headers take a few milliseconds to read.
-#[derive(Default)]
+/// What the thread read of a file: its headers and one frame.
+struct Read {
+    path: PathBuf,
+    modified: SystemTime,
+    duration: Option<i64>,
+    size: (u32, u32),
+    picture: Option<Picture>,
+}
+
+/// The recordings of a folder. A file's headers and its picture (a frame
+/// a second in, or a tenth of the way through a shorter one: the first
+/// frame is often still before what was recorded) are read on a thread of
+/// their own, a few milliseconds a file, and kept until the file changes.
 pub struct Recordings {
     folder: PathBuf,
     pub list: Vec<Recording>,
-    known: HashMap<PathBuf, Recording>,
+    /// Each file as last read, and its picture.
+    known: HashMap<PathBuf, (Recording, Option<egui::TextureHandle>)>,
+    requests: Option<mpsc::Sender<(PathBuf, SystemTime)>>,
+    replies: mpsc::Receiver<Read>,
+    /// Tells the thread to end without reading the rest of its queue.
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl Recordings {
-    /// Lists `folder` again.
+    pub fn new(ctx: egui::Context) -> Recordings {
+        let (requests, request_rx) = mpsc::channel::<(PathBuf, SystemTime)>();
+        let (reply_tx, replies) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("recordings".into())
+            .spawn(move || {
+                let _com = crate::win::com_init_mta();
+                while let Ok((path, modified)) = request_rx.recv() {
+                    if stopped.load(Relaxed) {
+                        break;
+                    }
+                    let read = match crate::trim::Preview::open(&path) {
+                        Ok(mut preview) => {
+                            let info = preview.info.clone();
+                            let time = (info.duration / 10).min(SECOND);
+                            Read {
+                                duration: (info.duration > 0).then_some(info.duration),
+                                size: (info.width, info.height),
+                                picture: preview.frame(time, PICTURE_SIDE).ok().flatten(),
+                                path,
+                                modified,
+                            }
+                        }
+                        Err(_) => Read { path, modified, duration: None, size: (0, 0), picture: None },
+                    };
+                    if reply_tx.send(read).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
+                }
+            })
+            .inspect_err(|e| log::warn!("no recordings thread: {e}"))
+            .ok();
+        Recordings { folder: PathBuf::new(), list: Vec::new(), known: HashMap::new(), requests: Some(requests), replies, stop, thread }
+    }
+
+    /// Lists `folder` again; files new or changed since are read.
     pub fn refresh(&mut self, folder: &Path) {
         if self.folder != folder {
             self.folder = folder.to_path_buf();
@@ -81,10 +140,13 @@ impl Recordings {
         self.list = files
             .into_iter()
             .map(|(path, modified, bytes)| match self.known.get(&path) {
-                Some(r) if r.modified == modified && r.bytes == bytes => r.clone(),
+                Some((r, _)) if r.modified == modified && r.bytes == bytes => r.clone(),
                 _ => {
-                    let r = read(path, modified, bytes);
-                    self.known.insert(r.path.clone(), r.clone());
+                    let r = Recording { path: path.clone(), modified, bytes, duration: None, width: 0, height: 0 };
+                    self.known.insert(path.clone(), (r.clone(), None));
+                    if let Some(requests) = &self.requests {
+                        let _ = requests.send((path, modified));
+                    }
                     r
                 }
             })
@@ -92,96 +154,47 @@ impl Recordings {
         self.known.retain(|path, _| self.list.iter().any(|r| &r.path == path));
     }
 
+    /// Takes what the thread read since.
+    pub fn poll(&mut self, ctx: &egui::Context) {
+        while let Ok(read) = self.replies.try_recv() {
+            let Some((known, texture)) = self.known.get_mut(&read.path).filter(|(r, _)| r.modified == read.modified) else { continue };
+            known.duration = read.duration;
+            (known.width, known.height) = read.size;
+            if let Some(picture) = read.picture {
+                let image = egui::ColorImage::from_rgba_unmultiplied([picture.width, picture.height], &picture.rgba);
+                *texture = Some(ctx.load_texture(format!("recording {}", read.path.display()), image, egui::TextureOptions::LINEAR));
+            }
+            let known = known.clone();
+            if let Some(r) = self.list.iter_mut().find(|r| r.path == known.path) {
+                *r = known;
+            }
+        }
+    }
+
     pub fn get(&self, path: &Path) -> Option<&Recording> {
         self.list.iter().find(|r| r.path == path)
     }
-}
 
-/// The longer side of a picture as decoded: a whole factor down from the
-/// frame, enough for the list's pictures on a display at 200 %.
-const THUMBNAIL_SIDE: usize = 320;
-
-/// A small picture of each recording: one frame, a second in or a tenth
-/// of the way through when it is shorter (the first frame is often still
-/// before what was recorded), decoded on a thread of its own and kept
-/// until the file changes.
-pub struct Thumbnails {
-    requests: Option<mpsc::Sender<(PathBuf, SystemTime, i64)>>,
-    replies: mpsc::Receiver<(PathBuf, SystemTime, Option<Picture>)>,
-    /// What was asked for each file (as of its time), and the picture once
-    /// it came; `None` also when it could not be decoded.
-    known: HashMap<PathBuf, (SystemTime, Option<egui::TextureHandle>)>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Thumbnails {
-    pub fn new(ctx: egui::Context) -> Thumbnails {
-        let (requests, request_rx) = mpsc::channel::<(PathBuf, SystemTime, i64)>();
-        let (reply_tx, replies) = mpsc::channel();
-        let thread = std::thread::Builder::new()
-            .name("thumbnails".into())
-            .spawn(move || {
-                let _com = crate::win::com_init_mta();
-                while let Ok((path, modified, duration)) = request_rx.recv() {
-                    let time = (duration / 10).min(SECOND);
-                    let picture = crate::trim::Preview::open(&path).and_then(|mut p| p.frame(time, THUMBNAIL_SIDE)).ok().flatten();
-                    if reply_tx.send((path, modified, picture)).is_err() {
-                        break;
-                    }
-                    ctx.request_repaint();
-                }
-            })
-            .inspect_err(|e| log::warn!("no thumbnails thread: {e}"))
-            .ok();
-        Thumbnails { requests: Some(requests), replies, known: HashMap::new(), thread }
-    }
-
-    /// Asks for the pictures of `list` not asked for yet, and forgets the
-    /// files no longer in it.
-    pub fn want(&mut self, list: &[Recording]) {
-        self.known.retain(|path, _| list.iter().any(|r| &r.path == path));
-        for r in list {
-            if self.known.get(&r.path).is_some_and(|(modified, _)| *modified == r.modified) {
-                continue;
-            }
-            self.known.insert(r.path.clone(), (r.modified, None));
-            if let Some(requests) = &self.requests {
-                let _ = requests.send((r.path.clone(), r.modified, r.duration.unwrap_or(0)));
-            }
-        }
-    }
-
-    /// Takes the pictures decoded since.
-    pub fn poll(&mut self, ctx: &egui::Context) {
-        while let Ok((path, modified, picture)) = self.replies.try_recv() {
-            let Some(picture) = picture else { continue };
-            if let Some(entry) = self.known.get_mut(&path).filter(|(m, _)| *m == modified) {
-                let image = egui::ColorImage::from_rgba_unmultiplied([picture.width, picture.height], &picture.rgba);
-                entry.1 = Some(ctx.load_texture(format!("thumbnail {}", path.display()), image, egui::TextureOptions::LINEAR));
-            }
-        }
-    }
-
-    pub fn get(&self, path: &Path) -> Option<&egui::TextureHandle> {
+    /// The picture of a recording, once decoded.
+    pub fn picture(&self, path: &Path) -> Option<&egui::TextureHandle> {
         self.known.get(path).and_then(|(_, texture)| texture.as_ref())
     }
+
+    /// The bytes of all the files listed.
+    pub fn bytes(&self) -> u64 {
+        self.list.iter().map(|r| r.bytes).sum()
+    }
 }
 
-impl Drop for Thumbnails {
-    /// The thread ends after the picture it is decoding.
+impl Drop for Recordings {
+    /// The thread ends after the file it is reading.
     fn drop(&mut self) {
+        self.stop.store(true, Relaxed);
         self.requests = None;
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
-}
-
-fn read(path: PathBuf, modified: SystemTime, bytes: u64) -> Recording {
-    let info = crate::trim::info(&path).ok();
-    let duration = info.as_ref().map(|i| i.duration).filter(|&d| d > 0);
-    let (width, height) = info.map_or((0, 0), |i| (i.width, i.height));
-    Recording { path, modified, bytes, duration, width, height }
 }
 
 /// A file qrec wrote: `qrec_<date>_<time>.mp4`, and its cuts, which keep

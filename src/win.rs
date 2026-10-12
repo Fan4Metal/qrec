@@ -41,13 +41,23 @@ pub fn strip_caption(hwnd: isize) -> bool {
 /// `Ok(true)` when it went there, `Ok(false)` when it was deleted outright:
 /// a network or removable drive has no Recycle Bin.
 pub fn recycle(path: &std::path::Path) -> Result<bool, String> {
+    recycle_all(&[path])
+}
+
+/// Moves `paths` to the Recycle Bin in one operation (one undo in
+/// Explorer); `Ok(false)` when the drive of the first has none and they
+/// were deleted.
+pub fn recycle_all(paths: &[&std::path::Path]) -> Result<bool, String> {
     use windows::Win32::UI::Shell::{FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW, SHFileOperationW};
-    // The shell wants a full path; a relative one is taken from its own
+    let Some(first) = paths.first() else { return Ok(true) };
+    // The shell wants full paths; a relative one is taken from its own
     // current folder.
-    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let recycled = has_recycle_bin(&path);
+    let recycled = has_recycle_bin(&std::path::absolute(first).unwrap_or_else(|_| first.to_path_buf()));
     // A list of paths, each ended by a null, the list by another.
-    let mut from = wide(&path);
+    let mut from = Vec::new();
+    for path in paths {
+        from.extend(wide(std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())));
+    }
     from.push(0);
     let mut op = SHFILEOPSTRUCTW {
         wFunc: FO_DELETE,

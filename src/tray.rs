@@ -50,6 +50,8 @@ pub enum Command {
     Trim(PathBuf),
     /// Show the folder of the recordings in Explorer.
     Folder,
+    /// Open the window that lists the recordings.
+    Recordings,
 }
 
 /// The icon's callback message.
@@ -74,6 +76,7 @@ const MENU_MINIMISE_ON_RECORD: usize = 6;
 const MENU_ABOUT: usize = 7;
 const MENU_TRIM_AFTER_RECORD: usize = 8;
 const MENU_FOLDER: usize = 9;
+const MENU_RECORDINGS: usize = 10;
 /// The latest recordings: this plus their place in `Status::recent`.
 const MENU_RECENT: usize = 100;
 
@@ -286,6 +289,7 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
     let recent = wide(tr!("Latest recordings", "Последние записи"));
     let none = wide(tr!("None yet", "Пока нет"));
     let folder = wide(tr!("Open the folder", "Открыть папку"));
+    let all = wide(tr!("All recordings…", "Все записи…"));
     let names: Vec<Vec<u16>> = state.recent.iter().map(|(name, _)| wide(name)).collect();
     let exit = wide(tr!("Exit", "Выход"));
     unsafe {
@@ -301,6 +305,7 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
                 let _ = AppendMenuW(list, MF_STRING | MF_GRAYED, 0, PCWSTR(none.as_ptr()));
             }
             let _ = AppendMenuW(list, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(list, MF_STRING, MENU_RECORDINGS, PCWSTR(all.as_ptr()));
             let _ = AppendMenuW(list, MF_STRING, MENU_FOLDER, PCWSTR(folder.as_ptr()));
             // Destroyed with the menu.
             let _ = AppendMenuW(menu, MF_POPUP, list.0 as usize, PCWSTR(recent.as_ptr()));
@@ -331,6 +336,7 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
             MENU_ABOUT => Some(Command::About),
             MENU_EXIT => Some(Command::Exit),
             MENU_FOLDER => Some(Command::Folder),
+            MENU_RECORDINGS => Some(Command::Recordings),
             n if n >= MENU_RECENT => state.recent.get(n - MENU_RECENT).map(|(_, path)| Command::Trim(path.clone())),
             _ => None,
         }
