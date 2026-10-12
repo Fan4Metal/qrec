@@ -104,6 +104,10 @@ pub struct App {
     close_to_tray: bool,
     /// Whether the window is put out of the way when a recording starts.
     minimise_on_record: bool,
+    /// Whether the recording put the window out of the way, so that it
+    /// comes back when the recording stops; not when it was already
+    /// minimised or hidden (a recording started by the hotkey).
+    restore_on_stop: bool,
     /// Whether a recording opens in the trimming window when it ends.
     trim_after_record: bool,
     /// Interface language, chosen in About.
@@ -206,8 +210,6 @@ enum FileAction {
     Trim(PathBuf),
     Show(PathBuf),
     Discard(PathBuf),
-    /// The folder of the recordings, in Explorer.
-    Folder,
 }
 
 /// The status line.
@@ -298,6 +300,7 @@ impl App {
             taskbar,
             close_to_tray,
             minimise_on_record,
+            restore_on_stop: false,
             trim_after_record,
             lang,
             about: false,
@@ -512,6 +515,8 @@ impl App {
                 self.notice = Notice::Info(format!("{}×{}, {} fps, {encoder}{fallback}", region.width, region.height, self.fps));
                 self.audio_warning = None;
                 self.recorder = Some(recorder);
+                // `minimise` leaves the window when the trimming window is open.
+                self.restore_on_stop = self.minimise_on_record && self.editor.is_none() && self.window.is_some_and(win::is_shown);
                 if self.minimise_on_record {
                     self.minimise(ctx);
                 }
@@ -524,6 +529,13 @@ impl App {
     /// the trimming window when that is wanted.
     fn stop(&mut self, ctx: Option<&egui::Context>) {
         self.border = None;
+        // Back as it was before the recording put it away (not at exit).
+        if std::mem::take(&mut self.restore_on_stop)
+            && ctx.is_some()
+            && let Some(hwnd) = self.window
+        {
+            win::show_window(hwnd, true);
+        }
         if let Some(recorder) = self.recorder.take() {
             let path = recorder.path.clone();
             log::debug!("stopping");
@@ -1405,8 +1417,7 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
 
     /// The latest recordings of the folder but the one on the card, newest
     /// first, each with its picture (a click trims it), when it was made,
-    /// its name, length and size, and what can be done with it; then the
-    /// folder itself.
+    /// its name, length and size, and what can be done with it.
     fn recordings_list(&self, ui: &mut egui::Ui, card: &Path, action: &mut Option<FileAction>) {
         ui.label(RichText::new(tr!("Latest recordings", "Последние записи")).strong());
         ui.add_space(2.0);
@@ -1420,10 +1431,6 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
                 self.list_row(ui, r, action);
             }
         });
-        ui.separator();
-        if ui.button(tr!("Open the folder", "Открыть папку")).clicked() {
-            *action = Some(FileAction::Folder);
-        }
     }
 
     fn list_row(&self, ui: &mut egui::Ui, r: &Recording, action: &mut Option<FileAction>) {
@@ -1465,7 +1472,6 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
                 self.discard(&path);
                 self.relist();
             }
-            Some(FileAction::Folder) => win::open_folder(&self.folder),
             None => {}
         }
     }
@@ -1713,7 +1719,6 @@ fn file_link(ui: &mut egui::Ui, name: &str) -> egui::Response {
 #[derive(Clone, Copy)]
 enum Icon {
     Scissors,
-    Folder,
     Trash,
 }
 
@@ -1736,14 +1741,6 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon) -> egui::Response {
             painter.line_segment([p(-1.8, 1.6), p(3.5, -6.0)], stroke);
             painter.line_segment([p(1.8, 1.6), p(-3.5, -6.0)], stroke);
         }
-        Icon::Folder => {
-            // The tab at the top left, the body below it.
-            painter.add(egui::Shape::closed_line(
-                vec![p(-6.0, -4.5), p(-2.0, -4.5), p(-0.5, -3.0), p(6.0, -3.0), p(6.0, 5.0), p(-6.0, 5.0)],
-                stroke,
-            ));
-            painter.line_segment([p(-6.0, -1.0), p(6.0, -1.0)], stroke);
-        }
         Icon::Trash => {
             // The lid with its handle, the body narrowing downwards, two ribs.
             painter.line_segment([p(-5.0, -3.5), p(5.0, -3.5)], stroke);
@@ -1758,15 +1755,12 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon) -> egui::Response {
     response
 }
 
-/// Trim, show in Explorer, move to the Recycle Bin: laid out right to
-/// left, so the bin is last.
+/// Trim and move to the Recycle Bin (the name shows the file in
+/// Explorer): laid out right to left, so the bin is last.
 fn file_buttons(ui: &mut egui::Ui, path: &Path, action: &mut Option<FileAction>) {
     ui.spacing_mut().item_spacing.x = 4.0;
     if icon_button(ui, Icon::Trash).on_hover_text(tr!("Move the file to the Recycle Bin", "Удалить файл в корзину")).clicked() {
         *action = Some(FileAction::Discard(path.to_path_buf()));
-    }
-    if icon_button(ui, Icon::Folder).on_hover_text(tr!("Show in Explorer", "Показать в Проводнике")).clicked() {
-        *action = Some(FileAction::Show(path.to_path_buf()));
     }
     if icon_button(ui, Icon::Scissors)
         .on_hover_text(tr!("Trim: cut the start and the end off, without re-encoding", "Обрезать: отрезать начало и конец без перекодирования"))
