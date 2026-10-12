@@ -17,7 +17,7 @@ use crate::win;
 
 /// The window's size in points when it opens, and the least it can be.
 pub const WINDOW_SIZE: [f32; 2] = [860.0, 640.0];
-pub const MIN_WINDOW_SIZE: [f32; 2] = [560.0, 420.0];
+pub const MIN_WINDOW_SIZE: [f32; 2] = [560.0, 440.0];
 
 /// The preview is decoded no larger than this on its longer side.
 const PREVIEW_SIDE: usize = 1920;
@@ -676,27 +676,48 @@ impl Editor {
         ui.allocate_rect(ui.max_rect(), Sense::hover());
     }
 
-    /// The timeline, the buttons and the status line; `true` when the
-    /// window is to close.
+    /// The timeline, then three rows laid out around the middle, as
+    /// LosslessCut has them: the buttons that move the cursor between the
+    /// marks of the stretch, with their times outside; what is kept, the time
+    /// under the cursor and what the file is; what is going on, and the
+    /// save. `true` when the window is to close.
     fn controls(&mut self, ui: &mut egui::Ui) -> bool {
         let ready = self.info.is_some();
+        let idle = ready && self.export.is_none();
         self.timeline(ui);
-        ui.add_space(6.0);
-        let close = false;
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(ready && self.export.is_none(), |ui| {
-                let button =
-                    |ui: &mut egui::Ui, text: &str, hint: &str| ui.add(egui::Button::new(text).min_size(Vec2::new(32.0, 26.0))).on_hover_text(hint);
-                let playing = self.playing.is_some();
-                let hint = if playing {
-                    tr!("Pause (Space)", "Пауза (пробел)")
-                } else {
-                    tr!("Play from the cursor (Space)", "Воспроизвести с курсора (пробел)")
-                };
-                if play_button(ui, playing).on_hover_text(hint).clicked() {
-                    self.toggle_play();
+        ui.add_space(8.0);
+
+        // The buttons that move the cursor in the middle, the marks of the
+        // stretch either side of them, and the times of the marks outside.
+        let (left, middle, right) = thirds(ui, ROW_HEIGHT, MARKS_WIDTH, 6.0);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(left).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
+            ui.add_enabled_ui(idle, |ui| {
+                if time_link(ui, self.start).on_hover_text(tr!("The start of the stretch: the cursor goes there", "Начало фрагмента: курсор переходит туда")).clicked() {
+                    self.set_cursor(self.start);
                 }
-                ui.add_space(6.0);
+            });
+        });
+        ui.scope_builder(egui::UiBuilder::new().max_rect(middle).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+            ui.add_enabled_ui(idle, |ui| {
+                ui.spacing_mut().item_spacing.x = TRANSPORT_GAP;
+                let button =
+                    |ui: &mut egui::Ui, text: &str, hint: &str| ui.add(egui::Button::new(text).min_size(Vec2::new(STEP_WIDTH, 26.0))).on_hover_text(hint);
+                let mark = |ui: &mut egui::Ui, text: &str, hint: &str| {
+                    ui.add(egui::Button::new(RichText::new(text).strong().size(16.0)).min_size(Vec2::new(STEP_WIDTH, 26.0))).on_hover_text(hint)
+                };
+                if mark(
+                    ui,
+                    "[",
+                    tr!(
+                        "Start here: the stretch kept starts on the key frame at or before this one (I)",
+                        "Начало здесь: оставляемый фрагмент начнётся с ключевого кадра на этом или перед ним (I)"
+                    ),
+                )
+                .clicked()
+                {
+                    self.set_start(self.cursor);
+                }
+                ui.add_space(MARK_GAP);
                 if button(ui, "⏮", tr!("First frame (Home)", "Первый кадр (Home)")).clicked() {
                     self.set_cursor(0);
                 }
@@ -711,6 +732,15 @@ impl Editor {
                 .clicked()
                 {
                     self.set_cursor(self.frame_from(self.cursor, -1));
+                }
+                let playing = self.playing.is_some();
+                let hint = if playing {
+                    tr!("Pause (Space)", "Пауза (пробел)")
+                } else {
+                    tr!("Play from the cursor (Space)", "Воспроизвести с курсора (пробел)")
+                };
+                if play_button(ui, playing).on_hover_text(hint).clicked() {
+                    self.toggle_play();
                 }
                 if button(
                     ui,
@@ -727,121 +757,102 @@ impl Editor {
                 if button(ui, "⏭", tr!("Last frame (End)", "Последний кадр (End)")).clicked() {
                     self.set_cursor(self.length() - 1);
                 }
-                ui.add_space(8.0);
-                ui.label(RichText::new(clock(self.cursor)).monospace().strong());
-                ui.add_space(8.0);
-                if ui
-                    .button(tr!("[ Start here", "[ Начало здесь"))
-                    .on_hover_text(tr!(
-                        "The stretch kept starts on the key frame at or before this one (I)",
-                        "Оставляемый фрагмент начнётся с ключевого кадра на этом или перед ним (I)"
-                    ))
-                    .clicked()
-                {
-                    self.set_start(self.cursor);
-                }
-                if ui
-                    .button(tr!("End here ]", "Конец здесь ]"))
-                    .on_hover_text(tr!("This frame is the first left out (O)", "Этот кадр — первый из отброшенных (O)"))
-                    .clicked()
-                {
+                ui.add_space(MARK_GAP);
+                if mark(ui, "]", tr!("End here: this frame is the first left out (O)", "Конец здесь: этот кадр — первый из отброшенных (O)")).clicked() {
                     self.set_end(self.cursor);
                 }
-                ui.add_space(8.0);
-                if ui.button(tr!("To start", "К началу")).clicked() {
-                    self.set_cursor(self.start);
-                }
-                if ui.button(tr!("To end", "К концу")).clicked() {
-                    self.set_cursor(self.frame_at(self.end - 1));
-                }
             });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let can_save = ready && self.export.is_none() && self.end > self.start;
-                let save = egui::Button::new(RichText::new(tr!("Save the cut", "Сохранить фрагмент")).strong()).min_size(Vec2::new(0.0, 26.0));
-                let hint = if self.replace {
-                    tr!(
-                        "In place of this file, without re-encoding; this file goes to the Recycle Bin (Ctrl+S)",
-                        "Вместо этого файла, без перекодирования; этот файл уходит в корзину (Ctrl+S)"
-                    )
-                } else {
-                    tr!(
-                        "Into a new file beside this one, without re-encoding (Ctrl+S)",
-                        "В новый файл рядом с этим, без перекодирования (Ctrl+S)"
-                    )
-                };
-                if ui.add_enabled(can_save, save).on_hover_text(hint).clicked() {
-                    self.save();
-                }
-                if let Some(export) = &self.export
-                    && ui.button(tr!("Cancel", "Отмена")).clicked()
-                {
-                    export.progress.cancel.store(true, Relaxed);
+        });
+        ui.scope_builder(egui::UiBuilder::new().max_rect(right).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+            ui.add_enabled_ui(idle, |ui| {
+                let last = self.frame_at(self.end - 1);
+                if time_link(ui, self.end).on_hover_text(tr!("The end of the stretch: the cursor goes to its last frame", "Конец фрагмента: курсор переходит на его последний кадр")).clicked() {
+                    self.set_cursor(last);
                 }
             });
         });
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let kept = self.end - self.start;
-            ui.label(
-                RichText::new(format!(
-                    "{}: {}   {}: {}   {}: {}",
-                    tr!("Start", "Начало"),
-                    clock(self.start),
-                    tr!("End", "Конец"),
-                    clock(self.end),
-                    tr!("Kept", "Остаётся"),
-                    clock(kept.max(0))
-                ))
-                .monospace(),
-            );
+
+        // What is kept, the time under the cursor, what the file is.
+        let kept = (self.end - self.start).max(0);
+        let (left, middle, right) = thirds(ui, ROW_HEIGHT, TRANSPORT_WIDTH, 12.0);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(left).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+            ui.label(format!("{} {}", tr!("Kept", "Остаётся"), clock(kept)));
             if ui
-                .add_enabled(self.info.is_some() && kept > 0, egui::Button::new(tr!("▶ Play", "▶ Проиграть")).small())
+                .add_enabled(ready && kept > 0, egui::Button::new(tr!("▶ Play", "▶ Проиграть")).small())
                 .on_hover_text(tr!("Play the stretch kept (Shift+Space)", "Проиграть оставляемый фрагмент (Shift+пробел)"))
                 .clicked()
             {
                 self.play_cut();
             }
+        });
+        ui.scope_builder(egui::UiBuilder::new().max_rect(middle).layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)), |ui| {
+            ui.label(RichText::new(clock(self.cursor)).monospace().strong().size(15.0));
+        });
+        ui.scope_builder(egui::UiBuilder::new().max_rect(right).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
             if let Some(info) = &self.info {
-                ui.weak(format!("{}×{}, {} {}", info.width, info.height, fmt_fps(info.fps), tr!("fps", "к/с")));
                 if info.other_audio {
                     ui.label(RichText::new(tr!("the sound is not AAC: not played, not kept", "звук не в AAC: не воспроизводится и не сохраняется")).color(ui.visuals().warn_fg_color));
                 }
+                ui.weak(format!("{}×{}, {} {}", info.width, info.height, fmt_fps(info.fps), tr!("fps", "к/с")));
                 if self.frames_rx.is_some() {
                     ui.weak(tr!("listing the frames…", "кадры перечисляются…"));
                 }
             }
-            // Under the save button, which it changes.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_enabled_ui(self.export.is_none(), |ui| {
-                    ui.checkbox(&mut self.replace, tr!("Replace the original", "Заменить исходный файл")).on_hover_text(tr!(
-                        "The cut takes the place of this file instead of going into a new one; this file goes to the Recycle Bin.",
-                        "Фрагмент сохраняется вместо этого файла, а не в новый; этот файл уходит в корзину."
-                    ));
-                });
-            });
         });
-        ui.add_space(2.0);
-        // A line, empty or not, so the preview above keeps its size.
-        let height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
-        ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), height), egui::Layout::top_down(egui::Align::LEFT), |ui| {
-            ui.set_min_height(height);
-            ui.horizontal_wrapped(|ui| {
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        ui.add_space(6.0);
+
+        // What is going on, and the save.
+        let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::hover());
+        let mut save_width = 0.0;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
+            let can_save = idle && self.end > self.start;
+            let save = egui::Button::new(RichText::new(tr!("Save the cut", "Сохранить фрагмент")).strong()).min_size(Vec2::new(0.0, 26.0));
+            let hint = if self.replace {
+                tr!(
+                    "In place of this file, without re-encoding; this file goes to the Recycle Bin (Ctrl+S)",
+                    "Вместо этого файла, без перекодирования; этот файл уходит в корзину (Ctrl+S)"
+                )
+            } else {
+                tr!("Into a new file beside this one, without re-encoding (Ctrl+S)", "В новый файл рядом с этим, без перекодирования (Ctrl+S)")
+            };
+            if ui.add_enabled(can_save, save).on_hover_text(hint).clicked() {
+                self.save();
+            }
+            if let Some(export) = &self.export
+                && ui.button(tr!("Cancel", "Отмена")).clicked()
+            {
+                export.progress.cancel.store(true, Relaxed);
+            }
+            ui.add_space(6.0);
+            ui.add_enabled_ui(self.export.is_none(), |ui| {
+                ui.checkbox(&mut self.replace, tr!("Replace the original", "Заменить исходный файл")).on_hover_text(tr!(
+                    "The cut takes the place of this file instead of going into a new one; this file goes to the Recycle Bin.",
+                    "Фрагмент сохраняется вместо этого файла, а не в новый; этот файл уходит в корзину."
+                ));
+            });
+            save_width = row.right() - ui.min_rect().left();
+        });
+        // The status in what is left of the row, cut short (all of it on
+        // hover) so that it does not push the save aside.
+        let status = egui::Rect::from_min_max(row.min, egui::pos2(row.right() - save_width - 12.0, row.bottom()));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(status).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
             if let Some(export) = &self.export {
                 let done = export.progress.done.load(Relaxed);
                 ui.add(egui::ProgressBar::new(done as f32 / 1000.0).desired_width(160.0).show_percentage());
                 ui.weak(tr!("Saving…", "Сохраняется…"));
             } else if let Some(e) = &self.error {
-                ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
+                ui.add(egui::Label::new(RichText::new(e).color(ui.visuals().error_fg_color)).truncate());
             } else if let (Some(recycled), None) = (self.replaced, &self.saved) {
-                ui.label(if recycled {
+                let text = if recycled {
                     tr!("The file was replaced by the cut; the original is in the Recycle Bin.", "Файл заменён фрагментом; исходный — в корзине.")
                 } else {
                     tr!(
                         "The file was replaced by the cut; the original is deleted (the drive has no Recycle Bin).",
                         "Файл заменён фрагментом; исходный удалён (у диска нет корзины)."
                     )
-                });
+                };
+                ui.add(egui::Label::new(text).truncate());
             } else if let Some(path) = &self.saved {
                 ui.label(tr!("Saved:", "Сохранено:"));
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -849,9 +860,8 @@ impl Editor {
                     win::show_in_explorer(path);
                 }
             }
-            });
         });
-        close
+        false
     }
 
     /// The timeline: the stretch kept, the key frames, the marks of its
@@ -1020,7 +1030,7 @@ fn help_text() -> &'static str {
 
 /// The play button: a triangle, or two bars while playing.
 fn play_button(ui: &mut egui::Ui, playing: bool) -> egui::Response {
-    let response = ui.add(egui::Button::new("").min_size(Vec2::new(40.0, 26.0)));
+    let response = ui.add(egui::Button::new("").min_size(Vec2::new(PLAY_WIDTH, 26.0)));
     let colour = ui.style().interact(&response).fg_stroke.color;
     let c = response.rect.center();
     let painter = ui.painter();
@@ -1031,6 +1041,39 @@ fn play_button(ui: &mut egui::Ui, playing: bool) -> egui::Response {
     } else {
         let points = vec![c + Vec2::new(-4.5, -6.5), c + Vec2::new(6.5, 0.0), c + Vec2::new(-4.5, 6.5)];
         painter.add(egui::Shape::convex_polygon(points, colour, egui::Stroke::NONE));
+    }
+    response
+}
+
+/// The height of a row of the controls.
+const ROW_HEIGHT: f32 = 28.0;
+/// The buttons that move the cursor: four of this width and the play
+/// button, this far apart.
+const STEP_WIDTH: f32 = 34.0;
+const PLAY_WIDTH: f32 = 44.0;
+const TRANSPORT_GAP: f32 = 4.0;
+const TRANSPORT_WIDTH: f32 = 4.0 * STEP_WIDTH + PLAY_WIDTH + 4.0 * TRANSPORT_GAP;
+/// The marks of the stretch either side of those buttons, set a little
+/// apart from them.
+const MARK_GAP: f32 = 6.0;
+const MARKS_WIDTH: f32 = TRANSPORT_WIDTH + 2.0 * (STEP_WIDTH + TRANSPORT_GAP + MARK_GAP);
+
+/// A row of `height` split into a middle of `middle` width, centred in
+/// the row, and what is left and right of it, `gap` away.
+fn thirds(ui: &mut egui::Ui, height: f32, middle: f32, gap: f32) -> (egui::Rect, egui::Rect, egui::Rect) {
+    let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+    let mid = egui::Rect::from_center_size(row.center(), Vec2::new(middle, height));
+    let left = egui::Rect::from_min_max(row.min, egui::pos2(mid.left() - gap, row.bottom()));
+    let right = egui::Rect::from_min_max(egui::pos2(mid.right() + gap, row.top()), row.max);
+    (left, mid, right)
+}
+
+/// A time of the stretch as a link: a click moves the cursor there.
+fn time_link(ui: &mut egui::Ui, time: i64) -> egui::Response {
+    let colour = ui.visuals().hyperlink_color;
+    let response = ui.add(egui::Label::new(RichText::new(clock(time)).monospace().color(colour)).sense(Sense::click()));
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     response
 }
