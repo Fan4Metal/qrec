@@ -2,9 +2,11 @@
 //! dot while recording, the time recorded in its tooltip. A click shows
 //! the window; its menu starts or stops the recording, shows the window,
 //! sets whether the window is on the taskbar, whether closing it hides it
-//! and whether a recording puts it away, or exits.
+//! and whether a recording puts it away, opens one of the latest
+//! recordings in the trimming window, or exits.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -16,7 +18,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
-    GetMessageW, GetSystemMetrics, HICON, LR_DEFAULTCOLOR, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+    GetMessageW, GetSystemMetrics, HICON, LR_DEFAULTCOLOR, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
     RegisterClassExW, RegisterWindowMessageW, SM_CXSMICON, SetForegroundWindow, SetMenuDefaultItem, TPM_NONOTIFY, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_NULL,
     WNDCLASSEXW, WS_POPUP,
@@ -26,7 +28,7 @@ use windows::core::{PCWSTR, w};
 use crate::win::wide;
 
 /// What the icon asks of the window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     /// Start or stop the recording, as the hotkey does.
     Toggle,
@@ -44,6 +46,10 @@ pub enum Command {
     About,
     /// Close the program.
     Exit,
+    /// Open a recording in the trimming window.
+    Trim(PathBuf),
+    /// Show the folder of the recordings in Explorer.
+    Folder,
 }
 
 /// The icon's callback message.
@@ -67,6 +73,9 @@ const MENU_CLOSE_TO_TRAY: usize = 5;
 const MENU_MINIMISE_ON_RECORD: usize = 6;
 const MENU_ABOUT: usize = 7;
 const MENU_TRIM_AFTER_RECORD: usize = 8;
+const MENU_FOLDER: usize = 9;
+/// The latest recordings: this plus their place in `Status::recent`.
+const MENU_RECENT: usize = 100;
 
 /// What the icon and its menu show.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -81,6 +90,9 @@ pub struct Status {
     pub minimise_on_record: bool,
     /// Whether a recording that ends opens in the trimming window.
     pub trim_after_record: bool,
+    /// The latest recordings, newest first: how each is named in the menu,
+    /// and its file.
+    pub recent: Vec<(String, PathBuf)>,
 }
 
 /// The icon; removed when dropped. Commands arrive on the receiver, and
@@ -271,11 +283,28 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
     let minimise_on_record = wide(tr!("Minimise when recording starts", "Сворачивать при начале записи"));
     let trim_after_record = wide(tr!("Trim after recording", "Обрезать после записи"));
     let about = wide(tr!("About…", "О программе…"));
+    let recent = wide(tr!("Latest recordings", "Последние записи"));
+    let none = wide(tr!("None yet", "Пока нет"));
+    let folder = wide(tr!("Open the folder", "Открыть папку"));
+    let names: Vec<Vec<u16>> = state.recent.iter().map(|(name, _)| wide(name)).collect();
     let exit = wide(tr!("Exit", "Выход"));
     unsafe {
         let menu = CreatePopupMenu().ok()?;
         let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, PCWSTR(toggle.as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING, MENU_SHOW, PCWSTR(show.as_ptr()));
+        // A click on one opens it in the trimming window.
+        if let Ok(list) = CreatePopupMenu() {
+            for (i, name) in names.iter().enumerate() {
+                let _ = AppendMenuW(list, MF_STRING, MENU_RECENT + i, PCWSTR(name.as_ptr()));
+            }
+            if names.is_empty() {
+                let _ = AppendMenuW(list, MF_STRING | MF_GRAYED, 0, PCWSTR(none.as_ptr()));
+            }
+            let _ = AppendMenuW(list, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(list, MF_STRING, MENU_FOLDER, PCWSTR(folder.as_ptr()));
+            // Destroyed with the menu.
+            let _ = AppendMenuW(menu, MF_POPUP, list.0 as usize, PCWSTR(recent.as_ptr()));
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
         let _ = AppendMenuW(menu, check(state.tray_only), MENU_TASKBAR, PCWSTR(taskbar.as_ptr()));
@@ -301,6 +330,8 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
             MENU_TRIM_AFTER_RECORD => Some(Command::TrimAfterRecord),
             MENU_ABOUT => Some(Command::About),
             MENU_EXIT => Some(Command::Exit),
+            MENU_FOLDER => Some(Command::Folder),
+            n if n >= MENU_RECENT => state.recent.get(n - MENU_RECENT).map(|(_, path)| Command::Trim(path.clone())),
             _ => None,
         }
     }

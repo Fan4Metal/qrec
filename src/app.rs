@@ -14,13 +14,14 @@ use crate::hotkey::{Chord, Hotkey};
 use crate::i18n::LangChoice;
 use crate::overlay::{self, Border};
 use crate::recorder::{self, Config, Quality, RateControl, Recorder};
+use crate::recordings::{self, Recording, Recordings, Thumbnails};
 use crate::region::{Aspect, Region};
 use crate::sessions;
 use crate::tray::{self, Tray};
 use crate::win;
 
 /// The window's size in points.
-pub const WINDOW_SIZE: [f32; 2] = [460.0, 462.0];
+pub const WINDOW_SIZE: [f32; 2] = [460.0, 478.0];
 /// The window's corners, painted over a transparent window (as Windows 11
 /// rounds its own).
 pub(crate) const CORNER_RADIUS: f32 = 8.0;
@@ -80,6 +81,13 @@ pub struct App {
     apps_listed: bool,
     cursor: bool,
     folder: PathBuf,
+    /// The latest recordings in `folder`, for the list and the tray.
+    recordings: Recordings,
+    /// A small picture of each of them.
+    thumbnails: Thumbnails,
+    /// When `recordings` was last listed: again every few seconds, so
+    /// files cut or deleted elsewhere show.
+    listed: std::time::Instant,
     /// The hotkey that starts and stops the recording.
     record_key: GlobalKey,
     /// The hotkey that opens the area selection.
@@ -120,6 +128,16 @@ pub struct App {
     /// The position in pixels the open trimming window still has to be
     /// moved to, once its window exists, when the guess was off.
     editor_move: Option<(i32, i32)>,
+    /// Whether the trimming window's viewport has been shown (its window
+    /// created).
+    editor_created: bool,
+    /// Whether the main window was on the screen when this frame began
+    /// (`logic`). eframe paints a hidden or minimised window outside
+    /// winit's event handlers, where a new viewport cannot create its
+    /// window: egui then panics ("the user callback was never called").
+    /// The window shown during that pass (from the tray, for a file to
+    /// trim) is still in it, so the trimming window waits a frame.
+    shown_at_start: bool,
     /// Whether a cut replaces the file it was made from.
     trim_replace: bool,
     /// The icon of About, rasterised at the display's pixel density.
@@ -181,6 +199,15 @@ impl GlobalKey {
     fn presses(&self) -> usize {
         self.registered.as_ref().map_or(0, |(_, rx)| rx.try_iter().count())
     }
+}
+
+/// What is done with a recording, from its card or the list.
+enum FileAction {
+    Trim(PathBuf),
+    Show(PathBuf),
+    Discard(PathBuf),
+    /// The folder of the recordings, in Explorer.
+    Folder,
 }
 
 /// The status line.
@@ -262,6 +289,9 @@ impl App {
             apps_listed: false,
             cursor,
             folder,
+            recordings: Recordings::default(),
+            thumbnails: Thumbnails::new(cc.egui_ctx.clone()),
+            listed: std::time::Instant::now(),
             record_key,
             select_key,
             aspect,
@@ -276,6 +306,8 @@ impl App {
             editor_rect,
             editor_placement: None,
             editor_move: None,
+            editor_created: false,
+            shown_at_start: false,
             trim_replace,
             about_icon: None,
             tray: Tray::new(cc.egui_ctx.clone()).inspect_err(|e| log::warn!("no tray icon: {e}")).ok(),
@@ -289,6 +321,7 @@ impl App {
             rounded: None,
         };
         app.register_hotkeys(&cc.egui_ctx);
+        app.relist();
         // Before eframe shows the window, so that no button appears.
         if let (Some(hwnd), true) = (app.window, app.tray_only()) {
             win::set_taskbar_button(hwnd, false, false);
@@ -395,6 +428,8 @@ impl App {
                     self.about = true;
                 }
                 tray::Command::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                tray::Command::Trim(path) => self.open_editor(path, ctx),
+                tray::Command::Folder => win::open_folder(&self.folder),
             }
         }
         let requests: Vec<crate::instance::Request> = self.instance.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
@@ -495,6 +530,7 @@ impl App {
             self.audio_warning = recorder.audio_error();
             self.notice = match recorder.stop() {
                 Ok(_) => {
+                    self.relist();
                     if let (true, Some(ctx)) = (self.trim_after_record, ctx) {
                         self.open_editor(path.clone(), ctx);
                     }
@@ -656,11 +692,19 @@ impl App {
         let mut editor = Editor::open(path, ctx.clone(), editor_viewport());
         editor.replace = self.trim_replace;
         self.editor = Some(editor);
+        self.editor_created = false;
     }
 
     /// The trimming window, a viewport of its own.
     fn editor_window(&mut self, ctx: &egui::Context) {
         let Some(editor) = &mut self.editor else { return };
+        // Not created in a pass that began with the main window hidden
+        // (see `shown_at_start`): the next one is an ordinary one.
+        if !self.editor_created && !self.shown_at_start {
+            ctx.request_repaint();
+            return;
+        }
+        self.editor_created = true;
         // Styled like the main window: its own title row and rounded
         // corners over a transparent window.
         let mut builder = egui::ViewportBuilder::default()
@@ -704,6 +748,8 @@ impl App {
         self.trim_replace = editor.replace;
         if close {
             self.editor = None;
+            // It may have written a cut or replaced the file.
+            self.relist();
         }
     }
 
@@ -724,6 +770,13 @@ impl App {
                 close_to_tray: self.close_to_tray,
                 minimise_on_record: self.minimise_on_record,
                 trim_after_record: self.trim_after_record,
+                recent: self
+                    .recordings
+                    .list
+                    .iter()
+                    .take(5)
+                    .map(|r| (format!("{}   {}", recordings::when(r.modified), r.details()), r.path.clone()))
+                    .collect(),
             });
         }
     }
@@ -822,6 +875,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.thumbnails.poll(&ctx);
         if let Some(action) = self.capturing_hotkey {
             self.capture_hotkey(&ctx, action);
         }
@@ -907,7 +961,11 @@ impl eframe::App for App {
     /// the tray and a failed recording are attended to all the same, so a
     /// recording can be stopped while the window is out of the way.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.shown_at_start = self.window.is_none_or(win::is_shown);
         self.poll(ctx);
+        if self.listed.elapsed() > Duration::from_secs(5) {
+            self.relist();
+        }
         self.update_tray();
         if self.recorder.is_some() {
             ctx.request_repaint_after(Duration::from_millis(500));
@@ -1084,6 +1142,7 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
                     && let Some(folder) = rfd::FileDialog::new().set_directory(&self.folder).pick_folder()
                 {
                     self.folder = folder;
+                    self.relist();
                 }
                 if ui.button(tr!("Open", "Открыть")).on_hover_text(tr!("Open the folder in Explorer", "Открыть папку в Проводнике")).clicked() {
                     win::open_folder(&self.folder);
@@ -1253,15 +1312,15 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
                 }
             });
         });
-        ui.add_space(8.0);
-        // Two lines of text at most; wrapped, so a long message stays in
-        // the window.
-        let height = ui.text_style_height(&egui::TextStyle::Body) * 2.0 + 4.0;
+        ui.add_space(10.0);
+        // The last recording as a card of its own, or a line of text: what
+        // the area is, what the recording does, what went wrong. Wrapped,
+        // so a long message stays in the window.
+        let height = ui.text_style_height(&egui::TextStyle::Body) * 2.0 + 14.0;
+        let mut action = None;
         ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), height), egui::Layout::top_down(egui::Align::LEFT), |ui| {
             ui.set_min_height(height);
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            let mut trim = None;
-            let mut discard = None;
             match &self.notice {
                 Notice::None => {
                     ui.label(RichText::new(self.area_label()).weak());
@@ -1270,19 +1329,7 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
                     if let Some(warning) = &self.audio_warning {
                         ui.label(RichText::new(warning).color(ui.visuals().error_fg_color));
                     }
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(tr!("Saved:", "Сохранено:"));
-                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        if ui.link(name).on_hover_text(tr!("Show in Explorer", "Показать в Проводнике")).clicked() {
-                            win::show_in_explorer(path);
-                        }
-                        if ui.small_button(tr!("Trim…", "Обрезать…")).on_hover_text(tr!("Cut the start and the end off, without re-encoding", "Отрезать начало и конец без перекодирования")).clicked() {
-                            trim = Some(path.clone());
-                        }
-                        if trash_button(ui).on_hover_text(tr!("Move the file to the Recycle Bin", "Удалить файл в корзину")).clicked() {
-                            discard = Some(path.clone());
-                        }
-                    });
+                    self.recording_card(ui, path, &mut action);
                 }
                 Notice::Error(e) => {
                     ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
@@ -1297,20 +1344,130 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
                     ui.label(RichText::new(text).weak());
                 }
             }
-            // A development build says which one it is; a release has it
-            // in About only.
-            if crate::VERSION.contains("-dev") {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
-                    ui.label(RichText::new(format!("qrec {}", crate::VERSION)).small().weak());
+        });
+        self.file_action(action, &ui.ctx().clone());
+    }
+
+    /// The last recording: its picture (a click trims it), its name (a
+    /// link to it in Explorer), its length, size and picture size, what can
+    /// be done with it, and when there are others, a button that lists
+    /// them above the card.
+    fn recording_card(&self, ui: &mut egui::Ui, path: &Path, action: &mut Option<FileAction>) {
+        let others = self.recordings.list.iter().filter(|r| r.path != path).count();
+        let mut more = None;
+        let card = egui::Frame::new()
+            .fill(ui.visuals().faint_bg_color)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    if thumbnail(ui, self.thumbnails.get(path), Vec2::new(64.0, 36.0)).clicked() {
+                        *action = Some(FileAction::Trim(path.to_path_buf()));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        file_buttons(ui, path, action);
+                        if others > 0 {
+                            ui.add_space(4.0);
+                            more = Some(
+                                ui.button(format!("{} {others} ⏶", tr!("More", "Ещё")))
+                                    .on_hover_text(tr!("The latest recordings of the folder", "Последние записи папки")),
+                            );
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                if file_link(ui, &name).on_hover_text(tr!("Show in Explorer", "Показать в Проводнике")).clicked() {
+                                    *action = Some(FileAction::Show(path.to_path_buf()));
+                                }
+                                if let Some(r) = self.recordings.get(path) {
+                                    ui.add(egui::Label::new(RichText::new(r.details()).small().weak()).truncate());
+                                }
+                            });
+                        });
+                    });
                 });
-            }
-            if let Some(path) = trim {
-                self.open_editor(path, ui.ctx());
-            }
-            if let Some(path) = discard {
-                self.discard(&path);
+            });
+        // Opened by the button, above the card and as wide as it.
+        if let Some(more) = more {
+            let inner = card.response.rect.width() - ui.spacing().menu_margin.sum().x;
+            egui::Popup::from_toggle_button_response(&more)
+                .anchor(card.response.rect)
+                .align(egui::RectAlign::TOP_START)
+                .gap(4.0)
+                .width(inner)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| self.recordings_list(ui, path, action));
+        }
+    }
+
+    /// The latest recordings of the folder but the one on the card, newest
+    /// first, each with its picture (a click trims it), when it was made,
+    /// its name, length and size, and what can be done with it; then the
+    /// folder itself.
+    fn recordings_list(&self, ui: &mut egui::Ui, card: &Path, action: &mut Option<FileAction>) {
+        ui.label(RichText::new(tr!("Latest recordings", "Последние записи")).strong());
+        ui.add_space(2.0);
+        // Below the title row.
+        let height = (ui.ctx().content_rect().height() - 200.0).max(120.0);
+        egui::ScrollArea::vertical().max_height(height).auto_shrink([false, true]).show(ui, |ui| {
+            for (i, r) in self.recordings.list.iter().filter(|r| r.path != card).enumerate() {
+                if i > 0 {
+                    ui.separator();
+                }
+                self.list_row(ui, r, action);
             }
         });
+        ui.separator();
+        if ui.button(tr!("Open the folder", "Открыть папку")).clicked() {
+            *action = Some(FileAction::Folder);
+        }
+    }
+
+    fn list_row(&self, ui: &mut egui::Ui, r: &Recording, action: &mut Option<FileAction>) {
+        ui.horizontal(|ui| {
+            if thumbnail(ui, self.thumbnails.get(&r.path), Vec2::new(112.0, 63.0)).clicked() {
+                *action = Some(FileAction::Trim(r.path.clone()));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // The scroll bar's place.
+                ui.add_space(12.0);
+                file_buttons(ui, &r.path, action);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        ui.label(RichText::new(recordings::when(r.modified)).strong());
+                        if file_link(ui, &r.name()).on_hover_text(tr!("Show in Explorer", "Показать в Проводнике")).clicked() {
+                            *action = Some(FileAction::Show(r.path.clone()));
+                        }
+                        ui.add(egui::Label::new(RichText::new(r.details()).small().weak()).truncate());
+                    });
+                });
+            });
+        });
+    }
+
+    /// Lists the recordings of the folder again, and asks for the pictures
+    /// of new ones.
+    fn relist(&mut self) {
+        self.recordings.refresh(&self.folder);
+        self.thumbnails.want(&self.recordings.list);
+        self.listed = std::time::Instant::now();
+    }
+
+    fn file_action(&mut self, action: Option<FileAction>, ctx: &egui::Context) {
+        match action {
+            Some(FileAction::Trim(path)) => self.open_editor(path, ctx),
+            Some(FileAction::Show(path)) => win::show_in_explorer(&path),
+            Some(FileAction::Discard(path)) => {
+                self.discard(&path);
+                self.relist();
+            }
+            Some(FileAction::Folder) => win::open_folder(&self.folder),
+            None => {}
+        }
     }
 
     /// Moves a recording to the Recycle Bin, closing the trimming window
@@ -1320,11 +1477,16 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
             self.editor = None;
         }
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        self.notice = match win::recycle(path) {
+        let notice = match win::recycle(path) {
             Ok(true) => Notice::Info(tr!(format!("{name} is in the Recycle Bin"), format!("{name} удалён в корзину"))),
             Ok(false) => Notice::Info(tr!(format!("{name} is deleted (the drive has no Recycle Bin)"), format!("{name} удалён (у диска нет корзины)"))),
             Err(e) => Notice::Error(format!("{}: {e}", tr!("The file could not be deleted", "Не удалось удалить файл"))),
         };
+        // The card of the last recording stays when another one went from
+        // the list (which shows it gone), unless that failed.
+        if !matches!((&self.notice, &notice), (Notice::Saved(shown), Notice::Info(_)) if shown != path) {
+            self.notice = notice;
+        }
     }
 }
 
@@ -1339,7 +1501,14 @@ fn title(ui: &egui::Ui, rect: egui::Rect) {
     job.append("rec", 0.0, egui::TextFormat::simple(font, RECORD_COLOUR));
     let galley = ui.fonts_mut(|f| f.layout_job(job));
     let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
+    let right = pos.x + galley.size().x;
     painter.galley(pos, galley, DARK_COLOUR);
+    // A development build says which one it is; a release has it in About
+    // only.
+    if crate::VERSION.contains("-dev") {
+        let colour = ui.visuals().weak_text_color();
+        painter.text(egui::pos2(right + 8.0, rect.center().y + 1.0), egui::Align2::LEFT_CENTER, crate::VERSION, egui::FontId::proportional(11.0), colour);
+    }
 }
 
 /// `x,y,w,h` of a rectangle, as the settings keep it.
@@ -1511,26 +1680,100 @@ fn cross_button(ui: &mut egui::Ui) -> egui::Response {
     response
 }
 
-/// A small button with a waste bin, as high as a small button's text.
-fn trash_button(ui: &mut egui::Ui) -> egui::Response {
-    let side = ui.text_style_height(&egui::TextStyle::Body) + 2.0;
+/// A recording's picture in a box of `size` (dark until it is decoded),
+/// fitted inside it; a click trims the recording.
+fn thumbnail(ui: &mut egui::Ui, texture: Option<&egui::TextureHandle>, size: Vec2) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 4.0, DARK_COLOUR);
+    if let Some(texture) = texture {
+        let [w, h] = texture.size();
+        let scale = (rect.width() / w as f32).min(rect.height() / h as f32);
+        let image = egui::Rect::from_center_size(rect.center(), Vec2::new(w as f32, h as f32) * scale);
+        painter.image(texture.id(), image, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+    }
+    if response.hovered() {
+        painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.5, ui.visuals().selection.bg_fill), egui::StrokeKind::Inside);
+    }
+    response.on_hover_text(tr!("Trim", "Обрезать")).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A file's name as a link, cut short with an ellipsis when it does not
+/// fit.
+fn file_link(ui: &mut egui::Ui, name: &str) -> egui::Response {
+    let colour = ui.visuals().hyperlink_color;
+    let response = ui.add(egui::Label::new(RichText::new(name).color(colour)).truncate().sense(egui::Sense::click()));
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// What a small icon button shows.
+#[derive(Clone, Copy)]
+enum Icon {
+    Scissors,
+    Folder,
+    Trash,
+}
+
+/// A small button with a drawn icon, as high as a small button's text.
+fn icon_button(ui: &mut egui::Ui, icon: Icon) -> egui::Response {
+    let side = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), egui::Sense::click());
     let visuals = ui.style().interact(&response);
     ui.painter().rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
     let stroke = egui::Stroke::new(1.2, visuals.fg_stroke.color);
     let c = rect.center();
-    let u = side / 16.0;
+    let u = side / 18.0;
     let p = |x: f32, y: f32| c + Vec2::new(x * u, y * u);
     let painter = ui.painter();
-    // The lid with its handle, the body narrowing downwards, two ribs.
-    painter.line_segment([p(-5.0, -3.5), p(5.0, -3.5)], stroke);
-    painter.line_segment([p(-1.5, -3.5), p(-1.5, -5.5)], stroke);
-    painter.line_segment([p(-1.5, -5.5), p(1.5, -5.5)], stroke);
-    painter.line_segment([p(1.5, -5.5), p(1.5, -3.5)], stroke);
-    painter.add(egui::Shape::closed_line(vec![p(-4.0, -3.5), p(-3.2, 5.5), p(3.2, 5.5), p(4.0, -3.5)], stroke));
-    painter.line_segment([p(-1.2, -1.0), p(-1.0, 3.5)], stroke);
-    painter.line_segment([p(1.2, -1.0), p(1.0, 3.5)], stroke);
+    match icon {
+        Icon::Scissors => {
+            // Two rings below, the blades crossing above them.
+            painter.circle_stroke(p(-3.0, 3.5), 2.2 * u, stroke);
+            painter.circle_stroke(p(3.0, 3.5), 2.2 * u, stroke);
+            painter.line_segment([p(-1.8, 1.6), p(3.5, -6.0)], stroke);
+            painter.line_segment([p(1.8, 1.6), p(-3.5, -6.0)], stroke);
+        }
+        Icon::Folder => {
+            // The tab at the top left, the body below it.
+            painter.add(egui::Shape::closed_line(
+                vec![p(-6.0, -4.5), p(-2.0, -4.5), p(-0.5, -3.0), p(6.0, -3.0), p(6.0, 5.0), p(-6.0, 5.0)],
+                stroke,
+            ));
+            painter.line_segment([p(-6.0, -1.0), p(6.0, -1.0)], stroke);
+        }
+        Icon::Trash => {
+            // The lid with its handle, the body narrowing downwards, two ribs.
+            painter.line_segment([p(-5.0, -3.5), p(5.0, -3.5)], stroke);
+            painter.line_segment([p(-1.5, -3.5), p(-1.5, -5.5)], stroke);
+            painter.line_segment([p(-1.5, -5.5), p(1.5, -5.5)], stroke);
+            painter.line_segment([p(1.5, -5.5), p(1.5, -3.5)], stroke);
+            painter.add(egui::Shape::closed_line(vec![p(-4.0, -3.5), p(-3.2, 5.5), p(3.2, 5.5), p(4.0, -3.5)], stroke));
+            painter.line_segment([p(-1.2, -1.0), p(-1.0, 3.5)], stroke);
+            painter.line_segment([p(1.2, -1.0), p(1.0, 3.5)], stroke);
+        }
+    }
     response
+}
+
+/// Trim, show in Explorer, move to the Recycle Bin: laid out right to
+/// left, so the bin is last.
+fn file_buttons(ui: &mut egui::Ui, path: &Path, action: &mut Option<FileAction>) {
+    ui.spacing_mut().item_spacing.x = 4.0;
+    if icon_button(ui, Icon::Trash).on_hover_text(tr!("Move the file to the Recycle Bin", "Удалить файл в корзину")).clicked() {
+        *action = Some(FileAction::Discard(path.to_path_buf()));
+    }
+    if icon_button(ui, Icon::Folder).on_hover_text(tr!("Show in Explorer", "Показать в Проводнике")).clicked() {
+        *action = Some(FileAction::Show(path.to_path_buf()));
+    }
+    if icon_button(ui, Icon::Scissors)
+        .on_hover_text(tr!("Trim: cut the start and the end off, without re-encoding", "Обрезать: отрезать начало и конец без перекодирования"))
+        .clicked()
+    {
+        *action = Some(FileAction::Trim(path.to_path_buf()));
+    }
 }
 
 /// The Videos folder, or the current directory.

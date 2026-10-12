@@ -28,6 +28,7 @@ mod mp4;
 mod overlay;
 mod playback;
 mod recorder;
+mod recordings;
 mod region;
 mod sessions;
 mod tray;
