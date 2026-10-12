@@ -511,6 +511,17 @@ impl Editor {
         frames.iter().rev().find(|f| f.key && f.time <= time).map_or(0, |f| f.time)
     }
 
+    /// The key frame nearest `time`, before or after it: where the start
+    /// goes, from the cursor (`[`, `I`) or while its mark is dragged, so
+    /// that it sticks to the key frame nearest the pointer instead of
+    /// trailing it.
+    fn nearest_key(&self, time: i64) -> i64 {
+        match &self.frames {
+            Some(frames) => nearest_key(frames, time),
+            None => self.frame_at(time),
+        }
+    }
+
     /// Moves the cursor by hand: playback stops.
     fn set_cursor(&mut self, time: i64) {
         self.playing = None;
@@ -633,7 +644,7 @@ impl Editor {
                 Key::ArrowRight => self.set_cursor(step(self, 1)),
                 Key::Home => self.set_cursor(0),
                 Key::End => self.set_cursor(self.length() - 1),
-                Key::I | Key::OpenBracket => self.set_start(self.cursor),
+                Key::I | Key::OpenBracket => self.set_start(self.nearest_key(self.cursor)),
                 Key::O | Key::CloseBracket => self.set_end(self.cursor),
                 Key::S if modifiers.command && self.export.is_none() && self.end > self.start => self.save(),
                 _ => {}
@@ -709,13 +720,13 @@ impl Editor {
                     ui,
                     "[",
                     tr!(
-                        "Start here: the stretch kept starts on the key frame at or before this one (I)",
-                        "Начало здесь: оставляемый фрагмент начнётся с ключевого кадра на этом или перед ним (I)"
+                        "Start here: the stretch kept starts on the key frame nearest this one (I)",
+                        "Начало здесь: оставляемый фрагмент начнётся с ближайшего к этому ключевого кадра (I)"
                     ),
                 )
                 .clicked()
                 {
-                    self.set_start(self.cursor);
+                    self.set_start(self.nearest_key(self.cursor));
                 }
                 ui.add_space(MARK_GAP);
                 if button(ui, "⏮", tr!("First frame (Home)", "Первый кадр (Home)")).clicked() {
@@ -927,7 +938,7 @@ impl Editor {
             match mark {
                 Mark::Cursor => self.set_cursor(t),
                 Mark::Start => {
-                    self.set_start(t);
+                    self.set_start(self.nearest_key(t));
                     self.set_cursor(self.start);
                 }
                 Mark::End => {
@@ -1016,7 +1027,7 @@ fn help_text() -> &'static str {
          Home, End — the first or the last frame\n\
          I, O — the start or the end of the stretch here\n\
          Ctrl+S — save the cut\n\n\
-         The stretch starts on a key frame (the marks under the timeline), the one at or before the frame chosen; it ends on any frame.",
+         The stretch starts on a key frame (the marks under the timeline), the one nearest the frame chosen; it ends on any frame.",
         "Пробел — воспроизвести или поставить на паузу\n\
          Shift+пробел — проиграть оставляемый фрагмент\n\
          Стрелки влево и вправо — кадр назад или вперёд\n    \
@@ -1024,7 +1035,7 @@ fn help_text() -> &'static str {
          Home, End — первый или последний кадр\n\
          I, O — начало или конец фрагмента здесь\n\
          Ctrl+S — сохранить фрагмент\n\n\
-         Фрагмент начинается на ключевом кадре (отметки под шкалой) — на выбранном или предшествующем ему; заканчивается на любом кадре."
+         Фрагмент начинается на ключевом кадре (отметки под шкалой) — на ближайшем к выбранному; заканчивается на любом кадре."
     )
 }
 
@@ -1110,6 +1121,24 @@ fn resize_edges(ui: &mut egui::Ui) {
     }
 }
 
+/// The key frame of `frames` nearest `time`, before or after it (the one
+/// before when both are as near); 0 without any.
+fn nearest_key(frames: &[Frame], time: i64) -> i64 {
+    let before = frames.iter().rev().find(|f| f.key && f.time <= time).map(|f| f.time);
+    let after = frames.iter().find(|f| f.key && f.time > time).map(|f| f.time);
+    match (before, after) {
+        (Some(b), Some(a)) => {
+            if time - b <= a - time {
+                b
+            } else {
+                a
+            }
+        }
+        (Some(k), None) | (None, Some(k)) => k,
+        (None, None) => 0,
+    }
+}
+
 /// Where a cut that is to replace `src` is written first: beside it,
 /// `<name>.trimming.mp4` (left over from an interrupted cut, overwritten).
 fn replacement_path(src: &Path) -> PathBuf {
@@ -1157,13 +1186,26 @@ fn fmt_fps(fps: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clock, cut_path};
+    use super::{Frame, SECOND, clock, cut_path, nearest_key};
 
     #[test]
     fn formats_times() {
         assert_eq!(clock(0), "0:00.000");
         assert_eq!(clock(12_345_000), "0:01.234");
         assert_eq!(clock(3_600 * 10_000_000 + 65 * 10_000_000), "1:01:05.000");
+    }
+
+    #[test]
+    fn sticks_to_the_nearest_key() {
+        // A key frame every second, frames every 0.1 s, from 0.5 s on.
+        let frames: Vec<Frame> =
+            (5..40).map(|i| Frame { time: i * SECOND / 10, duration: SECOND / 10, key: i % 10 == 0 }).collect();
+        assert_eq!(nearest_key(&frames, 14 * SECOND / 10), SECOND);
+        assert_eq!(nearest_key(&frames, 16 * SECOND / 10), 2 * SECOND);
+        assert_eq!(nearest_key(&frames, 15 * SECOND / 10), SECOND);
+        assert_eq!(nearest_key(&frames, 0), SECOND);
+        assert_eq!(nearest_key(&frames, 10 * SECOND), 3 * SECOND);
+        assert_eq!(nearest_key(&[], SECOND), 0);
     }
 
     #[test]
