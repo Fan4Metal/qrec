@@ -21,7 +21,7 @@ use crate::tray::{self, Tray};
 use crate::win;
 
 /// The window's size in points.
-pub const WINDOW_SIZE: [f32; 2] = [460.0, 478.0];
+pub const WINDOW_SIZE: [f32; 2] = [500.0, 494.0];
 /// The window's corners, painted over a transparent window (as Windows 11
 /// rounds its own).
 pub(crate) const CORNER_RADIUS: f32 = 8.0;
@@ -1012,7 +1012,7 @@ impl eframe::App for App {
 impl App {
     /// The settings, a label and its controls per row.
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, recording: bool) {
-        egui::Grid::new("settings").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
+        egui::Grid::new("settings").num_columns(2).spacing([16.0, 12.0]).show(ui, |ui| {
             ui.label(tr!("Display", "Экран"));
             ui.add_enabled_ui(!recording, |ui| {
                 let current = self.monitors.get(self.monitor).map(|m| m.label(self.monitor)).unwrap_or_default();
