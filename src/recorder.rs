@@ -39,11 +39,20 @@ impl Quality {
 
     /// Bits per pixel per frame: the bitrate follows the area and the
     /// frame rate.
-    fn bits_per_pixel(self) -> f64 {
+    pub fn bits_per_pixel(self) -> f64 {
         match self {
             Quality::Low => 0.05,
             Quality::Medium => 0.1,
             Quality::High => 0.2,
+        }
+    }
+
+    /// The quantisation parameter at a constant quality.
+    pub fn qp(self) -> u32 {
+        match self {
+            Quality::Low => 30,
+            Quality::Medium => 26,
+            Quality::High => 22,
         }
     }
 
@@ -69,6 +78,41 @@ impl Quality {
     }
 }
 
+/// How the encoder spends bits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RateControl {
+    /// The same quality in every frame: the file follows what is on the
+    /// screen, a still one takes almost nothing.
+    #[default]
+    Quality,
+    /// A target bitrate from the area, the frame rate and the quality:
+    /// the size is known beforehand, motion loses detail.
+    Bitrate,
+}
+
+impl RateControl {
+    pub const ALL: [RateControl; 2] = [RateControl::Quality, RateControl::Bitrate];
+
+    /// Name in the settings and on the command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            RateControl::Quality => "quality",
+            RateControl::Bitrate => "bitrate",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<RateControl> {
+        Self::ALL.into_iter().find(|r| r.name() == name)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RateControl::Quality => tr!("By quality", "По качеству"),
+            RateControl::Bitrate => tr!("Fixed", "Заданный"),
+        }
+    }
+}
+
 /// The bitrate for an area, a frame rate and a quality, bits per second.
 pub fn bitrate(width: u32, height: u32, fps: u32, quality: Quality) -> u32 {
     let pixels = f64::from(width) * f64::from(height) * f64::from(fps);
@@ -82,6 +126,7 @@ pub struct Config {
     pub region: Region,
     pub fps: u32,
     pub quality: Quality,
+    pub rate: RateControl,
     /// Whose sound is recorded; `None` for none.
     pub audio: Option<Source>,
     /// Draw the pointer into the frames.
@@ -94,6 +139,8 @@ pub struct Config {
 pub struct Info {
     pub encoder: String,
     pub hardware: bool,
+    /// Whether the encoder took the constant quality (else the bitrate).
+    pub constant_quality: bool,
     /// Sample rate of the audio track, when there is one.
     pub audio_rate: Option<u32>,
 }
@@ -227,7 +274,13 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
             .and_then(|_| std::fs::remove_file(&config.path))
             .map_err(|e| format!("{}: {e}", tr!("Cannot write the file", "Не удаётся записать файл")))?;
         let (width, height) = (config.region.width, config.region.height);
-        let video = VideoConfig { width, height, fps: config.fps, bitrate: bitrate(width, height, config.fps, config.quality) };
+        let video = VideoConfig {
+            width,
+            height,
+            fps: config.fps,
+            bitrate: bitrate(width, height, config.fps, config.quality),
+            qp: (config.rate == RateControl::Quality).then(|| config.quality.qp()),
+        };
         let audio = loopback.as_ref().map(|l| AudioConfig { sample_rate: l.rate() });
         let encoder = Encoder::new(&config.path, capturer.device(), video, audio)
             .map_err(|e| format!("{}: {}", tr!("encoder", "кодер"), win::describe(&e)))?;
@@ -261,7 +314,12 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
         if let Some(l) = &loopback {
             log::debug!("audio: {} at {} Hz", l.method, l.rate());
         }
-        let info = Info { encoder: encoder.encoder_name.clone(), hardware: encoder.hardware, audio_rate: audio.map(|a| a.sample_rate) };
+        let info = Info {
+            encoder: encoder.encoder_name.clone(),
+            hardware: encoder.hardware,
+            constant_quality: encoder.constant_quality,
+            audio_rate: audio.map(|a| a.sample_rate),
+        };
         Ok((capturer, converter, Arc::new(encoder), loopback, info, drawer, local))
     })();
     let (mut capturer, mut converter, encoder, loopback, info, mut drawer, local) = match setup {
@@ -648,5 +706,9 @@ mod tests {
             assert_eq!(Quality::from_name(q.name()), Some(q));
         }
         assert_eq!(Quality::from_name("ultra"), None);
+        for r in RateControl::ALL {
+            assert_eq!(RateControl::from_name(r.name()), Some(r));
+        }
+        assert_eq!(RateControl::from_name("cbr"), None);
     }
 }

@@ -30,8 +30,12 @@ pub struct VideoConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    /// Bits per second.
+    /// Bits per second: the target with a constant bitrate, a hint (the
+    /// media type wants one) with a constant quality.
     pub bitrate: u32,
+    /// A constant quality: the quantisation parameter of every frame
+    /// (0..51, lower is better); `None` for a constant bitrate.
+    pub qp: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -51,6 +55,8 @@ pub struct Encoder {
     /// Name of the H.264 encoder in use, and whether it is a hardware one.
     pub encoder_name: String,
     pub hardware: bool,
+    /// Whether it encodes at a constant quality (else at the bitrate).
+    pub constant_quality: bool,
     // Last: Media Foundation is shut down after the objects above are
     // released.
     _mf: Mf,
@@ -106,13 +112,14 @@ impl Encoder {
         let manager = manager.unwrap();
         unsafe { manager.ResetDevice(device, token)? };
         let encoder = VideoEncoder::new(device, &manager, video)?;
-        let (encoder_name, hardware) = (encoder.name.clone(), encoder.hardware);
+        let (encoder_name, hardware, constant_quality) = (encoder.name.clone(), encoder.hardware, encoder.constant_quality);
         Ok(Encoder {
             video: Mutex::new(encoder),
             mux: Mutex::new(Mux { path: path.to_path_buf(), audio, writer: None, pending_audio: Vec::new() }),
             _manager: manager,
             encoder_name,
             hardware,
+            constant_quality,
             _mf: mf,
         })
     }

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use crate::audio::Source;
 use crate::display;
-use crate::recorder::{Config, Quality, Recorder};
+use crate::recorder::{Config, Quality, RateControl, Recorder};
 use crate::region::Region;
 use crate::win;
 
@@ -29,6 +29,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     let mut monitor_index = 0usize;
     let mut fps = 30u32;
     let mut quality = Quality::Medium;
+    let mut rate = RateControl::default();
     let mut audio = Some(Source::System);
     let mut boost = true;
     let mut cursor = true;
@@ -42,6 +43,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--monitor" => monitor_index = value()?.parse::<usize>().map_err(|e| e.to_string())?.saturating_sub(1),
             "--fps" => fps = value()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?,
             "--quality" => quality = Quality::from_name(&value()?).ok_or("--quality wants low, medium or high")?,
+            "--rate" => rate = RateControl::from_name(&value()?).ok_or("--rate wants quality or bitrate")?,
             "--no-audio" => audio = None,
             "--audio-app" => audio = Some(Source::App { program: value()?, boost: true }),
             "--no-boost" => boost = false,
@@ -52,7 +54,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             s => return Err(format!("unknown argument {s}")),
         }
     }
-    let seconds = seconds.ok_or("usage: qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality Q] [--no-audio | --audio-app NAME.exe [--no-boost]] [--out FILE]")?;
+    let seconds = seconds.ok_or("usage: qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality Q] [--rate quality|bitrate] [--no-audio | --audio-app NAME.exe [--no-boost]] [--out FILE]")?;
     if let Some(Source::App { boost: b, .. }) = &mut audio {
         *b = boost;
     }
@@ -70,12 +72,28 @@ fn run(args: Vec<String>) -> Result<(), String> {
         Some(Source::App { program, boost: true }) => format!("of {program}, boosted"),
         Some(Source::App { program, boost: false }) => format!("of {program}"),
     };
-    let config = Config { monitor, region, fps, quality, audio, cursor, path: path.clone() };
-    say!("recording {}x{} at ({}, {}) for {seconds} s, {fps} fps, {} quality, sound {sound}", region.width, region.height, region.x, region.y, quality.name());
+    let config = Config { monitor, region, fps, quality, rate, audio, cursor, path: path.clone() };
+    say!(
+        "recording {}x{} at ({}, {}) for {seconds} s, {fps} fps, {} quality, {}, sound {sound}",
+        region.width,
+        region.height,
+        region.x,
+        region.y,
+        quality.name(),
+        match rate {
+            RateControl::Quality => format!("QP {}", quality.qp()),
+            RateControl::Bitrate => format!("{} bit/s", crate::recorder::bitrate(region.width, region.height, fps, quality)),
+        }
+    );
 
     let recorder = Recorder::start(config)?;
     let _border = border.then(|| crate::overlay::Border::show(region));
-    say!("encoder: {} ({})", recorder.info.encoder, if recorder.info.hardware { "hardware" } else { "software" });
+    say!(
+        "encoder: {} ({}, {})",
+        recorder.info.encoder,
+        if recorder.info.hardware { "hardware" } else { "software" },
+        if recorder.info.constant_quality { "constant quality" } else { "bitrate" }
+    );
     if let Some(rate) = recorder.info.audio_rate {
         say!("audio: {rate} Hz");
     }

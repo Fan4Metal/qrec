@@ -37,8 +37,10 @@ use windows::Win32::Media::MediaFoundation::{
     MFVideoInterlace_Progressive, MEError, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
     eAVEncH264VProfile_High, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX,
     MFCreateAttributes, MFNominalRange_16_235, MFT_ENUM_ADAPTER_LUID, MFTEnum2, MFVideoPrimaries_BT709, MFVideoTransFunc_709,
-    MFVideoTransferMatrix_BT709,
+    MFVideoTransferMatrix_BT709, CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncVideoEncodeQP, ICodecAPI,
+    eAVEncCommonRateControlMode_Quality,
 };
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::core::{GUID, Interface, PWSTR, Result};
 
@@ -60,6 +62,9 @@ pub struct VideoEncoder {
     height: u32,
     pub name: String,
     pub hardware: bool,
+    /// Whether the encoder took the constant quality asked for; without it
+    /// it encodes at the bitrate.
+    pub constant_quality: bool,
 }
 
 // Media Foundation transforms are free-threaded; the encoder is used
@@ -120,6 +125,17 @@ impl VideoEncoder {
         }
         let (input_id, output_id) = (input_ids[0], output_ids[0]);
 
+        // Before the types: Microsoft's encoder refuses the QP afterwards.
+        let constant_quality = match video.qp {
+            Some(qp) => match set_constant_quality(&transform, qp) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!("{name}: no constant quality, the bitrate is used: {}", crate::win::describe(&e));
+                    false
+                }
+            },
+            None => false,
+        };
         let output = unsafe { MFCreateMediaType()? };
         unsafe {
             output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -157,7 +173,10 @@ impl VideoEncoder {
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
         }
         let events = if asynchronous { Some(transform.cast::<IMFMediaEventGenerator>()?) } else { None };
-        log::debug!("H.264 encoder: {name} (hardware {hardware}, asynchronous {asynchronous}, Direct3D {d3d_aware})");
+        log::debug!(
+            "H.264 encoder: {name} (hardware {hardware}, asynchronous {asynchronous}, Direct3D {d3d_aware}, {})",
+            if constant_quality { format!("QP {}", video.qp.unwrap_or_default()) } else { format!("{} bit/s", video.bitrate) }
+        );
         Ok(VideoEncoder {
             transform,
             events,
@@ -171,6 +190,7 @@ impl VideoEncoder {
             height: video.height,
             name,
             hardware,
+            constant_quality,
         })
     }
 
@@ -400,6 +420,18 @@ fn set_colours(media_type: &IMFMediaType) -> Result<()> {
 
 /// The LUID of the adapter `device` runs on, as `MFT_ENUM_ADAPTER_LUID`
 /// takes it.
+/// A constant quality: the rate control mode Quality and one quantisation
+/// parameter for every frame. The size of the file then follows what is
+/// on the screen: a still one takes almost nothing, motion what it needs.
+fn set_constant_quality(transform: &IMFTransform, qp: u32) -> Result<()> {
+    let codec: ICodecAPI = transform.cast()?;
+    unsafe {
+        codec.SetValue(&CODECAPI_AVEncCommonRateControlMode, &VARIANT::from(eAVEncCommonRateControlMode_Quality.0 as u32))?;
+        codec.SetValue(&CODECAPI_AVEncVideoEncodeQP, &VARIANT::from(u64::from(qp)))?;
+    }
+    Ok(())
+}
+
 fn adapter_luid(device: &ID3D11Device) -> Option<[u8; 8]> {
     let adapter = unsafe { device.cast::<IDXGIDevice>().ok()?.GetAdapter().ok()? };
     let luid = unsafe { adapter.GetDesc().ok()? }.AdapterLuid;

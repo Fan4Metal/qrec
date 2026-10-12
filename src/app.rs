@@ -13,14 +13,14 @@ use crate::editor::Editor;
 use crate::hotkey::{Chord, Hotkey};
 use crate::i18n::LangChoice;
 use crate::overlay::{self, Border};
-use crate::recorder::{self, Config, Quality, Recorder};
+use crate::recorder::{self, Config, Quality, RateControl, Recorder};
 use crate::region::{Aspect, Region};
 use crate::sessions;
 use crate::tray::{self, Tray};
 use crate::win;
 
 /// The window's size in points.
-pub const WINDOW_SIZE: [f32; 2] = [460.0, 434.0];
+pub const WINDOW_SIZE: [f32; 2] = [460.0, 462.0];
 /// The window's corners, painted over a transparent window (as Windows 11
 /// rounds its own).
 pub(crate) const CORNER_RADIUS: f32 = 8.0;
@@ -29,6 +29,7 @@ const MONITOR_KEY: &str = "monitor";
 const REGION_KEY: &str = "region";
 const FPS_KEY: &str = "fps";
 const QUALITY_KEY: &str = "quality";
+const RATE_KEY: &str = "rate_control";
 const AUDIO_KEY: &str = "audio";
 const AUDIO_APP_KEY: &str = "audio_app";
 const AUDIO_BOOST_KEY: &str = "audio_boost";
@@ -62,6 +63,8 @@ pub struct App {
     region: Option<Region>,
     fps: u32,
     quality: Quality,
+    /// Whether the bitrate follows the quality or is fixed beforehand.
+    rate: RateControl,
     audio: bool,
     /// The program whose sound is recorded, by its executable's full path
     /// (or its file name, as `--audio-app` takes it); `None` for the
@@ -202,6 +205,7 @@ impl App {
             _ => 30,
         };
         let quality = get(QUALITY_KEY).and_then(|q| Quality::from_name(&q)).unwrap_or_default();
+        let rate = get(RATE_KEY).and_then(|r| RateControl::from_name(&r)).unwrap_or_default();
         let audio = get(AUDIO_KEY).as_deref() != Some("false");
         let audio_app = get(AUDIO_APP_KEY).filter(|a| !a.is_empty());
         let boost = get(AUDIO_BOOST_KEY).as_deref() != Some("false");
@@ -250,6 +254,7 @@ impl App {
             region,
             fps,
             quality,
+            rate,
             audio,
             audio_app,
             boost,
@@ -453,7 +458,7 @@ impl App {
             Some(program) => Source::App { program: program.clone(), boost: self.boost },
             None => Source::System,
         });
-        let config = Config { monitor, region, fps: self.fps, quality: self.quality, audio, cursor: self.cursor, path };
+        let config = Config { monitor, region, fps: self.fps, quality: self.quality, rate: self.rate, audio, cursor: self.cursor, path };
         match Recorder::start(config) {
             Ok(recorder) => {
                 self.border = Some(Border::show(region));
@@ -462,7 +467,14 @@ impl App {
                 } else {
                     tr!("software encoder", "программный кодер")
                 };
-                self.notice = Notice::Info(format!("{}×{}, {} fps, {encoder}", region.width, region.height, self.fps));
+                // An encoder that refused the constant quality records at the
+                // bitrate: said, since the file can then be larger or worse.
+                let fallback = if self.rate == RateControl::Quality && !recorder.info.constant_quality {
+                    tr!(", at the fixed bitrate", ", заданный битрейт")
+                } else {
+                    ""
+                };
+                self.notice = Notice::Info(format!("{}×{}, {} fps, {encoder}{fallback}", region.width, region.height, self.fps));
                 self.audio_warning = None;
                 self.recorder = Some(recorder);
                 if self.minimise_on_record {
@@ -915,6 +927,7 @@ impl eframe::App for App {
         storage.set_string(REGION_KEY, self.region.map(|r| r.to_setting()).unwrap_or_default());
         storage.set_string(FPS_KEY, self.fps.to_string());
         storage.set_string(QUALITY_KEY, self.quality.name().to_owned());
+        storage.set_string(RATE_KEY, self.rate.name().to_owned());
         storage.set_string(AUDIO_KEY, self.audio.to_string());
         storage.set_string(AUDIO_APP_KEY, self.audio_app.clone().unwrap_or_default());
         storage.set_string(AUDIO_BOOST_KEY, self.boost.to_string());
@@ -961,7 +974,7 @@ impl App {
             ui.add_enabled_ui(!recording, |ui| {
                 let before = self.aspect;
                 let options = Aspect::ALL.map(|a| (a, aspect_label(a)));
-                segmented(ui, &mut self.aspect, &options);
+                segmented(ui, &mut self.aspect, &options, "");
                 if self.aspect != before {
                     self.apply_aspect();
                 }
@@ -971,24 +984,80 @@ impl App {
             ui.label(tr!("Frame rate", "Частота кадров"));
             ui.add_enabled_ui(!recording, |ui| {
                 ui.horizontal(|ui| {
-                    segmented(ui, &mut self.fps, &[(30, "30"), (60, "60")]);
+                    segmented(ui, &mut self.fps, &[(30, "30"), (60, "60")], "");
                     ui.label(RichText::new(tr!("frames per second", "кадров в секунду")).weak());
                 });
             });
             ui.end_row();
 
             ui.label(tr!("Quality", "Качество"));
+            // What each step means for the encoder in the mode chosen.
+            let steps: Vec<String> = Quality::ALL
+                .iter()
+                .map(|q| match self.rate {
+                    RateControl::Quality => format!("{}: QP {}", q.label(), q.qp()),
+                    RateControl::Bitrate => {
+                        let bpp = format!("{}", q.bits_per_pixel()).replace('.', tr!(".", ","));
+                        format!("{}: {bpp} {}", q.label(), tr!("bit per pixel and frame", "бит на пиксель и кадр"))
+                    }
+                })
+                .collect();
+            let hint = match self.rate {
+                RateControl::Quality => tr!(
+                    "The quantisation parameter of every frame: lower is better and larger (H.264 takes 0 to 51).",
+                    "Параметр квантования каждого кадра: чем меньше, тем лучше и больше файл (у H.264 от 0 до 51)."
+                ),
+                RateControl::Bitrate => tr!(
+                    "The bitrate is the area times the frame rate times this.",
+                    "Битрейт равен площади области, умноженной на частоту кадров и на это число."
+                ),
+            };
+            let hint = format!("{}
+
+{hint}", steps.join("
+"));
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(!recording, |ui| {
                     let options = Quality::ALL.map(|q| (q, q.label()));
-                    segmented(ui, &mut self.quality, &options);
+                    segmented(ui, &mut self.quality, &options, &hint);
                 });
-                // What the area at this rate and quality comes to.
-                if let Some(estimate) = self.estimate() {
-                    ui.label(RichText::new(estimate).small().weak()).on_hover_text(tr!(
-                        "The most the recording takes: the bitrate given to the encoder, and the file per minute with the sound. A still screen takes less.",
-                        "Наибольший объём записи: битрейт, заданный кодеру, и размер файла за минуту вместе со звуком. Неподвижный экран занимает меньше."
-                    ));
+                // The step chosen, as the encoder takes it.
+                let value = match self.rate {
+                    RateControl::Quality => format!("QP {}", self.quality.qp()),
+                    RateControl::Bitrate => {
+                        let bpp = format!("{}", self.quality.bits_per_pixel()).replace('.', tr!(".", ","));
+                        format!("{bpp} {}", tr!("bit/pixel", "бит/пиксель"))
+                    }
+                };
+                ui.label(RichText::new(value).small().weak()).on_hover_text(&hint);
+            });
+            ui.end_row();
+
+            ui.label(tr!("Bitrate", "Битрейт"));
+            ui.horizontal(|ui| {
+                let hint = tr!(
+                    "By quality: every frame is encoded to the same quality, and the file follows what is on the screen: a still one takes almost nothing, motion as much as it needs.
+Fixed: the encoder is given a bitrate from the area, the frame rate and the quality; the size is known beforehand, and fast motion loses detail.",
+                    "По качеству: каждый кадр кодируется с одинаковым качеством, и размер файла следует за происходящим на экране: неподвижный экран почти ничего не занимает, движение — столько, сколько нужно.
+Заданный: кодеру задаётся битрейт по размеру области, частоте кадров и качеству; размер известен заранее, а при быстром движении теряются детали."
+                );
+                ui.add_enabled_ui(!recording, |ui| {
+                    let options = RateControl::ALL.map(|r| (r, r.label()));
+                    segmented(ui, &mut self.rate, &options, hint);
+                });
+                match self.rate {
+                    // What the area at this rate and quality comes to.
+                    RateControl::Bitrate => {
+                        if let Some(estimate) = self.estimate() {
+                            ui.label(RichText::new(estimate).small().weak()).on_hover_text(tr!(
+                                "The most the recording takes: the bitrate given to the encoder, and the file per minute with the sound. A still screen takes less.",
+                                "Наибольший объём записи: битрейт, заданный кодеру, и размер файла за минуту вместе со звуком. Неподвижный экран занимает меньше."
+                            ));
+                        }
+                    }
+                    RateControl::Quality => {
+                        ui.label(RichText::new(tr!("size follows the motion", "размер зависит от движения")).small().weak());
+                    }
                 }
             });
             ui.end_row();
@@ -1318,7 +1387,8 @@ fn choice(ui: &egui::Ui, selected: bool, text: &str, size: Option<f32>) -> egui:
 }
 
 /// A few values side by side as one control, the current one filled.
-fn segmented<T: Copy + PartialEq>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) {
+/// `hint`, when not empty, is the tooltip of every option.
+fn segmented<T: Copy + PartialEq>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)], hint: &str) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 1.0;
         let last = options.len().saturating_sub(1);
@@ -1331,7 +1401,11 @@ fn segmented<T: Copy + PartialEq>(ui: &mut egui::Ui, value: &mut T, options: &[(
                 se: if i == last { r } else { 0 },
             };
             let button = choice(ui, *value == v, text, None).corner_radius(corner).min_size(Vec2::new(44.0, 0.0));
-            if ui.add(button).clicked() {
+            let mut response = ui.add(button);
+            if !hint.is_empty() {
+                response = response.on_hover_text(hint);
+            }
+            if response.clicked() {
                 *value = v;
             }
         }
