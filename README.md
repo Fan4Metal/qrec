@@ -12,10 +12,10 @@
 
 <p align="center"><b>English</b> | <a href="README.ru.md">Русский</a></p>
 
-qrec records a rectangle of the screen, or a whole display, to an MP4 file: H.264 video encoded by the graphics card, the sound the computer plays as AAC, and the pointer. The window holds the few settings there are, and a global hotkey starts and stops the recording from anywhere.
+qrec records a rectangle of the screen, or a whole display, to an MP4 file: H.264 video encoded by the graphics card, the sound the computer plays as AAC, and the pointer. The window holds the few settings there are, a global hotkey starts and stops the recording from anywhere, and another one opens the area selection.
 
 <p align="center">
-  <img src="images/screenshot.png" width="560" alt="The qrec window: display, proportions, frame rate, quality, sound and pointer, the sound source, folder, hotkey, the area buttons and the Record button">
+  <img src="images/screenshot.png" width="560" alt="The qrec window: display, proportions, frame rate, quality, sound and pointer, the sound source, folder, the two hotkeys, the area buttons and the Record button">
 </p>
 
 *The window of version 0.1.0.*
@@ -29,7 +29,7 @@ qrec records a rectangle of the screen, or a whole display, to an MP4 file: H.26
 - **The pointer** is drawn into the recording, including the inverted I-beam.
 - **Trimming without re-encoding**: the start and the end of a recording are cut off in a window with the frame under the cursor and a timeline; the chosen stretch is copied into a new file as it is, in a moment and without loss of quality.
 - **Three settings**: 30 or 60 frames per second, a quality of three steps (the bitrate follows the size of the area), and whether sound and the pointer are recorded.
-- **A hotkey**: `Ctrl+Alt+R` by default, changed in the window by pressing another combination, or removed.
+- **Hotkeys**: `Ctrl+Alt+R` starts and stops the recording, `Ctrl+Alt+A` opens the area selection; each is changed in the window by pressing another combination, or removed.
 - **An icon in the notification area**: red while a recording runs, with the time recorded in its tooltip; its menu starts and stops the recording, and can leave the program in the notification area alone, without a taskbar button, make the window's cross hide it there, or put the window away when a recording starts.
 - **Nothing of qrec in the recording**: its own windows are kept out of the capture.
 - **Russian and English**: the interface follows the language of Windows, or the one chosen in the About window.
@@ -57,7 +57,8 @@ Requirements: Windows 10 version 2004 or later, 64-bit; the installer does not r
 | Record | **Sound**: the sound, from the source below. **Pointer**: the mouse pointer. |
 | Sound from | **Whole system**: everything the computer plays, at the volume it is played. Or one of the programs that have played sound since they started (those of the Volume Mixer; the ones playing now are shown brighter): only its sound. **Boost**, beside the list, records it at full volume whatever its volume in the mixer; without it the program is recorded as it is heard (see [Sound](#sound)). Two programs of one name (two copies of a browser) are told apart by the folder they are in, `Vivaldi (VP)`. The program is remembered by the path of its executable and must be running when a recording starts; when it runs more than once, the copy that plays at that moment is recorded. |
 | Folder | Where the files go; `Videos` by default. **Open** shows the folder in Explorer. |
-| Hotkey | Starts and stops the recording from any window. A click on **Change**, then a key with `Ctrl`, `Alt` or `Win`, or a function key, sets another one; `Esc` or **Cancel** keeps the current one; the cross beside **Change** removes the hotkey. A combination held by another program is reported as not available. |
+| Record key | Starts and stops the recording from any window; `Ctrl+Alt+R` by default. A click on **Change**, then a key with `Ctrl`, `Alt` or `Win`, or a function key, sets another one; `Esc` or **Cancel** keeps the current one; the cross beside **Change** removes the hotkey. A combination held by another program is reported as not available. |
+| Area key | Opens the area selection from any window, as **Select…** does; `Ctrl+Alt+A` by default, changed and removed in the same way. It does nothing while a recording runs. A window minimised or hidden in the notification area stays so after the selection. A combination given to one of the two hotkeys is taken from the other. |
 
 **Record** starts the recording; while it runs, the button shows the time recorded and stops the recording when clicked. The number of frames skipped, if the computer could not keep up, appears below. A red frame surrounds the area while it is recorded. The file is named by the date and time, `qrec_2026-10-08_16-45-12.mp4`, and after the recording its name appears in the window as a link that shows it in Explorer, with **Trim…** beside it (see [Trimming](#trimming)) and a button with a waste bin that moves the file to the Recycle Bin, for a take that is not worth keeping.
 

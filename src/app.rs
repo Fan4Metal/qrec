@@ -20,7 +20,7 @@ use crate::tray::{self, Tray};
 use crate::win;
 
 /// The window's size in points.
-pub const WINDOW_SIZE: [f32; 2] = [460.0, 406.0];
+pub const WINDOW_SIZE: [f32; 2] = [460.0, 434.0];
 /// The window's corners, painted over a transparent window (as Windows 11
 /// rounds its own).
 pub(crate) const CORNER_RADIUS: f32 = 8.0;
@@ -35,6 +35,7 @@ const AUDIO_BOOST_KEY: &str = "audio_boost";
 const CURSOR_KEY: &str = "cursor";
 const FOLDER_KEY: &str = "folder";
 const HOTKEY_KEY: &str = "hotkey";
+const SELECT_HOTKEY_KEY: &str = "select_hotkey";
 const ASPECT_KEY: &str = "aspect";
 const TASKBAR_KEY: &str = "taskbar";
 const CLOSE_TO_TRAY_KEY: &str = "close_to_tray";
@@ -76,10 +77,10 @@ pub struct App {
     apps_listed: bool,
     cursor: bool,
     folder: PathBuf,
-    /// `None` when the hotkey was removed.
-    chord: Option<Chord>,
-    hotkey: Option<(Hotkey, mpsc::Receiver<()>)>,
-    hotkey_error: Option<String>,
+    /// The hotkey that starts and stops the recording.
+    record_key: GlobalKey,
+    /// The hotkey that opens the area selection.
+    select_key: GlobalKey,
     /// The icon in the notification area; `None` when Windows refused it.
     tray: Option<(Tray, mpsc::Receiver<tray::Command>)>,
     /// The proportions of the next area selected.
@@ -120,8 +121,8 @@ pub struct App {
     trim_replace: bool,
     /// The icon of About, rasterised at the display's pixel density.
     about_icon: Option<egui::TextureHandle>,
-    /// The next key press becomes the hotkey.
-    capturing_hotkey: bool,
+    /// The next key press becomes the hotkey of this action.
+    capturing_hotkey: Option<KeyAction>,
     recorder: Option<Recorder>,
     /// Why the sound of the last recording stopped before it did, shown
     /// beside the file when it did.
@@ -134,6 +135,49 @@ pub struct App {
     /// The window size in pixels and the corner radius its region was
     /// made for (`win::round_window`).
     rounded: Option<(egui::Vec2, i32)>,
+}
+
+/// What a global hotkey does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyAction {
+    Record,
+    Select,
+}
+
+/// A global hotkey: its chord, registered while the program runs.
+#[derive(Default)]
+struct GlobalKey {
+    /// `None` when the hotkey was removed.
+    chord: Option<Chord>,
+    registered: Option<(Hotkey, mpsc::Receiver<()>)>,
+    /// Why Windows refused the chord.
+    error: Option<String>,
+}
+
+impl GlobalKey {
+    /// An empty setting is a removed hotkey; a missing one is `default`.
+    fn from_setting(setting: Option<String>, default: Chord) -> GlobalKey {
+        let chord = match setting {
+            Some(h) if h.is_empty() => None,
+            h => Some(h.and_then(|h| Chord::from_label(&h)).filter(Chord::is_usable).unwrap_or(default)),
+        };
+        GlobalKey { chord, ..GlobalKey::default() }
+    }
+
+    fn register(&mut self, ctx: &egui::Context) {
+        self.registered = None;
+        self.error = None;
+        let Some(chord) = self.chord else { return };
+        match Hotkey::register(chord, ctx.clone()) {
+            Ok(registered) => self.registered = Some(registered),
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// The presses since the last call.
+    fn presses(&self) -> usize {
+        self.registered.as_ref().map_or(0, |(_, rx)| rx.try_iter().count())
+    }
 }
 
 /// The status line.
@@ -174,11 +218,13 @@ impl App {
         let cursor = get(CURSOR_KEY).as_deref() != Some("false");
         let folder = get(FOLDER_KEY).map(PathBuf::from).unwrap_or_else(default_folder);
         let aspect = get(ASPECT_KEY).and_then(|a| Aspect::from_name(&a)).unwrap_or_default();
-        // An empty setting is a removed hotkey; a missing one is the default.
-        let chord = match get(HOTKEY_KEY) {
-            Some(h) if h.is_empty() => None,
-            h => Some(h.and_then(|h| Chord::from_label(&h)).filter(Chord::is_usable).unwrap_or_default()),
-        };
+        let record_key = GlobalKey::from_setting(get(HOTKEY_KEY), Chord::RECORD);
+        let mut select_key = GlobalKey::from_setting(get(SELECT_HOTKEY_KEY), Chord::SELECT);
+        // The recording's chord was set to the selection's default before
+        // the selection had a hotkey: the recording keeps it.
+        if select_key.chord.is_some() && select_key.chord == record_key.chord {
+            select_key.chord = None;
+        }
 
         // The window must not appear in its own recordings.
         let window = {
@@ -211,7 +257,8 @@ impl App {
             apps_listed: false,
             cursor,
             folder,
-            chord,
+            record_key,
+            select_key,
             aspect,
             taskbar,
             close_to_tray,
@@ -226,10 +273,8 @@ impl App {
             editor_move: None,
             trim_replace,
             about_icon: None,
-            hotkey: None,
-            hotkey_error: None,
             tray: Tray::new(cc.egui_ctx.clone()).inspect_err(|e| log::warn!("no tray icon: {e}")).ok(),
-            capturing_hotkey: false,
+            capturing_hotkey: None,
             recorder: None,
             border: None,
             selecting: None,
@@ -238,7 +283,7 @@ impl App {
             window,
             rounded: None,
         };
-        app.register_hotkey(&cc.egui_ctx);
+        app.register_hotkeys(&cc.egui_ctx);
         // Before eframe shows the window, so that no button appears.
         if let (Some(hwnd), true) = (app.window, app.tray_only()) {
             win::set_taskbar_button(hwnd, false, false);
@@ -252,16 +297,18 @@ impl App {
         app
     }
 
-    fn register_hotkey(&mut self, ctx: &egui::Context) {
-        self.hotkey = None;
-        self.hotkey_error = None;
-        let Some(chord) = self.chord else { return };
-        match Hotkey::register(chord, ctx.clone()) {
-            Ok(registered) => {
-                self.hotkey = Some(registered);
-                self.hotkey_error = None;
-            }
-            Err(e) => self.hotkey_error = Some(e),
+    fn register_hotkeys(&mut self, ctx: &egui::Context) {
+        // Both freed first, so a chord moved from one to the other is free.
+        self.record_key.registered = None;
+        self.select_key.registered = None;
+        self.record_key.register(ctx);
+        self.select_key.register(ctx);
+    }
+
+    fn global_key(&mut self, action: KeyAction) -> &mut GlobalKey {
+        match action {
+            KeyAction::Record => &mut self.record_key,
+            KeyAction::Select => &mut self.select_key,
         }
     }
 
@@ -300,14 +347,12 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        let mut presses = 0;
-        if let Some((_, rx)) = &self.hotkey {
-            while rx.try_recv().is_ok() {
-                presses += 1;
-            }
-        }
-        if presses % 2 == 1 && self.selecting.is_none() {
+        if self.record_key.presses() % 2 == 1 && self.selecting.is_none() {
             self.toggle(ctx);
+        }
+        // Not while recording: the area is fixed then, as its buttons are.
+        if self.select_key.presses() > 0 && self.selecting.is_none() && self.recorder.is_none() {
+            self.select_area(ctx);
         }
         // While an area is selected the window stays hidden: the commands
         // wait in their channels until it is done.
@@ -457,10 +502,11 @@ impl App {
 
     /// The selection over the screens, with the window hidden so that it
     /// does not cover what is to be recorded. A hidden window is not
-    /// repainted, so the selection's thread shows it again itself.
+    /// repainted, so the selection's thread shows it again itself. A
+    /// window already out of the way (the hotkey) stays so.
     fn select_area(&mut self, ctx: &egui::Context) {
         self.monitors = display::monitors();
-        let window = self.window;
+        let window = self.window.filter(|&hwnd| win::is_shown(hwnd));
         if let Some(hwnd) = window {
             win::show_window(hwnd, false);
         }
@@ -691,22 +737,28 @@ impl App {
         }
     }
 
-    /// The next key press, while the hotkey is being chosen.
-    fn capture_hotkey(&mut self, ctx: &egui::Context) {
+    /// The next key press, while a hotkey is being chosen. A chord the
+    /// other hotkey has is taken from it.
+    fn capture_hotkey(&mut self, ctx: &egui::Context, action: KeyAction) {
         let events = ctx.input(|i| i.events.clone());
         for event in events {
             if let egui::Event::Key { key, pressed: true, modifiers, .. } = event {
                 if key == egui::Key::Escape {
-                    self.capturing_hotkey = false;
-                    self.register_hotkey(ctx);
+                    self.capturing_hotkey = None;
+                    self.register_hotkeys(ctx);
                     return;
                 }
                 if let Some(chord) = Chord::from_egui(key, modifiers)
                     && chord.is_usable()
                 {
-                    self.chord = Some(chord);
-                    self.capturing_hotkey = false;
-                    self.register_hotkey(ctx);
+                    for other in [&mut self.record_key, &mut self.select_key] {
+                        if other.chord == Some(chord) {
+                            other.chord = None;
+                        }
+                    }
+                    self.global_key(action).chord = Some(chord);
+                    self.capturing_hotkey = None;
+                    self.register_hotkeys(ctx);
                     return;
                 }
             }
@@ -758,8 +810,8 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if self.capturing_hotkey {
-            self.capture_hotkey(&ctx);
+        if let Some(action) = self.capturing_hotkey {
+            self.capture_hotkey(&ctx, action);
         }
         let recording = self.recorder.is_some();
         let busy = recording || self.selecting.is_some();
@@ -875,7 +927,8 @@ impl eframe::App for App {
         storage.set_string(TRIM_REPLACE_KEY, self.trim_replace.to_string());
         storage.set_string(CURSOR_KEY, self.cursor.to_string());
         storage.set_string(FOLDER_KEY, self.folder.display().to_string());
-        storage.set_string(HOTKEY_KEY, self.chord.map(|c| c.label()).unwrap_or_default());
+        storage.set_string(HOTKEY_KEY, self.record_key.chord.map(|c| c.label()).unwrap_or_default());
+        storage.set_string(SELECT_HOTKEY_KEY, self.select_key.chord.map(|c| c.label()).unwrap_or_default());
         storage.set_string(ASPECT_KEY, self.aspect.name().to_owned());
     }
 
@@ -969,43 +1022,75 @@ impl App {
             });
             ui.end_row();
 
-            ui.label(tr!("Hotkey", "Клавиша"));
-            ui.horizontal_wrapped(|ui| {
-                if self.capturing_hotkey {
-                    ui.label(RichText::new(tr!("Press the keys…", "Нажмите клавиши…")).color(ui.visuals().selection.bg_fill));
-                } else if let Some(chord) = self.chord {
-                    ui.label(RichText::new(chord.label()).strong());
-                } else {
-                    ui.weak(tr!("none", "нет"));
-                }
-                let text = if self.capturing_hotkey { tr!("Cancel", "Отмена") } else { tr!("Change", "Изменить") };
-                let button = ui.add_enabled(!recording, egui::Button::new(text)).on_hover_text(tr!(
+            ui.label(tr!("Record key", "Клавиша записи"));
+            self.hotkey_row(
+                ui,
+                ctx,
+                recording,
+                KeyAction::Record,
+                tr!(
                     "Starts and stops the recording from anywhere. Click, then press a key with Ctrl or Alt, or a function key.",
                     "Начинает и останавливает запись из любого окна. Нажмите кнопку, затем клавишу с Ctrl или Alt, или функциональную клавишу."
-                ));
-                if button.clicked() {
-                    self.capturing_hotkey = !self.capturing_hotkey;
-                    if self.capturing_hotkey {
-                        // Free the key while another is chosen.
-                        self.hotkey = None;
-                    } else {
-                        self.register_hotkey(ctx);
-                    }
-                }
-                if self.chord.is_some()
-                    && !self.capturing_hotkey
-                    && ui.add_enabled(!recording, cross_button).on_hover_text(tr!("Remove the hotkey", "Убрать клавишу")).clicked()
-                {
-                    self.chord = None;
-                    self.register_hotkey(ctx);
-                }
-                if let Some(e) = &self.hotkey_error {
-                    // Usually another program (or another qrec) holds the key.
-                    ui.label(RichText::new(tr!("taken by another program", "занята другой программой")).color(ui.visuals().error_fg_color))
-                        .on_hover_text(e);
-                }
-            });
+                ),
+            );
             ui.end_row();
+
+            ui.label(tr!("Area key", "Клавиша области"));
+            self.hotkey_row(
+                ui,
+                ctx,
+                recording,
+                KeyAction::Select,
+                tr!(
+                    "Opens the area selection from anywhere, as Select area… does; not while recording. Click, then press a key with Ctrl or Alt, or a function key.",
+                    "Открывает выделение области из любого окна, как кнопка «Выделить область…»; не во время записи. Нажмите кнопку, затем клавишу с Ctrl или Alt, или функциональную клавишу."
+                ),
+            );
+            ui.end_row();
+        });
+    }
+
+    /// A hotkey, the button that changes it and the cross that removes it.
+    fn hotkey_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, recording: bool, action: KeyAction, hint: &str) {
+        let capturing = self.capturing_hotkey == Some(action);
+        ui.horizontal_wrapped(|ui| {
+            let chord = self.global_key(action).chord;
+            if capturing {
+                ui.label(RichText::new(tr!("Press the keys…", "Нажмите клавиши…")).color(ui.visuals().selection.bg_fill));
+            } else if let Some(chord) = chord {
+                ui.label(RichText::new(chord.label()).strong());
+            } else {
+                ui.weak(tr!("none", "нет"));
+            }
+            let text = if capturing { tr!("Cancel", "Отмена") } else { tr!("Change", "Изменить") };
+            let button = ui.add_enabled(!recording, egui::Button::new(text)).on_hover_text(hint);
+            if button.clicked() {
+                if capturing {
+                    self.capturing_hotkey = None;
+                    self.register_hotkeys(ctx);
+                } else {
+                    // Both keys freed while one is chosen, so either can
+                    // be pressed.
+                    self.capturing_hotkey = Some(action);
+                    self.record_key.registered = None;
+                    self.select_key.registered = None;
+                }
+            }
+            if chord.is_some()
+                && !capturing
+                && ui.add_enabled(!recording, cross_button).on_hover_text(tr!("Remove the hotkey", "Убрать клавишу")).clicked()
+            {
+                self.global_key(action).chord = None;
+                // Not while the other is being chosen: its keys stay free.
+                if self.capturing_hotkey.is_none() {
+                    self.register_hotkeys(ctx);
+                }
+            }
+            if let Some(e) = &self.global_key(action).error {
+                // Usually another program (or another qrec) holds the key.
+                ui.label(RichText::new(tr!("taken by another program", "занята другой программой")).color(ui.visuals().error_fg_color))
+                    .on_hover_text(e);
+            }
         });
     }
 

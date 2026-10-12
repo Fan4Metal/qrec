@@ -1,5 +1,5 @@
-//! The global hotkey that starts and stops the recording, and the key
-//! combination it is.
+//! The global hotkeys (one starts and stops the recording, one opens the
+//! area selection), and the key combinations they are.
 
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, mpsc};
@@ -21,13 +21,12 @@ pub struct Chord {
     pub key: u32,
 }
 
-impl Default for Chord {
-    fn default() -> Chord {
-        Chord { ctrl: true, alt: true, shift: false, win: false, key: b'R' as u32 }
-    }
-}
-
 impl Chord {
+    /// The recording's by default.
+    pub const RECORD: Chord = Chord { ctrl: true, alt: true, shift: false, win: false, key: b'R' as u32 };
+    /// The area selection's by default.
+    pub const SELECT: Chord = Chord { ctrl: true, alt: true, shift: false, win: false, key: b'A' as u32 };
+
     /// As shown in the window and kept in the settings: `Ctrl+Alt+R`.
     pub fn label(&self) -> String {
         let mut parts = Vec::new();
@@ -207,6 +206,7 @@ mod tests {
         assert_eq!(Chord::from_label("Ctrl+"), None);
         assert!(!Chord::from_label("R").unwrap().is_usable());
         assert!(!Chord::from_label("Shift+R").unwrap().is_usable());
-        assert_eq!(Chord::default().label(), "Ctrl+Alt+R");
+        assert_eq!(Chord::RECORD.label(), "Ctrl+Alt+R");
+        assert_eq!(Chord::SELECT.label(), "Ctrl+Alt+A");
     }
 }

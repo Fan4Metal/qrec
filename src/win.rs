@@ -272,6 +272,13 @@ pub fn show_window(hwnd: isize, show: bool) {
     }
 }
 
+/// Whether the window is on the screen: visible and not minimised.
+pub fn is_shown(hwnd: isize) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
+    let hwnd = HWND(hwnd as *mut _);
+    unsafe { IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() }
+}
+
 /// Whether the window is minimised.
 pub fn is_minimised(hwnd: isize) -> bool {
     unsafe { windows::Win32::UI::WindowsAndMessaging::IsIconic(HWND(hwnd as *mut _)).as_bool() }
