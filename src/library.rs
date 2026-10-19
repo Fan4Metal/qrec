@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use egui::{RichText, Sense, Vec2};
 
-use crate::app::{CORNER_RADIUS, FileAction, TitleButton, file_buttons, file_link, thumbnail, title_button};
+use crate::app::{CORNER_RADIUS, FileAction, OwnWindow, TitleButton, file_buttons, file_link, thumbnail, title_button};
 use crate::recordings::{self, Recordings};
 use crate::win;
 
@@ -26,9 +26,9 @@ pub const MIN_WINDOW_SIZE: [f32; 2] = [440.0, 320.0];
 const PICTURE: Vec2 = Vec2::new(224.0, 126.0);
 
 pub struct Library {
-    /// The window's handle once it exists (found by its title), and the
+    /// The window, made hidden and shown once found by its title, and the
     /// size and radius its corners were last rounded for.
-    window: Option<isize>,
+    own: OwnWindow,
     rounded: Option<(Vec2, i32)>,
     /// Clear was pressed and waits for the answer.
     confirm: bool,
@@ -36,12 +36,12 @@ pub struct Library {
 
 impl Library {
     pub fn new() -> Library {
-        Library { window: None, rounded: None, confirm: false }
+        Library { own: OwnWindow::default(), rounded: None, confirm: false }
     }
 
     /// The window's handle, once it has been found.
     pub fn window(&self) -> Option<isize> {
-        self.window
+        self.own.hwnd()
     }
 
     /// The window's title: what the taskbar shows, and how the window is
@@ -168,12 +168,10 @@ impl Library {
     }
 
     /// Clips the window to rounded corners, as the trimming window does
-    /// (`Editor::round_corners`).
+    /// (`Editor::round_corners`); docked by the app in the frame it is
+    /// found, while still cloaked.
     fn round_corners(&mut self, ctx: &egui::Context) {
-        if self.window.is_none() {
-            self.window = win::find_window(&Self::title());
-        }
-        let Some(hwnd) = self.window else { return };
+        let Some(hwnd) = self.own.follow(ctx, &Self::title()) else { return };
         if win::strip_caption(hwnd) {
             self.rounded = None;
         }

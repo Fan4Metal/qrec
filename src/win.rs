@@ -87,11 +87,60 @@ fn has_recycle_bin(path: &std::path::Path) -> bool {
     unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) == DRIVE_FIXED && SHQueryRecycleBinW(PCWSTR(root.as_ptr()), &mut info).is_ok() }
 }
 
-/// The handle of the top-level window titled `title`, if there is one.
-pub fn find_window(title: &str) -> Option<isize> {
-    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
-    let title = wide(title);
-    unsafe { FindWindowW(None, PCWSTR(title.as_ptr())) }.ok().map(|h| h.0 as isize)
+/// The top-level window of this thread titled `title`, hidden or not: a
+/// viewport of the program's (eframe gives no handle for one), made hidden
+/// (`app::OwnWindow`). Not "the thread's window that is not the main one":
+/// the thread has hidden windows of its own (the IME's), and two viewports.
+pub fn thread_window(title: &str) -> Option<isize> {
+    use windows::Win32::Foundation::LPARAM;
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{EnumThreadWindows, GetWindowTextLengthW, GetWindowTextW};
+    use windows::core::BOOL;
+    struct Search {
+        title: Vec<u16>,
+        found: Option<isize>,
+    }
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: `lparam` is the `Search` passed below, alive during the call.
+        let search = unsafe { &mut *(lparam.0 as *mut Search) };
+        let len = unsafe { GetWindowTextLengthW(hwnd) };
+        if len as usize == search.title.len() {
+            let mut text = vec![0u16; len as usize + 1];
+            let n = unsafe { GetWindowTextW(hwnd, &mut text) };
+            if text[..n.max(0) as usize] == search.title[..] {
+                search.found = Some(hwnd.0 as isize);
+                return false.into();
+            }
+        }
+        true.into()
+    }
+    if title.is_empty() {
+        return None;
+    }
+    let mut search = Search { title: title.encode_utf16().collect(), found: None };
+    unsafe {
+        let _ = EnumThreadWindows(GetCurrentThreadId(), Some(visit), LPARAM(&raw mut search as isize));
+    }
+    search.found
+}
+
+/// Hides the window from the screen while it goes on working and painting
+/// (`DWMWA_CLOAK`), or shows it again: a new window is cloaked until it has
+/// painted, since Windows shows it white until its first frame reaches DWM.
+pub fn cloak(hwnd: isize, on: bool) {
+    // dwmapi is declared by hand, to spare another feature of `windows`.
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(hwnd: isize, attribute: u32, value: *const core::ffi::c_void, size: u32) -> i32;
+    }
+    const DWMWA_CLOAK: u32 = 13;
+    let value = i32::from(on);
+    unsafe { DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, (&raw const value).cast(), 4) };
+}
+
+/// Whether the window is visible (shown, minimised or not, cloaked or not).
+pub fn is_visible(hwnd: isize) -> bool {
+    unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(HWND(hwnd as *mut _)).as_bool() }
 }
 
 /// Whether Windows shows its interface in Russian (primary language of

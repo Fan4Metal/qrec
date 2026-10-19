@@ -10,7 +10,7 @@ use std::thread::JoinHandle;
 
 use egui::{Color32, Key, RichText, Sense, Vec2};
 
-use crate::app::{CORNER_RADIUS, TitleButton, title_button};
+use crate::app::{CORNER_RADIUS, OwnWindow, TitleButton, title_button};
 use crate::playback::Playback;
 use crate::trim::{self, Frame, Info, Picture, Progress, SECOND};
 use crate::win;
@@ -103,9 +103,9 @@ pub struct Editor {
     readers: Vec<JoinHandle<()>>,
     ctx: egui::Context,
     viewport: egui::ViewportId,
-    /// The window's handle once it exists (found by its title), and the
+    /// The window, made hidden and shown once found by its title, and the
     /// size and radius its corners were last rounded for.
-    window: Option<isize>,
+    own: OwnWindow,
     rounded: Option<(Vec2, i32)>,
 }
 
@@ -200,7 +200,7 @@ impl Editor {
             readers,
             ctx: editor_ctx,
             viewport,
-            window: None,
+            own: OwnWindow::default(),
             rounded: None,
         }
     }
@@ -280,13 +280,11 @@ impl Editor {
 
     /// Clips the window to rounded corners (`win::round_window`), again
     /// whenever its size changes; the window is found by its title once
-    /// it exists. The caption is taken out of its style first, or Windows
-    /// would paint its own title bar over the row (`win::strip_caption`).
+    /// it exists, still hidden and cloaked (`OwnWindow`). The caption is
+    /// taken out of its style first, or Windows would paint its own title
+    /// bar over the row (`win::strip_caption`).
     fn round_corners(&mut self, ctx: &egui::Context) {
-        if self.window.is_none() {
-            self.window = win::find_window(&self.title());
-        }
-        let Some(hwnd) = self.window else { return };
+        let Some(hwnd) = self.own.follow(ctx, &self.title()) else { return };
         if win::strip_caption(hwnd) {
             self.rounded = None;
         }
@@ -299,7 +297,7 @@ impl Editor {
 
     /// The window's handle, once it has been found.
     pub fn window(&self) -> Option<isize> {
-        self.window
+        self.own.hwnd()
     }
 
     /// Results from the threads.

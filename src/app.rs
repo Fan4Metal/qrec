@@ -165,7 +165,16 @@ pub struct App {
     /// The window size in pixels and the corner radius its region was
     /// made for (`win::round_window`).
     rounded: Option<(egui::Vec2, i32)>,
+    /// The window is cloaked at start until it has painted a few frames
+    /// (Windows shows it white until its first frame reaches DWM): the
+    /// time it is shown anyway, and the frame it was cloaked in.
+    cloak: Option<(std::time::Instant, u64)>,
 }
+
+/// Frames the window paints, cloaked, before it is shown at start.
+const PAINTED_TO_SHOW: u64 = 3;
+/// How long the window stays cloaked at most.
+const UNCLOAK_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// What a global hotkey does.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -275,8 +284,13 @@ impl App {
                 _ => None,
             }
         };
+        // Cloaked while it is still hidden (eframe shows it after its first
+        // frame), until it has painted (`uncloak`).
+        let mut cloak = None;
         if let Some(hwnd) = window {
             win::exclude_from_capture(hwnd);
+            win::cloak(hwnd, true);
+            cloak = Some((std::time::Instant::now() + UNCLOAK_TIMEOUT, cc.egui_ctx.cumulative_frame_nr()));
             log::debug!("window at {:?}", win::window_rect(hwnd));
         }
 
@@ -332,6 +346,7 @@ impl App {
             audio_warning: None,
             window,
             rounded: None,
+            cloak,
         };
         app.register_hotkeys(&cc.egui_ctx);
         app.relist();
@@ -344,6 +359,10 @@ impl App {
         // style had not settled.
         if let Some(path) = open {
             app.place_editor(path, &cc.egui_ctx);
+        }
+        // QREC_RECORDINGS=1: the recordings window at start (GUI checks).
+        if std::env::var_os("QREC_RECORDINGS").is_some() {
+            app.library = Some(Library::new());
         }
         app
     }
@@ -737,8 +756,9 @@ impl App {
         }
         self.editor_created = true;
         // Styled like the main window: its own title row and rounded
-        // corners over a transparent window.
-        let mut builder = egui::ViewportBuilder::default()
+        // corners over a transparent window. Made hidden, shown once it
+        // has painted (`OwnWindow`).
+        let mut builder = OwnWindow::builder(egui::ViewportBuilder::default())
             .with_title(editor.title())
             .with_inner_size(self.editor_placement.map_or(crate::editor::WINDOW_SIZE.into(), |r| r.size()))
             .with_min_inner_size(crate::editor::MIN_WINDOW_SIZE)
@@ -764,7 +784,8 @@ impl App {
             (editor.ui(ui), rect)
         });
         // The guessed position was off (the display there has another
-        // scale than the main window's): moved there in pixels, once.
+        // scale than the main window's): moved there in pixels, once, in
+        // the frame the window is found, before it is seen.
         if let (Some((x, y)), Some(hwnd)) = (self.editor_move, editor.window()) {
             self.editor_move = None;
             let (left, top, _, _) = win::window_rect(hwnd);
@@ -818,6 +839,20 @@ impl App {
             let elapsed = recorder.started.elapsed().as_secs();
             format!("{:02}:{:02}:{:02}", elapsed / 3600, elapsed / 60 % 60, elapsed % 60)
         })
+    }
+
+    /// Shows the window cloaked at start (`App::new`) once it has painted a
+    /// few frames, or after `UNCLOAK_TIMEOUT` whatever it did.
+    fn uncloak(&mut self, ctx: &egui::Context) {
+        let Some((until, frame)) = self.cloak else { return };
+        if ctx.cumulative_frame_nr() >= frame + PAINTED_TO_SHOW || std::time::Instant::now() >= until {
+            if let Some(hwnd) = self.window {
+                win::cloak(hwnd, false);
+            }
+            self.cloak = None;
+        } else {
+            ctx.request_repaint();
+        }
     }
 
     /// Clips the window to the painted rounded background, again when its
@@ -1004,6 +1039,7 @@ impl eframe::App for App {
     /// the tray and a failed recording are attended to all the same, so a
     /// recording can be stopped while the window is out of the way.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.uncloak(ctx);
         self.shown_at_start = self.window.is_none_or(win::is_shown);
         self.poll(ctx);
         if self.listed.elapsed() > Duration::from_secs(5) {
@@ -1492,7 +1528,7 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
             ctx.request_repaint();
             return;
         }
-        let mut builder = egui::ViewportBuilder::default()
+        let mut builder = OwnWindow::builder(egui::ViewportBuilder::default())
             .with_title(Library::title())
             .with_inner_size(crate::library::WINDOW_SIZE)
             .with_min_inner_size(crate::library::MIN_WINDOW_SIZE)
@@ -1512,7 +1548,8 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
         let (library, recordings) = (&mut self.library, &self.recordings);
         let Some(library) = library else { return };
         let close = ctx.show_viewport_immediate(library_viewport(), builder, |ui, _class| library.ui(ui, recordings, left, &mut actions));
-        // Docked once its window exists (found by its title).
+        // Docked once its window exists (found by its title), in the frame
+        // it is found, while it is still hidden and cloaked.
         if self.dock.is_none()
             && let (Some(main), Some(side)) = (self.window, library.window())
         {
@@ -1589,6 +1626,90 @@ fn editor_viewport() -> egui::ViewportId {
 
 fn library_viewport() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("library")
+}
+
+/// A window of the program's own (the trimming window, the recordings
+/// window: immediate viewports) shown without a white flash: Windows shows
+/// a new window white until its first OpenGL frame reaches DWM. It is made
+/// hidden (`builder`), found by its title among this thread's windows
+/// (`win::thread_window`: eframe gives no handle for a viewport), cloaked
+/// (`win::cloak`), given what the caller does with it (caption, region,
+/// place, dock) in the same frame, shown, and uncloaked once it has
+/// painted a few frames.
+#[derive(Default)]
+pub(crate) struct OwnWindow {
+    /// The window, once found.
+    hwnd: Option<isize>,
+    /// Frames painted since it was found, and the frames it was looked for.
+    painted: u32,
+    looked: u32,
+}
+
+impl OwnWindow {
+    /// Frames painted before the window is uncloaked.
+    const PAINTED: u32 = 3;
+    /// Frames it is looked for before it is shown as it is.
+    const LOOKED: u32 = 10;
+
+    /// The builder of a window made hidden. Passed every frame: egui sends
+    /// only what changed, so the window is not hidden again once shown.
+    pub fn builder(builder: egui::ViewportBuilder) -> egui::ViewportBuilder {
+        builder.with_visible(false)
+    }
+
+    /// Each frame inside the viewport's closure (`ctx` is the viewport's):
+    /// finds the window titled `title`, cloaks and shows it, uncloaks it
+    /// once it has painted. Its handle, once found.
+    pub fn follow(&mut self, ctx: &egui::Context, title: &str) -> Option<isize> {
+        let more = || {
+            ctx.request_repaint();
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        };
+        match self.hwnd {
+            None => {
+                self.looked += 1;
+                self.hwnd = win::thread_window(title);
+                match self.hwnd {
+                    // Shown already: the trimming window's viewport keeps
+                    // its window when another file replaces the first.
+                    Some(hwnd) if win::is_visible(hwnd) => self.painted = Self::PAINTED,
+                    Some(hwnd) => {
+                        win::cloak(hwnd, true);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    }
+                    // Not found: shown as it is, and still looked for (its
+                    // corners).
+                    None if self.looked == Self::LOOKED => ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true)),
+                    None => {}
+                }
+                if self.looked <= Self::LOOKED {
+                    more();
+                }
+            }
+            Some(hwnd) if self.painted < Self::PAINTED => {
+                // eframe drops a viewport's commands in a pass painted
+                // outside winit's event handlers (the main window
+                // minimised meanwhile): asked again until it is shown, and
+                // the frames counted from then.
+                if win::is_visible(hwnd) {
+                    self.painted += 1;
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                }
+                if self.painted == Self::PAINTED {
+                    win::cloak(hwnd, false);
+                }
+                more();
+            }
+            Some(_) => {}
+        }
+        self.hwnd
+    }
+
+    /// The window's handle, once it has been found.
+    pub fn hwnd(&self) -> Option<isize> {
+        self.hwnd
+    }
 }
 
 /// The height of the area buttons and of the record button.
