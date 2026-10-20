@@ -1954,11 +1954,25 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon) -> egui::Response {
     let painter = ui.painter();
     match icon {
         Icon::Scissors => {
-            // Two rings below, the blades crossing above them.
-            painter.circle_stroke(p(-3.0, 3.5), 2.2 * k, line);
-            painter.circle_stroke(p(3.0, 3.5), 2.2 * k, line);
-            painter.line_segment([p(-1.8, 1.6), p(3.5, -6.0)], line);
-            painter.line_segment([p(1.8, 1.6), p(-3.5, -6.0)], line);
+            // Two rings on the left, a handle from each crossing the other
+            // in the middle into a solid blade pointing right, rounded on
+            // its outer edge at the tip.
+            let ring = egui::Stroke::new(1.4 * k, colour);
+            let handle = egui::Stroke::new(1.3 * k, colour);
+            let blade = [(-1.1, -0.9), (5.1, -5.15), (5.9, -5.2), (6.5, -4.8), (6.8, -4.2), (6.8, -3.8), (1.2, 0.1)];
+            for side in [-1.0f32, 1.0] {
+                let centre = Vec2::new(-4.6, 3.6 * side);
+                painter.circle_stroke(p(centre.x, centre.y), 1.6 * k, ring);
+                let end = Vec2::new(0.6, -0.5 * side);
+                let start = centre + (end - centre).normalized() * 1.6;
+                painter.line_segment([p(start.x, start.y), p(end.x, end.y)], handle);
+                // Clockwise on the screen: mirrored, the points go the other way.
+                let mut points: Vec<egui::Pos2> = blade.iter().map(|&(x, y)| p(x, y * side)).collect();
+                if side < 0.0 {
+                    points.reverse();
+                }
+                painter.add(egui::Shape::convex_polygon(points, colour, egui::Stroke::NONE));
+            }
         }
         Icon::Trash => {
             // The handle, the lid, the body narrowing downwards, two ribs.
