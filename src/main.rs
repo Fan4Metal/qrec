@@ -15,6 +15,7 @@ mod i18n;
 mod app;
 mod audio;
 mod capture;
+mod clicks;
 mod cli;
 mod convert;
 mod cursor;

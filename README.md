@@ -26,7 +26,7 @@ qrec records a rectangle of the screen, or a whole display, to an MP4 file: H.26
 - **Hardware encoding**: H.264 by the NVIDIA, Intel or AMD encoder of the graphics card through Media Foundation, with Microsoft's software encoder as the fallback; frames go from the screen to the encoder without leaving the graphics card.
 - **The sound of the computer without "Stereo Mix"**: whatever is played is captured through WASAPI loopback and written as AAC; no virtual cable or driver is needed.
 - **The sound of one program**: instead of the whole system, the sound of a single program can be recorded, and with **Boost** at full volume, whatever its volume in the Volume Mixer.
-- **The pointer** is drawn into the recording, including the inverted I-beam.
+- **The pointer** is drawn into the recording, including the inverted I-beam, and its clicks can be shown as coloured rings.
 - **Trimming without re-encoding**: the start and the end of a recording are cut off in a window with the frame under the cursor and a timeline; the chosen stretch is copied into a new file as it is, in a moment and without loss of quality.
 - **Few settings**: 30 or 60 frames per second, a quality of three steps, a bitrate that follows what is on the screen or one fixed beforehand, and whether sound and the pointer are recorded.
 - **Hotkeys**: `Ctrl+Alt+R` starts and stops the recording, `Ctrl+Alt+A` opens the area selection; each is changed in the window by pressing another combination, or removed.
@@ -55,7 +55,7 @@ Requirements: Windows 10 version 2004 or later, 64-bit; the installer does not r
 | Frame rate | 30 or 60 frames per second. A still screen costs nothing extra: the last image is repeated. |
 | Quality | Low, Medium or High. With the bitrate **By quality**, the quantisation parameter of every frame (30, 26 or 22); with a **Fixed** bitrate, about 0.05, 0.1 or 0.2 bits per pixel and frame. |
 | Bitrate | **By quality** (the default): every frame is encoded to the same quality, and the file follows what is on the screen: a still screen takes almost nothing, fast motion as much as it needs. **Fixed**: the encoder is given a bitrate from the area, the frame rate and the quality; 1920×1080 at 30 frames per second comes to about 3, 6 or 12 Mbit/s, and the window shows the most the chosen area takes, in Mbit/s and in megabytes per minute with the sound. The size is then known beforehand, and fast motion loses detail. An encoder that does not accept a constant quality records at the fixed bitrate, which the status line mentions when the recording starts. |
-| Record | **Sound**: the sound, from the source below. **Pointer**: the mouse pointer. |
+| Record | **Sound**: the sound, from the source below. **Pointer**: the mouse pointer. **Clicks** (with the pointer): a disc under the pointer while a mouse button is held and a ring that spreads and fades from each press, yellow for the left button and blue for the right one; off by default. |
 | Sound from | **Whole system**: everything the computer plays, at the volume it is played. Or one of the programs that have played sound since they started (those of the Volume Mixer; the ones playing now are shown brighter): only its sound. **Boost**, beside the list, records it at full volume whatever its volume in the mixer; without it the program is recorded as it is heard (see [Sound](#sound)). Two programs of one name (two copies of a browser) are told apart by the folder they are in, `Vivaldi (VP)`. The program is remembered by the path of its executable and must be running when a recording starts; when it runs more than once, the copy that plays at that moment is recorded. |
 | Folder | Where the files go; `Videos` by default. **Open** shows the folder in Explorer. |
 | Record key | Starts and stops the recording from any window; `Ctrl+Alt+R` by default. A click on **Change**, then a key with `Ctrl`, `Alt` or `Win`, or a function key, sets another one; `Esc` or **Cancel** keeps the current one; the cross beside **Change** removes the hotkey. A combination held by another program is reported as not available. |
@@ -103,7 +103,7 @@ The audio and the video share one clock, the performance counter of Windows: a p
 ## Command line
 
 ```
-qrec.exe --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality low|medium|high] [--no-audio | --audio-app NAME.exe [--no-boost]] [--no-cursor] [--countdown N] [--pause FROM-TO] [--out FILE]
+qrec.exe --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality low|medium|high] [--no-audio | --audio-app NAME.exe [--no-boost]] [--no-cursor | --clicks] [--countdown N] [--pause FROM-TO] [--out FILE]
 qrec.exe --cut FILE --from SECONDS --to SECONDS [--out FILE]
 qrec.exe --info FILE
 qrec.exe FILE.mp4

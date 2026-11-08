@@ -1,12 +1,13 @@
 //! The pointer drawn into the frame, as Desktop Duplication reports it: a
 //! colour shape blended over the frame, or a monochrome or masked one,
 //! whose pixels may invert or XOR what is under them. A small pixel
-//! shader does it over the patch of the frame under the pointer.
+//! shader does it over the patch of the frame under the pointer; another
+//! draws the clicks (`clicks.rs`) under it the same way.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, ID3DBlob};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BOX, D3D11_COMPARISON_NEVER, D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_SAMPLER_DESC, D3D11_TEXTURE_ADDRESS_CLAMP,
+    D3D11_BIND_CONSTANT_BUFFER, D3D11_BUFFER_DESC, D3D11_USAGE_DEFAULT, ID3D11Buffer, D3D11_BOX, D3D11_COMPARISON_NEVER, D3D11_FILTER_MIN_MAG_MIP_POINT, D3D11_SAMPLER_DESC, D3D11_TEXTURE_ADDRESS_CLAMP,
     D3D11_VIEWPORT, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView, ID3D11SamplerState,
     ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
 };
@@ -18,6 +19,7 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::core::{PCSTR, Result, s};
 
 use crate::capture::{Cursor, CursorShape, create_texture};
+use crate::clicks::Button;
 use crate::region::Rect;
 
 const SHADERS: &str = r#"
@@ -57,7 +59,31 @@ float4 ps_mask(Vertex v) : SV_Target {
     }
     return float4(d.rgb, 1);
 }
+
+// A click: a ring (or a disc, with the inner radius below 0) in a colour
+// over the patch, radii as fractions of half the patch, smooth at a pixel.
+cbuffer Ring : register(b0) { float4 colour; float4 ring; };
+
+float4 ps_ring(Vertex v) : SV_Target {
+    float4 d = under.Sample(point_sampler, v.uv);
+    float r = length(v.uv - 0.5) * 2;
+    float edge = fwidth(r);
+    float a = smoothstep(ring.x - edge, ring.x + edge, r) * (1 - smoothstep(ring.y - edge, ring.y + edge, r));
+    return float4(lerp(d.rgb, colour.rgb, a * ring.z), 1);
+}
 "#;
+
+/// How long the ring of a press grows and fades, 100 ns units.
+const RING_TIME: i64 = 4_000_000;
+
+/// The colour of the clicks of a button: yellow for the left, blue for
+/// the right.
+fn click_colour(button: Button) -> [f32; 4] {
+    match button {
+        Button::Left => [1.0, 0.78, 0.0, 1.0],
+        Button::Right => [0.2, 0.6, 1.0, 1.0],
+    }
+}
 
 /// Alpha values the shaders read as instructions (see `ps_mask`).
 const INVERT: u8 = 128;
@@ -78,6 +104,11 @@ pub struct CursorDrawer {
     /// A shape that could not be drawn (a type unknown here), so that it
     /// is not tried again each frame.
     refused: Option<u64>,
+    /// The clicks' shader, its parameters, and a patch for what lies under
+    /// a ring, made on the first click.
+    ring: ID3D11PixelShader,
+    ring_buffer: ID3D11Buffer,
+    ring_patch: Option<(u32, ID3D11Texture2D, ID3D11ShaderResourceView)>,
 }
 
 /// The current pointer shape on the GPU, with a patch texture of its
@@ -98,11 +129,21 @@ impl CursorDrawer {
         let vs = compile(s!("vs"), s!("vs_4_0"))?;
         let blend = compile(s!("ps_blend"), s!("ps_4_0"))?;
         let mask = compile(s!("ps_mask"), s!("ps_4_0"))?;
+        let ring = compile(s!("ps_ring"), s!("ps_4_0"))?;
         let (mut vertex, mut blend_shader, mut mask_shader, mut sampler, mut target_view) = (None, None, None, None, None);
+        let (mut ring_shader, mut ring_buffer) = (None, None);
         unsafe {
             device.CreateVertexShader(bytecode(&vs), None, Some(&mut vertex))?;
             device.CreatePixelShader(bytecode(&blend), None, Some(&mut blend_shader))?;
             device.CreatePixelShader(bytecode(&mask), None, Some(&mut mask_shader))?;
+            device.CreatePixelShader(bytecode(&ring), None, Some(&mut ring_shader))?;
+            let desc = D3D11_BUFFER_DESC {
+                ByteWidth: 32,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                ..Default::default()
+            };
+            device.CreateBuffer(&desc, None, Some(&mut ring_buffer))?;
             let desc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
                 AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
@@ -131,7 +172,73 @@ impl CursorDrawer {
             height,
             shape: None,
             refused: None,
+            ring: ring_shader.unwrap(),
+            ring_buffer: ring_buffer.unwrap(),
+            ring_patch: None,
         })
+    }
+
+    /// Draws the clicks of `state` as they look at `now`: a disc under the
+    /// pointer while a button is held, and a ring growing and fading from
+    /// each press. Positions are on the virtual screen, `origin` is the
+    /// area's corner there. Called before `draw`, so the pointer is on top.
+    pub fn draw_clicks(&mut self, state: &crate::clicks::State, now: i64, origin: (i32, i32)) -> Result<()> {
+        // The size of the pointer's shape follows the display's scale
+        // (32 px at 100 %): the rings follow it.
+        let radius = self.shape.as_ref().map_or(32, |s| s.width.clamp(32, 128));
+        if let Some(button) = state.held {
+            let mut colour = click_colour(button);
+            colour[3] = 1.0;
+            self.ring_pass(state.x - origin.0, state.y - origin.1, radius, colour, [-1.0, 0.45, 0.35, 0.0])?;
+        }
+        for press in &state.presses {
+            let age = now - press.time;
+            if !(0..RING_TIME).contains(&age) {
+                continue;
+            }
+            let k = age as f32 / RING_TIME as f32;
+            let inner = 0.3 + 0.55 * k;
+            self.ring_pass(press.x - origin.0, press.y - origin.1, radius, click_colour(press.button), [inner, inner + 0.14, 0.85 * (1.0 - k), 0.0])?;
+        }
+        Ok(())
+    }
+
+    /// One ring of `radius` around `(x, y)` in the frame.
+    fn ring_pass(&mut self, x: i32, y: i32, radius: u32, colour: [f32; 4], ring: [f32; 4]) -> Result<()> {
+        let side = radius * 2;
+        if self.ring_patch.as_ref().map(|p| p.0) != Some(side) {
+            let texture = create_texture(&self.device, side, side, DXGI_FORMAT_B8G8R8A8_UNORM)?;
+            let mut view = None;
+            unsafe { self.device.CreateShaderResourceView(&texture, None, Some(&mut view))? };
+            self.ring_patch = Some((side, texture, view.unwrap()));
+        }
+        let Some((_, patch, patch_view)) = &self.ring_patch else { return Ok(()) };
+        let (left, top) = (x - radius as i32, y - radius as i32);
+        let rect = Rect { left, top, right: left + side as i32, bottom: top + side as i32 };
+        let frame = Rect { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 };
+        let Some(visible) = rect.intersect(&frame) else { return Ok(()) };
+        let source = D3D11_BOX { left: visible.left as u32, top: visible.top as u32, front: 0, right: visible.right as u32, bottom: visible.bottom as u32, back: 1 };
+        let viewport = D3D11_VIEWPORT { TopLeftX: left as f32, TopLeftY: top as f32, Width: side as f32, Height: side as f32, MinDepth: 0.0, MaxDepth: 1.0 };
+        let params: [f32; 8] = [colour[0], colour[1], colour[2], colour[3], ring[0], ring[1], ring[2], ring[3]];
+        let context = &self.context;
+        unsafe {
+            context.UpdateSubresource(&self.ring_buffer, 0, None, params.as_ptr().cast(), 0, 0);
+            context.CopySubresourceRegion(patch, 0, (visible.left - left) as u32, (visible.top - top) as u32, 0, &self.target, 0, Some(&source));
+            context.OMSetRenderTargets(Some(&[Some(self.target_view.clone())]), None);
+            context.RSSetViewports(Some(&[viewport]));
+            context.IASetInputLayout(None);
+            context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            context.VSSetShader(&self.vertex, None);
+            context.PSSetShader(&self.ring, None);
+            context.PSSetConstantBuffers(0, Some(&[Some(self.ring_buffer.clone())]));
+            context.PSSetShaderResources(0, Some(&[None, Some(patch_view.clone())]));
+            context.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            context.Draw(4, 0);
+            context.PSSetShaderResources(0, Some(&[None, None]));
+            context.PSSetConstantBuffers(0, Some(&[None]));
+            context.OMSetRenderTargets(None, None);
+        }
+        Ok(())
     }
 
     /// Draws the pointer, whose position is given relative to `origin`

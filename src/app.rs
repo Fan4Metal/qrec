@@ -37,6 +37,7 @@ const AUDIO_KEY: &str = "audio";
 const AUDIO_APP_KEY: &str = "audio_app";
 const AUDIO_BOOST_KEY: &str = "audio_boost";
 const CURSOR_KEY: &str = "cursor";
+const CLICKS_KEY: &str = "clicks";
 const FOLDER_KEY: &str = "folder";
 const HOTKEY_KEY: &str = "hotkey";
 const SELECT_HOTKEY_KEY: &str = "select_hotkey";
@@ -87,6 +88,8 @@ pub struct App {
     /// listed once each time it opens.
     apps_listed: bool,
     cursor: bool,
+    /// Whether the clicks are drawn under the pointer.
+    clicks: bool,
     folder: PathBuf,
     /// The latest recordings in `folder`, for the list and the tray.
     recordings: Recordings,
@@ -285,6 +288,7 @@ impl App {
         updates.start_if_due(&cc.egui_ctx);
         crate::i18n::set_lang(lang.resolve());
         let cursor = get(CURSOR_KEY).as_deref() != Some("false");
+        let clicks = get(CLICKS_KEY).as_deref() == Some("true");
         let folder = get(FOLDER_KEY).map(PathBuf::from).unwrap_or_else(default_folder);
         let aspect = get(ASPECT_KEY).and_then(|a| Aspect::from_name(&a)).unwrap_or_default();
         let record_key = GlobalKey::from_setting(get(HOTKEY_KEY), Chord::RECORD);
@@ -331,6 +335,7 @@ impl App {
             apps,
             apps_listed: false,
             cursor,
+            clicks,
             folder,
             recordings: Recordings::new(cc.egui_ctx.clone()),
             listed: std::time::Instant::now(),
@@ -584,7 +589,7 @@ impl App {
             Some(program) => Source::App { program: program.clone(), boost: self.boost },
             None => Source::System,
         });
-        let config = Config { monitor, region, fps: self.fps, quality: self.quality, rate: self.rate, audio, cursor: self.cursor, path };
+        let config = Config { monitor, region, fps: self.fps, quality: self.quality, rate: self.rate, audio, cursor: self.cursor, clicks: self.clicks, path };
         match Recorder::start(config) {
             Ok(recorder) => {
                 self.border = Some(Border::show(region));
@@ -1164,6 +1169,7 @@ impl eframe::App for App {
         storage.set_string(CHECK_UPDATES_KEY, self.updates.enabled.to_string());
         storage.set_string(LAST_UPDATE_CHECK_KEY, self.updates.last_check.to_string());
         storage.set_string(CURSOR_KEY, self.cursor.to_string());
+        storage.set_string(CLICKS_KEY, self.clicks.to_string());
         storage.set_string(FOLDER_KEY, self.folder.display().to_string());
         storage.set_string(HOTKEY_KEY, self.record_key.chord.map(|c| c.label()).unwrap_or_default());
         storage.set_string(SELECT_HOTKEY_KEY, self.select_key.chord.map(|c| c.label()).unwrap_or_default());
@@ -1293,6 +1299,11 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
                     ui.checkbox(&mut self.audio, tr!("Sound", "Звук"));
                     ui.add_space(8.0);
                     ui.checkbox(&mut self.cursor, tr!("Pointer", "Указатель"));
+                    ui.add_space(8.0);
+                    ui.add_enabled(self.cursor, egui::Checkbox::new(&mut self.clicks, tr!("Clicks", "Щелчки"))).on_hover_text(tr!(
+                        "Clicks of the mouse buttons shown under the pointer: yellow for the left one, blue for the right one",
+                        "Щелчки кнопок мыши под указателем: жёлтые — левой, голубые — правой"
+                    ));
                 });
             });
             ui.end_row();

@@ -33,6 +33,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     let mut audio = Some(Source::System);
     let mut boost = true;
     let mut cursor = true;
+    let mut clicks = false;
     let mut out: Option<PathBuf> = None;
     let mut border = false;
     // Seconds into the run: paused from, resumed at (left out of the file).
@@ -51,6 +52,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--audio-app" => audio = Some(Source::App { program: value()?, boost: true }),
             "--no-boost" => boost = false,
             "--no-cursor" => cursor = false,
+            "--clicks" => clicks = true,
             "--border" => border = true,
             "--countdown" => countdown = value()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?,
             "--pause" => {
@@ -63,7 +65,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             s => return Err(format!("unknown argument {s}")),
         }
     }
-    let seconds = seconds.ok_or("usage: qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality Q] [--rate quality|bitrate] [--no-audio | --audio-app NAME.exe [--no-boost]] [--countdown N] [--pause FROM-TO] [--out FILE]")?;
+    let seconds = seconds.ok_or("usage: qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality Q] [--rate quality|bitrate] [--no-audio | --audio-app NAME.exe [--no-boost]] [--no-cursor | --clicks] [--countdown N] [--pause FROM-TO] [--out FILE]")?;
     if let Some(Source::App { boost: b, .. }) = &mut audio {
         *b = boost;
     }
@@ -81,7 +83,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         Some(Source::App { program, boost: true }) => format!("of {program}, boosted"),
         Some(Source::App { program, boost: false }) => format!("of {program}"),
     };
-    let config = Config { monitor, region, fps, quality, rate, audio, cursor, path: path.clone() };
+    let config = Config { monitor, region, fps, quality, rate, audio, cursor, clicks, path: path.clone() };
     say!(
         "recording {}x{} at ({}, {}) for {seconds} s, {fps} fps, {} quality, {}, sound {sound}",
         region.width,

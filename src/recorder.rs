@@ -131,6 +131,8 @@ pub struct Config {
     pub audio: Option<Source>,
     /// Draw the pointer into the frames.
     pub cursor: bool,
+    /// Draw its clicks too (with the pointer only).
+    pub clicks: bool,
     pub path: PathBuf,
 }
 
@@ -373,6 +375,7 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
                 Err(e) => log::warn!("no pointer in the recording: {}", win::describe(&e)),
             }
         }
+        let clicks = (drawer.is_some() && config.clicks).then(crate::clicks::Clicks::start);
         let source = drawer.as_ref().map_or(capturer.frame(), |(composed, _)| composed).clone();
         let converter = Converter::new(capturer.device(), capturer.context(), &source, width, height, config.fps)
             .map_err(|e| format!("{}: {}", tr!("colour conversion", "преобразование цвета"), win::describe(&e)))?;
@@ -398,9 +401,9 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
             constant_quality: encoder.constant_quality,
             audio_rate: audio.map(|a| a.sample_rate),
         };
-        Ok((capturer, converter, Arc::new(encoder), loopback, info, drawer, local))
+        Ok((capturer, converter, Arc::new(encoder), loopback, info, drawer, local, clicks))
     })();
-    let (mut capturer, mut converter, encoder, loopback, info, mut drawer, local) = match setup {
+    let (mut capturer, mut converter, encoder, loopback, info, mut drawer, local, clicks) = match setup {
         Ok(s) => s,
         Err(e) => {
             let _ = ready.send(Err(e.clone()));
@@ -496,6 +499,12 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
         }
         if let Some((composed, drawer)) = &mut drawer {
             unsafe { capturer.context().CopyResource(&*composed, capturer.frame()) };
+            if let Some(clicks) = &clicks {
+                let now = win::qpc_100ns();
+                if let Err(e) = drawer.draw_clicks(&clicks.state(now), now, (config.region.x, config.region.y)) {
+                    log::warn!("clicks not drawn: {}", win::describe(&e));
+                }
+            }
             if let Err(e) = drawer.draw(&capturer.cursor, (local.x, local.y)) {
                 log::warn!("pointer not drawn: {}", win::describe(&e));
             }
