@@ -23,6 +23,7 @@ mod display;
 mod dock;
 mod editor;
 mod encoder;
+mod hdr;
 mod hotkey;
 mod icon;
 mod instance;

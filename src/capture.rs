@@ -14,14 +14,15 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11CreateDevice,
     ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
-    DXGI_OUTDUPL_POINTER_SHAPE_INFO, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO, IDXGIFactory1, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::core::{Interface, Result};
 
 use crate::display::Monitor;
+use crate::hdr::ToneMapper;
 use crate::region::Region;
 
 /// The pointer as Desktop Duplication reports it.
@@ -67,6 +68,10 @@ pub struct Capturer {
     has_frame: bool,
     pub cursor: Cursor,
     shapes: u64,
+    /// The monitor's GDI name, for its SDR white level.
+    device_name: String,
+    /// An HDR desktop's area into the frame; `None` for an SDR one.
+    tone: Option<ToneMapper>,
 }
 
 impl Capturer {
@@ -104,6 +109,8 @@ impl Capturer {
             has_frame: false,
             cursor: Cursor::default(),
             shapes: 0,
+            device_name: monitor.device_name.clone(),
+            tone: None,
         };
         capturer.recreate()?;
         Ok(capturer)
@@ -126,20 +133,51 @@ impl Capturer {
         self.has_frame
     }
 
-    /// Opens the duplication (again, after it was lost).
+    /// Opens the duplication (again, after it was lost): 8-bit BGRA, or
+    /// 16-bit float scRGB from an HDR display, which is tone-mapped into
+    /// the frame (`hdr.rs`). QREC_HDR=1 asks for the float format alone, to
+    /// check that path on an SDR display.
     pub fn recreate(&mut self) -> Result<()> {
         self.duplication = None;
-        let duplication = unsafe { self.output.DuplicateOutput(&self.device)? };
-        // An HDR display delivers 16-bit float frames, which the pipeline
-        // does not tone-map yet.
-        let format = unsafe { duplication.GetDesc() }.ModeDesc.Format;
-        if format != DXGI_FORMAT_B8G8R8A8_UNORM {
-            return Err(windows::core::Error::new(
-                windows::Win32::Foundation::E_NOTIMPL,
-                tr!("HDR displays are not supported yet", "Экраны с HDR пока не поддерживаются"),
-            ));
-        }
+        let formats: &[DXGI_FORMAT] =
+            if std::env::var_os("QREC_HDR").is_some() { &[DXGI_FORMAT_R16G16B16A16_FLOAT] } else { &[DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT] };
+        // `DuplicateOutput1` (Windows 10 1703) names the formats taken; the
+        // older call gives an HDR display's float frames all the same.
+        let duplication = match self.output.cast::<IDXGIOutput5>() {
+            Ok(output) => match unsafe { output.DuplicateOutput1(&self.device, 0, formats) } {
+                Ok(d) => d,
+                Err(e) => {
+                    log::debug!("DuplicateOutput1: {}; the older call", crate::win::describe(&e));
+                    unsafe { self.output.DuplicateOutput(&self.device)? }
+                }
+            },
+            Err(_) => unsafe { self.output.DuplicateOutput(&self.device)? },
+        };
+        // The format is the frames' (`take_frame`): the description gives
+        // the display mode's, which differs when float frames were asked.
+        self.tone = None;
         self.duplication = Some(duplication);
+        Ok(())
+    }
+
+    /// Ready for frames of `format`: the tone mapping for float ones.
+    fn prepare(&mut self, format: DXGI_FORMAT) -> Result<()> {
+        match format {
+            DXGI_FORMAT_B8G8R8A8_UNORM => self.tone = None,
+            DXGI_FORMAT_R16G16B16A16_FLOAT if self.tone.is_none() => {
+                let white = crate::hdr::sdr_white_nits(&self.device_name);
+                log::debug!("HDR desktop: scRGB, SDR white at {white:.0} nits");
+                let (width, height) = (self.region.width, self.region.height);
+                self.tone = Some(ToneMapper::new(&self.device, &self.context, &self.frame, width, height, white)?);
+            }
+            DXGI_FORMAT_R16G16B16A16_FLOAT => {}
+            other => {
+                return Err(windows::core::Error::new(
+                    windows::Win32::Foundation::E_NOTIMPL,
+                    format!("{} {}", tr!("unsupported desktop format", "неподдерживаемый формат рабочего стола"), other.0),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -184,6 +222,9 @@ impl Capturer {
             && let Some(resource) = resource
         {
             let texture: ID3D11Texture2D = resource.cast()?;
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { texture.GetDesc(&mut desc) };
+            self.prepare(desc.Format)?;
             let r = self.region;
             let source = D3D11_BOX {
                 left: r.x as u32,
@@ -193,7 +234,13 @@ impl Capturer {
                 bottom: r.y as u32 + r.height,
                 back: 1,
             };
-            unsafe { self.context.CopySubresourceRegion(&self.frame, 0, 0, 0, 0, &texture, 0, Some(&source)) };
+            match &self.tone {
+                Some(tone) => unsafe {
+                    self.context.CopySubresourceRegion(tone.source(), 0, 0, 0, 0, &texture, 0, Some(&source));
+                    tone.run(&self.context);
+                },
+                None => unsafe { self.context.CopySubresourceRegion(&self.frame, 0, 0, 0, 0, &texture, 0, Some(&source)) },
+            }
             self.has_frame = true;
         }
         if info.LastMouseUpdateTime != 0 {

@@ -372,9 +372,14 @@ fn decode(shape: &CursorShape) -> Option<(u32, u32, Vec<u8>, bool)> {
 }
 
 fn compile(entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
+    compile_source(SHADERS, entry, target)
+}
+
+/// HLSL compiled at run time (`D3DCompile`), its errors logged.
+pub(crate) fn compile_source(source: &str, entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
     let (mut code, mut errors) = (None, None);
     let result = unsafe {
-        D3DCompile(SHADERS.as_ptr().cast(), SHADERS.len(), s!("cursor.hlsl"), None, None, entry, target, 0, 0, &mut code, Some(&mut errors))
+        D3DCompile(source.as_ptr().cast(), source.len(), s!("qrec.hlsl"), None, None, entry, target, 0, 0, &mut code, Some(&mut errors))
     };
     if let Err(e) = result {
         if let Some(errors) = errors {
@@ -385,7 +390,7 @@ fn compile(entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
     Ok(code.unwrap())
 }
 
-fn bytecode(blob: &ID3DBlob) -> &[u8] {
+pub(crate) fn bytecode(blob: &ID3DBlob) -> &[u8] {
     unsafe { std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()) }
 }
 

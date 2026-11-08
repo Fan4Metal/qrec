@@ -23,6 +23,7 @@ png = "0.18"
 # COM-heavy APIs (Direct3D 11, DXGI, Media Foundation, WASAPI): the
 # `windows` crate with its interface wrappers, not the raw `windows-sys`.
 windows = { version = "0.62", features = [
+    "Win32_Devices_Display",
     "Win32_Devices_FunctionDiscovery",
     "Win32_Foundation",
     "Win32_Globalization",

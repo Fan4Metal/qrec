@@ -98,7 +98,7 @@ The audio and the video share one clock, the performance counter of Windows: a p
 
 ## Limitations
 
-- Displays with HDR enabled are not supported yet: the capture delivers 16-bit floating point frames, which the program does not tone-map. Such a display is reported when the recording starts.
+- A display with HDR enabled is recorded in SDR: white is taken at the level of **SDR content brightness** in the Windows display settings, brighter parts are compressed softly towards it, and colours outside sRGB are clipped. The file itself is SDR (BT.709), as from any other display.
 - Rotated displays are captured in their native orientation.
 - Content that Windows protects from capture (some video players, DRM) appears black, as in any screen capture.
 - One area on one monitor; no webcam. The microphone is the default one of Windows, at the level set there.
