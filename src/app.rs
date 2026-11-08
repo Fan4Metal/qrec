@@ -404,6 +404,10 @@ impl App {
         if std::env::var_os("QREC_RECORDINGS").is_some() {
             app.library = Some(Library::new());
         }
+        // QREC_ABOUT=1: About at start (GUI checks).
+        if std::env::var_os("QREC_ABOUT").is_some() {
+            app.about = true;
+        }
         app
     }
 

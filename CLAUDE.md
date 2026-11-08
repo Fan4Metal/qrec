@@ -26,6 +26,7 @@ $env:QREC_HDR=1                                      # the desktop as 16-bit flo
 .\target\debug\qrec.exe --info in.mp4   # size, fps, length, the times of the key frames, and whether the index gives the frames the source reader does
 .\target\debug\qrec.exe file.mp4        # the window with the trimming window open on the file
 $env:QREC_RECORDINGS=1; .\target\debug\qrec.exe   # the window with the recordings window open (GUI checks)
+$env:QREC_ABOUT=1; .\target\debug\qrec.exe        # the window with About open (GUI checks)
 .\target\debug\qrec.exe --test-select [click]  # opens the selection overlay and drives it with posted mouse messages: a drag, or a click on the window in the middle of the primary display (the screen dims for a moment)
 .\target\debug\qrec.exe --export-icon file.ico|file.png   # the app icon for the installer / the README
 cargo run --example wasapi_probe       # whether WASAPI capture streams can be opened on this machine (see Architecture: audio)
