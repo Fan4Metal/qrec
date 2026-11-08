@@ -12,6 +12,7 @@ macro_rules! say {
 
 #[macro_use]
 mod i18n;
+mod animation;
 mod app;
 mod audio;
 mod capture;
@@ -110,6 +111,10 @@ fn main() -> eframe::Result {
         Some("--cut") => {
             console_mode();
             std::process::exit(cli::cut(args()));
+        }
+        Some("--gif") => {
+            console_mode();
+            std::process::exit(cli::gif(args()));
         }
         Some("--info") => {
             console_mode();

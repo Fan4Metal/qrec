@@ -18,6 +18,9 @@ log = "0.4"
 env_logger = "0.11"
 # The 256 px layer of the icon (src/icon.rs, also run by build.rs).
 png = "0.18"
+# The trimming window's GIF of a stretch (src/gif.rs); pure Rust, with
+# NeuQuant for the palettes.
+gif = "0.14.2"
 
 [target.'cfg(windows)'.dependencies]
 # COM-heavy APIs (Direct3D 11, DXGI, Media Foundation, WASAPI): the

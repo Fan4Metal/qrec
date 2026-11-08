@@ -726,6 +726,14 @@ impl Editor {
                 if ui.add_enabled(can_save, save).on_hover_text(hint).clicked() {
                     self.save();
                 }
+                let gif = egui::Button::new("GIF").min_size(Vec2::new(0.0, 26.0));
+                let hint = tr!(
+                    format!("The stretch as an animated GIF beside this file: {} frames a second, at most {} pixels a side, no sound", crate::animation::FPS, crate::animation::MAX_SIDE),
+                    format!("Фрагмент как анимированный GIF рядом с этим файлом: {} кадров в секунду, не больше {} пикселей по стороне, без звука", crate::animation::FPS, crate::animation::MAX_SIDE)
+                );
+                if ui.add_enabled(can_save, gif).on_hover_text(hint).clicked() {
+                    self.save_gif();
+                }
                 if let Some(export) = &self.export
                     && ui.add(egui::Button::new(tr!("Cancel", "Отмена")).min_size(Vec2::new(0.0, 26.0))).clicked()
                 {
@@ -967,7 +975,7 @@ impl Editor {
     fn save(&mut self) {
         self.playing = None;
         let replace = self.replace;
-        let dst = if replace { replacement_path(&self.path) } else { cut_path(&self.path, self.start, self.end) };
+        let dst = if replace { replacement_path(&self.path) } else { cut_path(&self.path, self.start, self.end, "mp4") };
         let (src, start, end) = (self.path.clone(), self.start, self.end);
         let progress = Arc::new(Progress::default());
         let worker = Arc::clone(&progress);
@@ -995,6 +1003,37 @@ impl Editor {
             return;
         }
         self.export = Some(Export { progress, done, thread, replace });
+    }
+
+    /// Starts the GIF of the stretch, beside the source.
+    fn save_gif(&mut self) {
+        self.playing = None;
+        let dst = cut_path(&self.path, self.start, self.end, "gif");
+        let (src, start, end) = (self.path.clone(), self.start, self.end);
+        let keys: Vec<i64> = self.frames.iter().flatten().filter(|f| f.key).map(|f| f.time).collect();
+        let progress = Arc::new(Progress::default());
+        let worker = Arc::clone(&progress);
+        let (tx, done) = mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("gif".into())
+            .spawn(move || {
+                let _com = win::com_init_mta();
+                let started = std::time::Instant::now();
+                let result = crate::animation::export(&src, &dst, start, end, keys, &worker).map(|frames| {
+                    log::debug!("GIF of {frames} frames in {:.1} s: {}", started.elapsed().as_secs_f64(), dst.display());
+                    dst
+                });
+                let _ = tx.send(result);
+            })
+            .ok();
+        self.saved = None;
+        self.error = None;
+        self.replaced = None;
+        if thread.is_none() {
+            self.error = Some(tr!("The GIF could not be started", "Не удалось начать сохранение GIF").into());
+            return;
+        }
+        self.export = Some(Export { progress, done, thread, replace: false });
     }
 }
 
@@ -1153,15 +1192,16 @@ fn replacement_path(src: &Path) -> PathBuf {
     src.with_file_name(format!("{stem}.trimming.mp4"))
 }
 
-/// `<name>_<start>-<end>.mp4` beside `src`, with a counter when taken.
-fn cut_path(src: &Path, start: i64, end: i64) -> PathBuf {
+/// `<name>_<start>-<end>.<extension>` beside `src`, with a counter when
+/// taken.
+fn cut_path(src: &Path, start: i64, end: i64, extension: &str) -> PathBuf {
     let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "cut".into());
     let folder = src.parent().map(Path::to_path_buf).unwrap_or_default();
     let base = format!("{stem}_{}-{}", file_clock(start), file_clock(end));
-    let mut path = folder.join(format!("{base}.mp4"));
+    let mut path = folder.join(format!("{base}.{extension}"));
     let mut n = 2;
     while path.exists() {
-        path = folder.join(format!("{base}_{n}.mp4"));
+        path = folder.join(format!("{base}_{n}.{extension}"));
         n += 1;
     }
     path
@@ -1217,7 +1257,9 @@ mod tests {
 
     #[test]
     fn names_the_cut() {
-        let p = cut_path(std::path::Path::new("C:/none/qrec_1.mp4"), 10_000_000, 25_000_000);
+        let p = cut_path(std::path::Path::new("C:/none/qrec_1.mp4"), 10_000_000, 25_000_000, "mp4");
         assert_eq!(p.to_string_lossy().replace('\\', "/"), "C:/none/qrec_1_0.01.000-0.02.500.mp4");
+        let p = cut_path(std::path::Path::new("C:/none/qrec_1.mp4"), 10_000_000, 25_000_000, "gif");
+        assert_eq!(p.to_string_lossy().replace('\\', "/"), "C:/none/qrec_1_0.01.000-0.02.500.gif");
     }
 }

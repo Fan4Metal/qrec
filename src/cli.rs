@@ -161,6 +161,47 @@ fn run(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// `qrec --gif FILE --from SECONDS --to SECONDS [--out FILE]`: the stretch
+/// of a recording as an animated GIF, as the trimming window makes it.
+pub fn gif(args: Vec<String>) -> i32 {
+    let mut src: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let (mut from, mut to) = (0.0f64, f64::INFINITY);
+    let mut args = args.into_iter();
+    let result = (|| -> Result<(), String> {
+        while let Some(arg) = args.next() {
+            let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
+            match arg.as_str() {
+                "--from" => from = value()?.parse().map_err(|e: std::num::ParseFloatError| e.to_string())?,
+                "--to" => to = value()?.parse().map_err(|e: std::num::ParseFloatError| e.to_string())?,
+                "--out" => out = Some(PathBuf::from(value()?)),
+                s if src.is_none() => src = Some(PathBuf::from(s)),
+                s => return Err(format!("unknown argument {s}")),
+            }
+        }
+        let src = src.ok_or("usage: qrec --gif FILE --from SECONDS --to SECONDS [--out FILE]")?;
+        if from.is_nan() || from < 0.0 || to <= from {
+            return Err(format!("--from ({from}) must be at least 0 and before --to ({to})"));
+        }
+        let seconds = |s: f64| if s.is_finite() { (s * crate::trim::SECOND as f64) as i64 } else { i64::MAX / 2 };
+        let end = seconds(to).min(crate::trim::info(&src).map_err(|e| win::describe(&e))?.duration.max(1));
+        let dst = out.unwrap_or_else(|| src.with_extension("gif"));
+        let keys = crate::trim::frames(&src, &Default::default()).map_err(|e| win::describe(&e))?.iter().filter(|f| f.key).map(|f| f.time).collect();
+        let started = std::time::Instant::now();
+        let frames = crate::animation::export(&src, &dst, seconds(from), end, keys, &crate::trim::Progress::default())?;
+        let size = std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
+        say!("{frames} GIF frames in {:.2} s, {size} bytes: {}", started.elapsed().as_secs_f64(), dst.display());
+        Ok(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            say!("qrec: {e}");
+            1
+        }
+    }
+}
+
 /// `qrec --cut FILE --from SECONDS --to SECONDS [--out FILE]`: the stretch
 /// of a recording into a new file, without re-encoding; the start lands
 /// on the key frame at or before it.
