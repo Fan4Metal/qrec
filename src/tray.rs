@@ -3,7 +3,8 @@
 //! the window; its menu starts or stops the recording, shows the window,
 //! sets whether the window is on the taskbar, whether closing it hides it
 //! and whether a recording puts it away, opens one of the latest
-//! recordings in the trimming window, or exits.
+//! recordings in the trimming window, the page of a newer release, or
+//! exits.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -52,6 +53,8 @@ pub enum Command {
     Folder,
     /// Open the window that lists the recordings.
     Recordings,
+    /// Open the page of the newer release found by the update check.
+    Update,
 }
 
 /// The icon's callback message.
@@ -77,6 +80,7 @@ const MENU_ABOUT: usize = 7;
 const MENU_TRIM_AFTER_RECORD: usize = 8;
 const MENU_FOLDER: usize = 9;
 const MENU_RECORDINGS: usize = 10;
+const MENU_UPDATE: usize = 11;
 /// The latest recordings: this plus their place in `Status::recent`.
 const MENU_RECENT: usize = 100;
 
@@ -96,6 +100,10 @@ pub struct Status {
     /// The latest recordings, newest first: how each is named in the menu,
     /// and its file.
     pub recent: Vec<(String, PathBuf)>,
+    /// The version of a newer release, when the update check found one:
+    /// the window's button for it is out of sight while the program sits
+    /// in the notification area.
+    pub update: Option<String>,
 }
 
 /// The icon; removed when dropped. Commands arrive on the receiver, and
@@ -292,6 +300,7 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
     let all = wide(tr!("All recordings…", "Все записи…"));
     let names: Vec<Vec<u16>> = state.recent.iter().map(|(name, _)| wide(name)).collect();
     let exit = wide(tr!("Exit", "Выход"));
+    let update = state.update.as_ref().map(|v| wide(tr!(format!("Version {v} is available…"), format!("Доступна версия {v}…"))));
     unsafe {
         let menu = CreatePopupMenu().ok()?;
         let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, PCWSTR(toggle.as_ptr()));
@@ -317,6 +326,9 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
         let _ = AppendMenuW(menu, check(state.minimise_on_record), MENU_MINIMISE_ON_RECORD, PCWSTR(minimise_on_record.as_ptr()));
         let _ = AppendMenuW(menu, check(state.trim_after_record), MENU_TRIM_AFTER_RECORD, PCWSTR(trim_after_record.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        if let Some(update) = &update {
+            let _ = AppendMenuW(menu, MF_STRING, MENU_UPDATE, PCWSTR(update.as_ptr()));
+        }
         let _ = AppendMenuW(menu, MF_STRING, MENU_ABOUT, PCWSTR(about.as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, PCWSTR(exit.as_ptr()));
         // In bold: what a click on the icon does.
@@ -337,6 +349,7 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
             MENU_EXIT => Some(Command::Exit),
             MENU_FOLDER => Some(Command::Folder),
             MENU_RECORDINGS => Some(Command::Recordings),
+            MENU_UPDATE => Some(Command::Update),
             n if n >= MENU_RECENT => state.recent.get(n - MENU_RECENT).map(|(_, path)| Command::Trim(path.clone())),
             _ => None,
         }

@@ -474,6 +474,13 @@ impl App {
                 tray::Command::Trim(path) => self.open_editor(path, ctx),
                 tray::Command::Folder => win::open_folder(&self.folder),
                 tray::Command::Recordings => self.open_library(ctx),
+                tray::Command::Update => {
+                    if let Some(url) = self.updates.newer().map(update::release_url)
+                        && !win::shell_open(&url)
+                    {
+                        log::warn!("could not open {url}");
+                    }
+                }
             }
         }
         let requests: Vec<crate::instance::Request> = self.instance.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
@@ -845,6 +852,7 @@ impl App {
                     .take(5)
                     .map(|r| (format!("{}   {}", recordings::when(r.modified), r.details()), r.path.clone()))
                     .collect(),
+                update: self.updates.newer().map(|tag| update::version_of(tag).to_owned()),
             });
         }
     }

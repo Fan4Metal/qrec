@@ -115,7 +115,7 @@ qrec.exe FILE.mp4
 
 ## Update check and privacy
 
-The update check is optional and off by default. With **Check for updates at start-up (once a day)** enabled in the About window, the program asks the GitHub Releases API (`api.github.com`) for the latest release at most once a day; **Check now** in the same window asks at once. The request carries nothing but the program version in its `User-Agent` header, and nothing is downloaded or installed: when a newer release exists, a button with its version appears in the window's title row, left of the recordings button, and opens the release page in the browser. Otherwise the program does not access the network.
+The update check is optional and off by default. With **Check for updates at start-up (once a day)** enabled in the About window, the program asks the GitHub Releases API (`api.github.com`) for the latest release at most once a day; **Check now** in the same window asks at once. The request carries nothing but the program version in its `User-Agent` header, and nothing is downloaded or installed: when a newer release exists, a button with its version appears in the window's title row, left of the recordings button, and an item in the menu of the notification area icon; either opens the release page in the browser. Otherwise the program does not access the network.
 
 ## Building
 
