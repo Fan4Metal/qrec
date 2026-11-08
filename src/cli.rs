@@ -1,6 +1,6 @@
 //! `qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N]
 //! [--quality low|medium|high] [--no-audio | --audio-app NAME.exe
-//! [--no-boost]] [--pause FROM-TO] [--out FILE]`: a recording without the window, for checking the
+//! [--no-boost]] [--countdown N] [--pause FROM-TO] [--out FILE]`: a recording without the window, for checking the
 //! pipeline from a console. `qrec --cut FILE --from S --to S [--out FILE]`
 //! and `qrec --info FILE`: a cut and a look at a file, the same way.
 
@@ -37,6 +37,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     let mut border = false;
     // Seconds into the run: paused from, resumed at (left out of the file).
     let mut pause: Option<(f64, f64)> = None;
+    let mut countdown = 0u32;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
@@ -51,6 +52,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--no-boost" => boost = false,
             "--no-cursor" => cursor = false,
             "--border" => border = true,
+            "--countdown" => countdown = value()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?,
             "--pause" => {
                 let v = value()?;
                 let parsed = v.split_once('-').and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?)));
@@ -61,7 +63,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             s => return Err(format!("unknown argument {s}")),
         }
     }
-    let seconds = seconds.ok_or("usage: qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality Q] [--rate quality|bitrate] [--no-audio | --audio-app NAME.exe [--no-boost]] [--pause FROM-TO] [--out FILE]")?;
+    let seconds = seconds.ok_or("usage: qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality Q] [--rate quality|bitrate] [--no-audio | --audio-app NAME.exe [--no-boost]] [--countdown N] [--pause FROM-TO] [--out FILE]")?;
     if let Some(Source::App { boost: b, .. }) = &mut audio {
         *b = boost;
     }
@@ -93,6 +95,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
     );
 
+    if countdown > 0 {
+        let counting = crate::overlay::Countdown::show(region, countdown, egui::Context::default());
+        while counting.left() > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
     let recorder = Recorder::start(config)?;
     let _border = border.then(|| crate::overlay::Border::show(region));
     say!(

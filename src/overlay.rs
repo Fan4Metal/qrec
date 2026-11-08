@@ -553,6 +553,177 @@ fn run_border(region: Region, ready: mpsc::Sender<()>) {
     }
 }
 
+/// The seconds counted down before a recording starts: a dark rounded
+/// square with the number, in the middle of the area, that clicks pass
+/// through. It ends by itself (`finished`), or when dropped (cancelled).
+pub struct Countdown {
+    thread_id: Arc<AtomicIsize>,
+    thread: Option<JoinHandle<()>>,
+    /// The number shown; 0 once the count is over.
+    left: Arc<std::sync::atomic::AtomicU32>,
+}
+
+/// The dark of the icon, as `COLORREF` holds it (BGR).
+const COUNTDOWN_BACKGROUND: COLORREF = COLORREF(0x0040_332A);
+const COUNTDOWN_TIMER: usize = 1;
+
+thread_local! {
+    /// The countdown window's number, on its thread.
+    static COUNTDOWN: RefCell<Option<Arc<std::sync::atomic::AtomicU32>>> = const { RefCell::new(None) };
+}
+
+impl Countdown {
+    /// Counts `seconds` down over `region`; `ctx` is woken at each step.
+    pub fn show(region: Region, seconds: u32, ctx: egui::Context) -> Countdown {
+        let thread_id = Arc::new(AtomicIsize::new(0));
+        let left = Arc::new(std::sync::atomic::AtomicU32::new(seconds.max(1)));
+        let (id, shared) = (Arc::clone(&thread_id), Arc::clone(&left));
+        let thread = std::thread::Builder::new()
+            .name("countdown".into())
+            .spawn(move || {
+                id.store(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() } as isize, Relaxed);
+                run_countdown(region, &shared, &ctx);
+                // Over, or the window could not be made: the recording
+                // starts all the same.
+                shared.store(0, Relaxed);
+                ctx.request_repaint();
+            })
+            .ok();
+        if thread.is_none() {
+            left.store(0, Relaxed);
+        }
+        Countdown { thread_id, thread, left }
+    }
+
+    /// The number shown, 0 once the count is over.
+    pub fn left(&self) -> u32 {
+        self.left.load(Relaxed)
+    }
+}
+
+impl Drop for Countdown {
+    fn drop(&mut self) {
+        // The thread posts nothing before it has its id: waited for.
+        while self.thread.as_ref().is_some_and(|t| !t.is_finished()) && self.thread_id.load(Relaxed) == 0 {
+            std::thread::yield_now();
+        }
+        let id = self.thread_id.load(Relaxed);
+        if id != 0 {
+            unsafe {
+                let _ = PostThreadMessageW(id as u32, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn run_countdown(region: Region, left: &Arc<std::sync::atomic::AtomicU32>, ctx: &egui::Context) {
+    use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
+    use windows::Win32::UI::WindowsAndMessaging::{KillTimer, LWA_ALPHA, SetTimer, WM_TIMER};
+    // A third of the area's shorter side, within reason.
+    let side = (region.width.min(region.height) as i32 / 3).clamp(96, 260);
+    unsafe {
+        let Ok(instance) = windows::Win32::System::LibraryLoader::GetModuleHandleW(None) else { return };
+        let class = w!("qrec_countdown");
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(countdown_proc),
+            hInstance: instance.into(),
+            lpszClassName: class,
+            ..Default::default()
+        };
+        RegisterClassExW(&wc);
+        let Ok(hwnd) = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class,
+            PCWSTR::null(),
+            WS_POPUP,
+            region.x + (region.width as i32 - side) / 2,
+            region.y + (region.height as i32 - side) / 2,
+            side,
+            side,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        ) else {
+            return;
+        };
+        COUNTDOWN.with_borrow_mut(|c| *c = Some(Arc::clone(left)));
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 235, LWA_ALPHA);
+        let radius = side / 6;
+        let _ = SetWindowRgn(hwnd, Some(CreateRoundRectRgn(0, 0, side + 1, side + 1, radius, radius)), false);
+        win::exclude_from_capture(hwnd.0 as isize);
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetTimer(Some(hwnd), COUNTDOWN_TIMER, 1000, None);
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if msg.message == WM_TIMER && msg.hwnd == hwnd {
+                let n = left.load(Relaxed).saturating_sub(1);
+                left.store(n, Relaxed);
+                ctx.request_repaint();
+                if n == 0 {
+                    break;
+                }
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, true);
+                continue;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        let _ = KillTimer(Some(hwnd), COUNTDOWN_TIMER);
+        let _ = DestroyWindow(hwnd);
+        COUNTDOWN.with_borrow_mut(|c| *c = None);
+    }
+}
+
+unsafe extern "system" fn countdown_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use windows::Win32::Graphics::Gdi::{DT_CENTER, DT_SINGLELINE, DT_VCENTER, DrawTextW, FW_BOLD};
+    match msg {
+        WM_PAINT => {
+            let n = COUNTDOWN.with_borrow(|c| c.as_ref().map_or(0, |n| n.load(Relaxed)));
+            let mut ps = PAINTSTRUCT::default();
+            unsafe {
+                let dc = BeginPaint(hwnd, &mut ps);
+                let mut rect = RECT::default();
+                let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
+                let background: HBRUSH = CreateSolidBrush(COUNTDOWN_BACKGROUND);
+                FillRect(dc, &rect, background);
+                let _ = DeleteObject(background.into());
+                let font: HFONT = CreateFontW(
+                    -(rect.bottom * 7 / 10),
+                    0,
+                    0,
+                    0,
+                    FW_BOLD.0 as i32,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET,
+                    OUT_DEFAULT_PRECIS,
+                    CLIP_DEFAULT_PRECIS,
+                    ANTIALIASED_QUALITY,
+                    (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+                    w!("Segoe UI"),
+                );
+                let old = SelectObject(dc, font.into());
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, COLORREF(0x00FF_FFFF));
+                let mut text: Vec<u16> = n.to_string().encode_utf16().collect();
+                DrawTextW(dc, &mut text, &mut rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(dc, old);
+                let _ = DeleteObject(font.into());
+                let _ = EndPaint(hwnd, &ps);
+            }
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
 unsafe extern "system" fn border_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {

@@ -12,7 +12,7 @@ use crate::display::{self, Monitor};
 use crate::editor::Editor;
 use crate::hotkey::{Chord, Hotkey};
 use crate::i18n::LangChoice;
-use crate::overlay::{self, Border};
+use crate::overlay::{self, Border, Countdown};
 use crate::recorder::{self, Config, Quality, RateControl, Recorder};
 use crate::library::Library;
 use crate::recordings::{self, Recordings};
@@ -45,6 +45,9 @@ const TASKBAR_KEY: &str = "taskbar";
 const CLOSE_TO_TRAY_KEY: &str = "close_to_tray";
 const MINIMISE_ON_RECORD_KEY: &str = "minimise_on_record";
 const TRIM_AFTER_RECORD_KEY: &str = "trim_after_record";
+const COUNTDOWN_KEY: &str = "countdown";
+/// The seconds counted down before a recording, with the countdown on.
+const COUNTDOWN_SECONDS: u32 = 3;
 const LANGUAGE_KEY: &str = "language";
 /// Not `editor_rect`, which held the position in points: a value of that
 /// is not taken for pixels.
@@ -112,6 +115,11 @@ pub struct App {
     restore_on_stop: bool,
     /// Whether a recording opens in the trimming window when it ends.
     trim_after_record: bool,
+    /// Whether a recording starts after a few seconds counted down over
+    /// the area.
+    countdown: bool,
+    /// The count before a recording, while it runs.
+    counting: Option<Countdown>,
     /// Interface language, chosen in About.
     lang: LangChoice,
     /// Whether the About window is open.
@@ -266,6 +274,7 @@ impl App {
         let close_to_tray = get(CLOSE_TO_TRAY_KEY).as_deref() == Some("true");
         let minimise_on_record = get(MINIMISE_ON_RECORD_KEY).as_deref() == Some("true");
         let trim_after_record = get(TRIM_AFTER_RECORD_KEY).as_deref() == Some("true");
+        let countdown = get(COUNTDOWN_KEY).as_deref() == Some("true");
         let lang = get(LANGUAGE_KEY).and_then(|l| LangChoice::from_name(&l)).unwrap_or_default();
         let editor_rect = get(EDITOR_RECT_KEY).and_then(|r| rect_from_setting(&r));
         let trim_replace = get(TRIM_REPLACE_KEY).as_deref() == Some("true");
@@ -333,6 +342,8 @@ impl App {
             minimise_on_record,
             restore_on_stop: false,
             trim_after_record,
+            countdown,
+            counting: None,
             lang,
             about: false,
             updates,
@@ -431,6 +442,10 @@ impl App {
         if self.record_key.presses() % 2 == 1 && self.selecting.is_none() {
             self.toggle(ctx);
         }
+        if self.counting.as_ref().is_some_and(|c| c.left() == 0) {
+            self.counting = None;
+            self.start(ctx);
+        }
         // Not while recording: the area is fixed then, as its buttons are.
         if self.select_key.presses() > 0 && self.selecting.is_none() && self.recorder.is_none() {
             self.select_area(ctx);
@@ -465,6 +480,7 @@ impl App {
                 tray::Command::CloseToTray => self.close_to_tray = !self.close_to_tray,
                 tray::Command::MinimiseOnRecord => self.minimise_on_record = !self.minimise_on_record,
                 tray::Command::TrimAfterRecord => self.trim_after_record = !self.trim_after_record,
+                tray::Command::Countdown => self.countdown = !self.countdown,
                 tray::Command::About => {
                     if let Some(hwnd) = self.window {
                         win::show_window(hwnd, true);
@@ -518,28 +534,43 @@ impl App {
         self.update_tray();
     }
 
+    /// Starts or stops the recording; with the countdown, starts it after
+    /// the count, and a second press during the count cancels it.
     fn toggle(&mut self, ctx: &egui::Context) {
         log::debug!("toggle: recording {}", self.recorder.is_some());
-        if self.recorder.is_some() {
+        if self.counting.take().is_some() {
+            self.notice = Notice::Info(tr!("Recording cancelled", "Запись отменена").into());
+        } else if self.recorder.is_some() {
             self.stop(Some(ctx));
+        } else if self.countdown {
+            if let Some((_, region)) = self.target() {
+                self.counting = Some(Countdown::show(region, COUNTDOWN_SECONDS, ctx.clone()));
+            }
         } else {
             self.start(ctx);
         }
     }
 
-    fn start(&mut self, ctx: &egui::Context) {
+    /// The display and the area to record, fitted to it; `None` with the
+    /// reason in the status line.
+    fn target(&mut self) -> Option<(Monitor, Region)> {
         self.monitors = display::monitors();
         let Some(monitor) = self.monitors.get(self.monitor).cloned() else {
             self.monitor = 0;
             self.notice = Notice::Error(tr!("No display found", "Экран не найден").into());
-            return;
+            return None;
         };
         let region = self.region.unwrap_or_else(|| Region::from_rect(monitor.rect));
         let Some(region) = region.fit(monitor.rect) else {
             self.region = None;
             self.notice = Notice::Error(tr!("The area is outside the display", "Область вне экрана").into());
-            return;
+            return None;
         };
+        Some((monitor, region))
+    }
+
+    fn start(&mut self, ctx: &egui::Context) {
+        let Some((monitor, region)) = self.target() else { return };
         if !self.folder.is_absolute() {
             self.notice = Notice::Error(tr!("Choose a folder for the recordings", "Выберите папку для записей").into());
             return;
@@ -855,6 +886,8 @@ impl App {
                 close_to_tray: self.close_to_tray,
                 minimise_on_record: self.minimise_on_record,
                 trim_after_record: self.trim_after_record,
+                countdown: self.countdown,
+                counting: self.counting.is_some(),
                 recent: self
                     .recordings
                     .list
@@ -867,8 +900,12 @@ impl App {
         }
     }
 
-    /// The time recorded, `00:01:23`, while recording.
+    /// The time recorded, `00:01:23`, while recording; the seconds left
+    /// while counting down.
     fn clock(&self) -> Option<String> {
+        if let Some(counting) = &self.counting {
+            return Some(counting.left().max(1).to_string());
+        }
         self.recorder.as_ref().map(|recorder| {
             let elapsed = recorder.elapsed().as_secs();
             format!("{:02}:{:02}:{:02}", elapsed / 3600, elapsed / 60 % 60, elapsed % 60)
@@ -979,7 +1016,8 @@ impl eframe::App for App {
         if let Some(action) = self.capturing_hotkey {
             self.capture_hotkey(&ctx, action);
         }
-        let recording = self.recorder.is_some();
+        // The settings are fixed from the countdown on.
+        let recording = self.recorder.is_some() || self.counting.is_some();
         let busy = recording || self.selecting.is_some();
 
         // The bar with the area buttons, the record button and the status
@@ -1119,6 +1157,7 @@ impl eframe::App for App {
         storage.set_string(CLOSE_TO_TRAY_KEY, self.close_to_tray.to_string());
         storage.set_string(MINIMISE_ON_RECORD_KEY, self.minimise_on_record.to_string());
         storage.set_string(TRIM_AFTER_RECORD_KEY, self.trim_after_record.to_string());
+        storage.set_string(COUNTDOWN_KEY, self.countdown.to_string());
         storage.set_string(LANGUAGE_KEY, self.lang.name().to_owned());
         storage.set_string(EDITOR_RECT_KEY, self.editor_rect.map(rect_to_setting).unwrap_or_default());
         storage.set_string(TRIM_REPLACE_KEY, self.trim_replace.to_string());

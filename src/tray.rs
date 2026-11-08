@@ -45,6 +45,8 @@ pub enum Command {
     MinimiseOnRecord,
     /// Whether the trimming window opens when a recording ends.
     TrimAfterRecord,
+    /// Whether a recording starts after a countdown.
+    Countdown,
     /// Show the window with About open.
     About,
     /// Close the program.
@@ -84,6 +86,7 @@ const MENU_FOLDER: usize = 9;
 const MENU_RECORDINGS: usize = 10;
 const MENU_UPDATE: usize = 11;
 const MENU_PAUSE: usize = 12;
+const MENU_COUNTDOWN: usize = 13;
 /// The latest recordings: this plus their place in `Status::recent`.
 const MENU_RECENT: usize = 100;
 
@@ -102,6 +105,10 @@ pub struct Status {
     pub minimise_on_record: bool,
     /// Whether a recording that ends opens in the trimming window.
     pub trim_after_record: bool,
+    /// Whether a recording starts after a countdown.
+    pub countdown: bool,
+    /// Whether the countdown runs: `clock` is the seconds left then.
+    pub counting: bool,
     /// The latest recordings, newest first: how each is named in the menu,
     /// and its file.
     pub recent: Vec<(String, PathBuf)>,
@@ -251,11 +258,12 @@ fn load_icon(recording: bool) -> HICON {
 fn notify(hwnd: HWND, op: NOTIFY_ICON_MESSAGE) -> bool {
     CONTEXT.with_borrow(|c| {
         let Some(c) = c else { return false };
-        let (clock, paused) = {
+        let (clock, paused, counting) = {
             let state = c.state.lock().unwrap();
-            (state.clock.clone(), state.paused)
+            (state.clock.clone(), state.paused, state.counting)
         };
         let tip = match &clock {
+            Some(left) if counting => format!("qrec: {} {left}", tr!("recording starts in", "запись начнётся через")),
             Some(clock) if paused => format!("qrec: {} {clock}", tr!("paused at", "пауза на")),
             Some(clock) => format!("qrec: {} {clock}", tr!("recording", "запись")),
             None => "qrec".to_owned(),
@@ -266,7 +274,7 @@ fn notify(hwnd: HWND, op: NOTIFY_ICON_MESSAGE) -> bool {
             uID: ICON_ID,
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
             uCallbackMessage: WM_TRAY,
-            hIcon: c.icons[usize::from(clock.is_some())],
+            hIcon: c.icons[usize::from(clock.is_some() && !counting)],
             ..Default::default()
         };
         for (to, from) in data.szTip.iter_mut().zip(tip.encode_utf16().take(127)) {
@@ -295,8 +303,15 @@ fn send(command: Command) {
 /// The menu at `(x, y)`; the command chosen, if any.
 unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
     let state = CONTEXT.with_borrow(|c| c.as_ref().map(|c| c.state.lock().unwrap().clone())).unwrap_or_default();
-    let recording = state.clock.is_some();
-    let toggle = wide(if recording { tr!("Stop recording", "Остановить запись") } else { tr!("Start recording", "Начать запись") });
+    let recording = state.clock.is_some() && !state.counting;
+    let toggle = wide(if state.counting {
+        tr!("Cancel the recording", "Отменить запись")
+    } else if recording {
+        tr!("Stop recording", "Остановить запись")
+    } else {
+        tr!("Start recording", "Начать запись")
+    });
+    let countdown = wide(tr!("Count down before recording", "Отсчёт перед записью"));
     let pause = wide(if state.paused { tr!("Resume recording", "Продолжить запись") } else { tr!("Pause recording", "Приостановить запись") });
     let show = wide(tr!("Show the window", "Показать окно"));
     let taskbar = wide(tr!("Not on the taskbar", "Не показывать на панели задач"));
@@ -337,6 +352,7 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
         let _ = AppendMenuW(menu, check(state.tray_only), MENU_TASKBAR, PCWSTR(taskbar.as_ptr()));
         let _ = AppendMenuW(menu, check(state.close_to_tray), MENU_CLOSE_TO_TRAY, PCWSTR(close_to_tray.as_ptr()));
         let _ = AppendMenuW(menu, check(state.minimise_on_record), MENU_MINIMISE_ON_RECORD, PCWSTR(minimise_on_record.as_ptr()));
+        let _ = AppendMenuW(menu, check(state.countdown), MENU_COUNTDOWN, PCWSTR(countdown.as_ptr()));
         let _ = AppendMenuW(menu, check(state.trim_after_record), MENU_TRIM_AFTER_RECORD, PCWSTR(trim_after_record.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         if let Some(update) = &update {
@@ -359,6 +375,7 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
             MENU_CLOSE_TO_TRAY => Some(Command::CloseToTray),
             MENU_MINIMISE_ON_RECORD => Some(Command::MinimiseOnRecord),
             MENU_TRIM_AFTER_RECORD => Some(Command::TrimAfterRecord),
+            MENU_COUNTDOWN => Some(Command::Countdown),
             MENU_ABOUT => Some(Command::About),
             MENU_EXIT => Some(Command::Exit),
             MENU_FOLDER => Some(Command::Folder),
