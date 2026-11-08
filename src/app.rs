@@ -30,7 +30,7 @@ use crate::update::{self, Updates};
 use crate::win;
 
 /// The window's size in points.
-pub const WINDOW_SIZE: [f32; 2] = [500.0, 494.0];
+pub const WINDOW_SIZE: [f32; 2] = [500.0, 524.0];
 /// The window's corners, painted over a transparent window (as Windows 11
 /// rounds its own).
 pub(crate) const CORNER_RADIUS: f32 = 8.0;
@@ -49,6 +49,7 @@ const MICROPHONE_KEY: &str = "microphone";
 const FOLDER_KEY: &str = "folder";
 const HOTKEY_KEY: &str = "hotkey";
 const SELECT_HOTKEY_KEY: &str = "select_hotkey";
+const PAUSE_HOTKEY_KEY: &str = "pause_hotkey";
 const ASPECT_KEY: &str = "aspect";
 const TASKBAR_KEY: &str = "taskbar";
 const CLOSE_TO_TRAY_KEY: &str = "close_to_tray";
@@ -107,6 +108,8 @@ pub struct App {
     record_key: GlobalKey,
     /// The hotkey that opens the area selection.
     select_key: GlobalKey,
+    /// The hotkey that pauses and resumes the recording.
+    pause_key: GlobalKey,
     /// The icon in the notification area; `None` when Windows refused it.
     tray: Option<(Tray, mpsc::Receiver<tray::Command>)>,
     /// The proportions of the next area selected.
@@ -207,6 +210,7 @@ const UNCLOAK_TIMEOUT: Duration = Duration::from_secs(1);
 enum KeyAction {
     Record,
     Select,
+    Pause,
 }
 
 /// A global hotkey: its chord, registered while the program runs.
@@ -309,6 +313,12 @@ impl App {
         if select_key.chord.is_some() && select_key.chord == record_key.chord {
             select_key.chord = None;
         }
+        // A chord the others already have (set before the pause had a
+        // hotkey) stays theirs.
+        let mut pause_key = GlobalKey::from_setting(get(PAUSE_HOTKEY_KEY), Chord::PAUSE);
+        if pause_key.chord.is_some() && (pause_key.chord == record_key.chord || pause_key.chord == select_key.chord) {
+            pause_key.chord = None;
+        }
 
         // The window must not appear in its own recordings.
         let window = {
@@ -353,6 +363,7 @@ impl App {
             listed: std::time::Instant::now(),
             record_key,
             select_key,
+            pause_key,
             aspect,
             taskbar,
             close_to_tray,
@@ -412,17 +423,26 @@ impl App {
     }
 
     fn register_hotkeys(&mut self, ctx: &egui::Context) {
-        // Both freed first, so a chord moved from one to the other is free.
-        self.record_key.registered = None;
-        self.select_key.registered = None;
+        // All freed first, so a chord moved from one to another is free.
+        self.free_hotkeys();
         self.record_key.register(ctx);
         self.select_key.register(ctx);
+        self.pause_key.register(ctx);
+    }
+
+    /// Unregisters the hotkeys (while one is being chosen, so that any
+    /// chord can be pressed).
+    fn free_hotkeys(&mut self) {
+        self.record_key.registered = None;
+        self.select_key.registered = None;
+        self.pause_key.registered = None;
     }
 
     fn global_key(&mut self, action: KeyAction) -> &mut GlobalKey {
         match action {
             KeyAction::Record => &mut self.record_key,
             KeyAction::Select => &mut self.select_key,
+            KeyAction::Pause => &mut self.pause_key,
         }
     }
 
@@ -471,6 +491,10 @@ impl App {
             self.start(ctx);
         }
         // Not while recording: the area is fixed then, as its buttons are.
+        // Only while recording: a press otherwise does nothing.
+        if self.pause_key.presses() % 2 == 1 && self.recorder.is_some() {
+            self.toggle_pause();
+        }
         if self.select_key.presses() > 0 && self.selecting.is_none() && self.recorder.is_none() {
             self.select_area(ctx);
         }
@@ -912,7 +936,7 @@ impl App {
                 if let Some(chord) = Chord::from_egui(key, modifiers)
                     && chord.is_usable()
                 {
-                    for other in [&mut self.record_key, &mut self.select_key] {
+                    for other in [&mut self.record_key, &mut self.select_key, &mut self.pause_key] {
                         if other.chord == Some(chord) {
                             other.chord = None;
                         }
@@ -1143,6 +1167,7 @@ impl eframe::App for App {
         storage.set_string(FOLDER_KEY, self.folder.display().to_string());
         storage.set_string(HOTKEY_KEY, self.record_key.chord.map(|c| c.label()).unwrap_or_default());
         storage.set_string(SELECT_HOTKEY_KEY, self.select_key.chord.map(|c| c.label()).unwrap_or_default());
+        storage.set_string(PAUSE_HOTKEY_KEY, self.pause_key.chord.map(|c| c.label()).unwrap_or_default());
         storage.set_string(ASPECT_KEY, self.aspect.name().to_owned());
     }
 
@@ -1328,6 +1353,19 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
                 ),
             );
             ui.end_row();
+
+            ui.label(tr!("Pause key", "Клавиша паузы"));
+            self.hotkey_row(
+                ui,
+                ctx,
+                recording,
+                KeyAction::Pause,
+                tr!(
+                    "Pauses and resumes the recording from anywhere, as the pause button does. Click, then press a key with Ctrl or Alt, or a function key.",
+                    "Приостанавливает и продолжает запись из любого окна, как кнопка паузы. Нажмите кнопку, затем клавишу с Ctrl или Alt, или функциональную клавишу."
+                ),
+            );
+            ui.end_row();
         });
     }
 
@@ -1350,11 +1388,10 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
                     self.capturing_hotkey = None;
                     self.register_hotkeys(ctx);
                 } else {
-                    // Both keys freed while one is chosen, so either can
-                    // be pressed.
+                    // All keys freed while one is chosen, so any can be
+                    // pressed.
                     self.capturing_hotkey = Some(action);
-                    self.record_key.registered = None;
-                    self.select_key.registered = None;
+                    self.free_hotkeys();
                 }
             }
             if chord.is_some()

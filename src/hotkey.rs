@@ -26,6 +26,8 @@ impl Chord {
     pub const RECORD: Chord = Chord { ctrl: true, alt: true, shift: false, win: false, key: b'R' as u32 };
     /// The area selection's by default.
     pub const SELECT: Chord = Chord { ctrl: true, alt: true, shift: false, win: false, key: b'A' as u32 };
+    /// The default chord that pauses and resumes the recording.
+    pub const PAUSE: Chord = Chord { ctrl: true, alt: true, shift: false, win: false, key: b'P' as u32 };
 
     /// As shown in the window and kept in the settings: `Ctrl+Alt+R`.
     pub fn label(&self) -> String {
