@@ -1,6 +1,6 @@
 //! `qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N]
 //! [--quality low|medium|high] [--no-audio | --audio-app NAME.exe
-//! [--no-boost]] [--countdown N] [--pause FROM-TO] [--out FILE]`: a recording without the window, for checking the
+//! [--no-boost]] [--microphone] [--no-cursor | --clicks] [--countdown N] [--pause FROM-TO] [--out FILE]`: a recording without the window, for checking the
 //! pipeline from a console. `qrec --cut FILE --from S --to S [--out FILE]`
 //! and `qrec --info FILE`: a cut and a look at a file, the same way.
 
@@ -34,6 +34,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     let mut boost = true;
     let mut cursor = true;
     let mut clicks = false;
+    let mut microphone = false;
     let mut out: Option<PathBuf> = None;
     let mut border = false;
     // Seconds into the run: paused from, resumed at (left out of the file).
@@ -53,6 +54,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--no-boost" => boost = false,
             "--no-cursor" => cursor = false,
             "--clicks" => clicks = true,
+            "--microphone" => microphone = true,
             "--border" => border = true,
             "--countdown" => countdown = value()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?,
             "--pause" => {
@@ -65,7 +67,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             s => return Err(format!("unknown argument {s}")),
         }
     }
-    let seconds = seconds.ok_or("usage: qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality Q] [--rate quality|bitrate] [--no-audio | --audio-app NAME.exe [--no-boost]] [--no-cursor | --clicks] [--countdown N] [--pause FROM-TO] [--out FILE]")?;
+    let seconds = seconds.ok_or("usage: qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality Q] [--rate quality|bitrate] [--no-audio | --audio-app NAME.exe [--no-boost]] [--microphone] [--no-cursor | --clicks] [--countdown N] [--pause FROM-TO] [--out FILE]")?;
     if let Some(Source::App { boost: b, .. }) = &mut audio {
         *b = boost;
     }
@@ -77,13 +79,16 @@ fn run(args: Vec<String>) -> Result<(), String> {
         .fit(monitor.rect)
         .ok_or("the area does not fit the display or is too small")?;
     let path = out.unwrap_or_else(|| PathBuf::from(format!("qrec_{}.mp4", win::local_time_stamp())));
-    let sound = match &audio {
+    let mut sound = match &audio {
         None => "off".to_owned(),
         Some(Source::System) => "of the system".to_owned(),
         Some(Source::App { program, boost: true }) => format!("of {program}, boosted"),
         Some(Source::App { program, boost: false }) => format!("of {program}"),
     };
-    let config = Config { monitor, region, fps, quality, rate, audio, cursor, clicks, path: path.clone() };
+    if microphone {
+        sound = if audio.is_some() { format!("{sound} and the microphone") } else { "of the microphone".to_owned() };
+    }
+    let config = Config { monitor, region, fps, quality, rate, audio, microphone, cursor, clicks, path: path.clone() };
     say!(
         "recording {}x{} at ({}, {}) for {seconds} s, {fps} fps, {} quality, {}, sound {sound}",
         region.width,

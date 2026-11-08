@@ -25,6 +25,10 @@
 //!
 //! Either way the packets carry performance counter timestamps, and the
 //! recorder fills any gap with silence.
+//!
+//! The default microphone is opened the same way as a capture stream of
+//! its own (`Loopback::open_microphone`); the recorder mixes it with the
+//! sound of the computer.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -37,7 +41,7 @@ use windows::Win32::Media::Audio::{
     ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
     IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient, IAudioRenderClient,
     IMMDeviceEnumerator, MMDeviceEnumerator, PROCESS_LOOPBACK_MODE, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
-    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eConsole, eRender,
+    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eCapture, eConsole, eRender,
 };
 use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0};
 use windows::Win32::System::Com::{BLOB, CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
@@ -283,6 +287,41 @@ impl Loopback {
         })();
         unsafe { CoTaskMemFree(Some(format as *const _)) };
         result
+    }
+
+    /// Opens the default microphone (the default capture device) as
+    /// 32-bit float stereo at `rate`, the engine converting for it (a mono
+    /// microphone comes in both channels), with an event and timestamps
+    /// like the loopback's.
+    pub fn open_microphone(rate: u32) -> Result<Loopback> {
+        let enumerator: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+        let device = unsafe { enumerator.GetDefaultAudioEndpoint(eCapture, eConsole) }.map_err(|e| context("no microphone", e))?;
+        let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(|e| context("Activate", e))?;
+        let format = WAVEFORMATEX { nSamplesPerSec: rate, nAvgBytesPerSec: rate * 8, ..STEREO_FLOAT };
+        let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 10_000_000, 0, &format, None) }.map_err(|e| context("Initialize (microphone)", e))?;
+        let event = unsafe { CreateEventW(None, false, false, None).map_err(|e| context("CreateEvent", e))? };
+        if let Err(e) = unsafe { client.SetEventHandle(event) } {
+            unsafe {
+                let _ = CloseHandle(event);
+            }
+            return Err(context("SetEventHandle", e));
+        }
+        let capture: IAudioCaptureClient = unsafe { client.GetService().map_err(|e| context("GetService", e))? };
+        Ok(Loopback {
+            client,
+            capture,
+            keepalive: None,
+            event: Some(event),
+            rate,
+            channels: 2,
+            samples: Samples::Float32,
+            block_align: 8,
+            scratch: Vec::new(),
+            volume: None,
+            gain: 1.0,
+            method: "microphone",
+        })
     }
 
     /// Samples per second of the packets.

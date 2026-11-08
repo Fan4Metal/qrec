@@ -129,6 +129,8 @@ pub struct Config {
     pub rate: RateControl,
     /// Whose sound is recorded; `None` for none.
     pub audio: Option<Source>,
+    /// Whether the default microphone is recorded too, mixed in.
+    pub microphone: bool,
     /// Draw the pointer into the frames.
     pub cursor: bool,
     /// Draw its clicks too (with the pointer only).
@@ -361,7 +363,15 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
             bitrate: bitrate(width, height, config.fps, config.quality),
             qp: (config.rate == RateControl::Quality).then(|| config.quality.qp()),
         };
-        let audio = loopback.as_ref().map(|l| AudioConfig { sample_rate: l.rate() });
+        // The microphone at the rate of the other sound, mixed with it.
+        let mut sources: Vec<Loopback> = loopback.into_iter().collect();
+        if config.microphone {
+            let rate = sources.first().map_or(48_000, Loopback::rate);
+            let microphone = Loopback::open_microphone(rate)
+                .map_err(|e| format!("{}: {}", tr!("microphone", "микрофон"), win::describe(&e)))?;
+            sources.push(microphone);
+        }
+        let audio = sources.first().map(|l| AudioConfig { sample_rate: l.rate() });
         let encoder = Encoder::new(&config.path, capturer.device(), video, audio)
             .map_err(|e| format!("{}: {}", tr!("encoder", "кодер"), win::describe(&e)))?;
         // With the pointer, the frame is composed into a second texture, so
@@ -392,7 +402,7 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
                 Err(PollError::Other(e)) => return Err(win::describe(&e)),
             }
         }
-        if let Some(l) = &loopback {
+        for l in &sources {
             log::debug!("audio: {} at {} Hz", l.method, l.rate());
         }
         let info = Info {
@@ -401,9 +411,9 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
             constant_quality: encoder.constant_quality,
             audio_rate: audio.map(|a| a.sample_rate),
         };
-        Ok((capturer, converter, Arc::new(encoder), loopback, info, drawer, local, clicks))
+        Ok((capturer, converter, Arc::new(encoder), sources, info, drawer, local, clicks))
     })();
-    let (mut capturer, mut converter, encoder, loopback, info, mut drawer, local, clicks) = match setup {
+    let (mut capturer, mut converter, encoder, sources, info, mut drawer, local, clicks) = match setup {
         Ok(s) => s,
         Err(e) => {
             let _ = ready.send(Err(e.clone()));
@@ -413,14 +423,14 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
     log::debug!("recording {}x{} at {} fps to {}", config.region.width, config.region.height, config.fps, config.path.display());
 
     let start = win::qpc_100ns();
-    let audio_thread = loopback.and_then(|loopback| {
+    let audio_thread = (!sources.is_empty()).then_some(sources).and_then(|sources| {
         let encoder = Arc::clone(&encoder);
         let shared = Arc::clone(shared);
         std::thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
                 let _com = win::com_init_mta();
-                if let Err(e) = run_audio(loopback, &encoder, start, &shared) {
+                if let Err(e) = run_audio(sources, &encoder, start, &shared) {
                     log::error!("audio stopped: {e}");
                     shared.audio_error.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
                 }
@@ -562,59 +572,156 @@ const AUDIO_TOLERANCE: i64 = 300_000;
 /// heard, a jump of 30 ms is.
 const AUDIO_DRIFT: i64 = 100_000;
 
-fn run_audio(mut loopback: Loopback, encoder: &Encoder, start: i64, shared: &Shared) -> Result<(), String> {
+/// The sound sources (the computer's, the microphone, or both, at one
+/// rate), each laid down on a track of its own and mixed into the file.
+fn run_audio(mut sources: Vec<Loopback>, encoder: &Encoder, start: i64, shared: &Shared) -> Result<(), String> {
     let describe = |e: windows::core::Error| format!("{}: {}", tr!("audio capture", "захват звука"), win::describe(&e));
-    let mut write = |samples: &[i16], time: i64, duration: i64| {
-        encoder.write_audio(samples, time, duration).map_err(|e| format!("{}: {}", tr!("encoder", "кодер"), win::describe(&e)))
+    let rate = i64::from(sources.first().map_or(48_000, Loopback::rate));
+    let mut write = |samples: &[i16], frame: i64| {
+        let (time, end) = (frame * 10_000_000 / rate, (frame + samples.len() as i64 / 2) * 10_000_000 / rate);
+        encoder.write_audio(samples, time, end - time).map_err(|e| format!("{}: {}", tr!("encoder", "кодер"), win::describe(&e)))
     };
-    let mut track = Track::new(i64::from(loopback.rate()));
-    loopback.start().map_err(describe)?;
+    let mut tracks: Vec<Track> = sources.iter().map(|_| Track::new(rate)).collect();
+    let mut mixer = Mixer::new(sources.len(), rate);
+    for source in &sources {
+        source.start().map_err(describe)?;
+    }
     let mut packets: Vec<(Vec<i16>, Option<i64>)> = Vec::new();
     let mut result = Ok(());
     let mut logged = 0;
-    loop {
-        loopback.wait(Duration::from_millis(10));
-        packets.clear();
-        if let Err(e) = loopback.drain(|p| packets.push((p.samples.to_vec(), p.qpc))) {
-            result = Err(describe(e));
-            break;
-        }
+    'record: loop {
+        sources[0].wait(Duration::from_millis(10));
         // A copy: the lock is not held while the encoder writes.
         let pauses = shared.pauses().clone();
-        for (samples, qpc) in packets.drain(..) {
-            // On the file's clock; recorded during a pause, dropped (one
-            // without a time, while paused).
-            let time = match qpc {
-                Some(qpc) => match pauses.before(qpc) {
-                    Some(paused) => Some(qpc - paused - start),
-                    None => continue,
-                },
-                None if pauses.paused() => continue,
-                None => None,
-            };
-            track.add(&samples, time, &mut write)?;
-        }
         let now = win::qpc_100ns();
         let now = now - pauses.total(now) - start;
-        track.flush(&mut write)?;
+        for (i, (source, track)) in sources.iter_mut().zip(&mut tracks).enumerate() {
+            packets.clear();
+            if let Err(e) = source.drain(|p| packets.push((p.samples.to_vec(), p.qpc))) {
+                result = Err(describe(e));
+                break 'record;
+            }
+            let mut push = |samples: &[i16], frame: i64| {
+                mixer.push(i, samples, frame);
+                Ok(())
+            };
+            for (samples, qpc) in packets.drain(..) {
+                // On the file's clock; recorded during a pause, dropped (one
+                // without a time, while paused).
+                let time = match qpc {
+                    Some(qpc) => match pauses.before(qpc) {
+                        Some(paused) => Some(qpc - paused - start),
+                        None => continue,
+                    },
+                    None if pauses.paused() => continue,
+                    None => None,
+                };
+                track.add(&samples, time, &mut push)?;
+            }
+            track.flush(&mut push)?;
+            // Nothing played for a while and no keep-alive: keep the track going.
+            track.keep_up(now, &mut push)?;
+        }
+        mixer.mix(false, &mut write)?;
         if now / 50_000_000 > logged {
             logged = now / 50_000_000;
-            log::debug!(
-                "audio at {:.2} s lags the clock by {} ms, {} frames added or left out",
-                track.end() as f64 / 1e7,
-                (now - track.end()) / 10_000,
-                track.corrections
-            );
+            for (track, source) in tracks.iter().zip(&sources) {
+                log::debug!(
+                    "{} at {:.2} s lags the clock by {} ms, {} frames added or left out",
+                    source.method,
+                    track.end() as f64 / 1e7,
+                    (now - track.end()) / 10_000,
+                    track.corrections
+                );
+            }
         }
-        // Nothing played for a while and no keep-alive: keep the track going.
-        track.keep_up(now, &mut write)?;
         // Once more after the stop, for the packets of the last moment.
         if shared.stop.load(Relaxed) {
             break;
         }
     }
-    loopback.stop();
-    result
+    let mixed = mixer.mix(true, &mut write);
+    for source in &sources {
+        source.stop();
+    }
+    result.and(mixed)
+}
+
+/// A source this far behind the furthest one is taken as silent there: a
+/// stream that delivers nothing for a while does not hold the others up.
+const MIX_LAG: i64 = 10_000_000;
+
+/// The tracks of the sources summed into one. Each writes its samples at
+/// their frames, contiguous from where it starts; what every source has
+/// reached is summed and written. A source not started yet, or more than
+/// `MIX_LAG` behind, counts as silence, and what it brings later for frames
+/// already written is dropped.
+struct Mixer {
+    rate: i64,
+    /// Per source: the frame of the first sample waiting, and the samples.
+    sources: Vec<Option<(i64, Vec<i16>)>>,
+    /// The next frame to write; `None` before any source has written.
+    next: Option<i64>,
+}
+
+impl Mixer {
+    fn new(sources: usize, rate: i64) -> Mixer {
+        Mixer { rate, sources: vec![None; sources], next: None }
+    }
+
+    fn push(&mut self, source: usize, samples: &[i16], frame: i64) {
+        let pending = self.sources[source].get_or_insert_with(|| (frame, Vec::new()));
+        // A track's writes follow on; a gap is silence, an overlap dropped.
+        let end = pending.0 + pending.1.len() as i64 / 2;
+        let mut samples = samples;
+        if frame > end {
+            pending.1.resize(pending.1.len() + (frame - end) as usize * 2, 0);
+        } else if frame < end {
+            samples = &samples[((end - frame) as usize * 2).min(samples.len())..];
+        }
+        pending.1.extend_from_slice(samples);
+        // What lies before the frames written is too late.
+        if let Some(next) = self.next
+            && pending.0 < next
+        {
+            let drop = ((next - pending.0) as usize * 2).min(pending.1.len());
+            pending.1.drain(..drop);
+            pending.0 += drop as i64 / 2;
+        }
+    }
+
+    /// Writes what every source has reached (with `all`, what any has).
+    fn mix(&mut self, all: bool, write: &mut impl FnMut(&[i16], i64) -> Result<(), String>) -> Result<(), String> {
+        let ends: Vec<Option<i64>> = self.sources.iter().map(|s| s.as_ref().map(|(start, samples)| start + samples.len() as i64 / 2)).collect();
+        let Some(furthest) = ends.iter().flatten().max().copied() else { return Ok(()) };
+        let first = self.next.unwrap_or_else(|| self.sources.iter().flatten().map(|(start, _)| *start).min().unwrap_or(furthest));
+        let until = if all {
+            furthest
+        } else {
+            let slowest = ends.iter().map(|e| e.unwrap_or(i64::MIN)).min().unwrap_or(furthest);
+            slowest.max(furthest - MIX_LAG * self.rate / 10_000_000)
+        };
+        if until <= first {
+            return Ok(());
+        }
+        let mut out = vec![0i16; (until - first) as usize * 2];
+        for (start, samples) in self.sources.iter_mut().flatten() {
+            for frame in (*start).max(first)..(*start + samples.len() as i64 / 2).min(until) {
+                let (from, to) = ((frame - *start) as usize * 2, (frame - first) as usize * 2);
+                out[to] = out[to].saturating_add(samples[from]);
+                out[to + 1] = out[to + 1].saturating_add(samples[from + 1]);
+            }
+            let used = (until - *start).clamp(0, samples.len() as i64 / 2);
+            samples.drain(..used as usize * 2);
+            *start += used;
+            // Left behind: it starts again where the file is.
+            if samples.is_empty() && *start < until {
+                *start = until;
+            }
+        }
+        self.next = Some(until);
+        write(&out, first)
+    }
 }
 
 /// The sound track as it is laid down: where the next sample goes,
@@ -651,7 +758,8 @@ impl Track {
 
     /// Lays down a packet recorded at `time` (on the recording's clock;
     /// `None` when the device gave no time: it continues the track).
-    fn add(&mut self, samples: &[i16], time: Option<i64>, write: &mut impl FnMut(&[i16], i64, i64) -> Result<(), String>) -> Result<(), String> {
+    /// `write` takes samples and the frame of the first.
+    fn add(&mut self, samples: &[i16], time: Option<i64>, write: &mut impl FnMut(&[i16], i64) -> Result<(), String>) -> Result<(), String> {
         let mut samples = samples;
         let mut at = time.map_or(self.position.unwrap_or(0), |t| self.frames(t));
         if at < 0 {
@@ -701,26 +809,25 @@ impl Track {
     }
 
     /// Writes the samples waiting.
-    fn flush(&mut self, write: &mut impl FnMut(&[i16], i64, i64) -> Result<(), String>) -> Result<(), String> {
+    fn flush(&mut self, write: &mut impl FnMut(&[i16], i64) -> Result<(), String>) -> Result<(), String> {
         if self.buffer.is_empty() {
             return Ok(());
         }
         let end = self.buffer_start + self.buffer.len() as i64 / 2;
-        let (time, duration) = (self.time(self.buffer_start), self.time(end) - self.time(self.buffer_start));
-        let result = write(&self.buffer, time, duration);
+        let result = write(&self.buffer, self.buffer_start);
         self.buffer.clear();
         self.buffer_start = end;
         result
     }
 
     /// `frames` of silence from the position on; the buffer is empty.
-    fn silence(&mut self, frames: i64, write: &mut impl FnMut(&[i16], i64, i64) -> Result<(), String>) -> Result<(), String> {
+    fn silence(&mut self, frames: i64, write: &mut impl FnMut(&[i16], i64) -> Result<(), String>) -> Result<(), String> {
         let mut at = self.position.unwrap_or(0);
         let end = at + frames;
         while at < end {
             let chunk = (end - at).min(self.rate);
             let silence = vec![0i16; chunk as usize * 2];
-            write(&silence, self.time(at), self.time(at + chunk) - self.time(at))?;
+            write(&silence, at)?;
             at += chunk;
         }
         self.position = Some(end);
@@ -731,7 +838,7 @@ impl Track {
     /// Silence up to a second before `now` when the track has fallen more
     /// than five behind: a stream that delivers nothing while nothing
     /// plays.
-    fn keep_up(&mut self, now: i64, write: &mut impl FnMut(&[i16], i64, i64) -> Result<(), String>) -> Result<(), String> {
+    fn keep_up(&mut self, now: i64, write: &mut impl FnMut(&[i16], i64) -> Result<(), String>) -> Result<(), String> {
         let lag = self.frames(now) - self.position.unwrap_or(0);
         if lag > self.frames(5 * 10_000_000) {
             self.flush(write)?;
@@ -749,9 +856,8 @@ mod tests {
     /// What a track writes, as (first frame, frames, the samples' first value).
     fn lay(track: &mut Track, packets: &[(usize, Option<i64>, i16)]) -> Vec<(i64, i64, i16)> {
         let mut out = Vec::new();
-        let rate = track.rate;
-        let mut write = |s: &[i16], time: i64, duration: i64| {
-            out.push((time * rate / 10_000_000, (duration * rate + 5_000_000) / 10_000_000, s[0]));
+        let mut write = |s: &[i16], frame: i64| {
+            out.push((frame, s.len() as i64 / 2, s[0]));
             Ok(())
         };
         for &(frames, time, value) in packets {
@@ -804,15 +910,60 @@ mod tests {
     fn track_keeps_up_with_the_clock() {
         let mut track = Track::new(48_000);
         let mut out = Vec::new();
-        let mut write = |_: &[i16], time: i64, duration: i64| {
-            out.push((time, duration));
+        let mut write = |s: &[i16], frame: i64| {
+            out.push((frame, s.len() as i64 / 2));
             Ok(())
         };
         track.keep_up(4 * 10_000_000, &mut write).unwrap();
         assert_eq!(track.end(), 0);
         track.keep_up(6 * 10_000_000, &mut write).unwrap();
         assert_eq!(track.end(), 5 * 10_000_000);
-        assert_eq!(out.first(), Some(&(0, 10_000_000)));
+        assert_eq!(out.first(), Some(&(0, 48_000)));
+    }
+
+    /// What a mixer writes, as (first frame, frames, the first left sample).
+    fn mixed(mixer: &mut Mixer, all: bool) -> Vec<(i64, i64, i16)> {
+        let mut out = Vec::new();
+        mixer
+            .mix(all, &mut |s: &[i16], frame: i64| {
+                out.push((frame, s.len() as i64 / 2, s[0]));
+                Ok(())
+            })
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn mixer_sums_what_both_sources_reached() {
+        let mut mixer = Mixer::new(2, 48_000);
+        mixer.push(0, &[100; 200], 1000);
+        // The second source has not started: nothing yet within the lag.
+        assert_eq!(mixed(&mut mixer, false), vec![]);
+        mixer.push(1, &[10; 100], 1000);
+        assert_eq!(mixed(&mut mixer, false), vec![(1000, 50, 110)]);
+        // The rest of the first, the second silent for it at the end.
+        assert_eq!(mixed(&mut mixer, true), vec![(1050, 50, 100)]);
+        // Late samples of the second are dropped; later ones are mixed.
+        mixer.push(1, &[10; 200], 1080);
+        mixer.push(0, &[100; 40], 1100);
+        assert_eq!(mixed(&mut mixer, false), vec![(1100, 20, 110)]);
+    }
+
+    #[test]
+    fn mixer_does_not_wait_for_a_silent_source() {
+        let mut mixer = Mixer::new(2, 48_000);
+        mixer.push(0, &[1; 2 * 60_000], 0);
+        // More than a second ahead: written up to a second before its end.
+        assert_eq!(mixed(&mut mixer, false), vec![(0, 12_000, 1)]);
+        // A source alone is written as it is.
+        let mut alone = Mixer::new(1, 48_000);
+        alone.push(0, &[7; 20], 5);
+        assert_eq!(mixed(&mut alone, false), vec![(5, 10, 7)]);
+        // Two loud ones are clipped, not wrapped.
+        let mut loud = Mixer::new(2, 48_000);
+        loud.push(0, &[30_000; 2], 0);
+        loud.push(1, &[30_000; 2], 0);
+        assert_eq!(mixed(&mut loud, false), vec![(0, 1, i16::MAX)]);
     }
 
     #[test]
