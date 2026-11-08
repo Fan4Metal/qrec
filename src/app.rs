@@ -445,6 +445,7 @@ impl App {
             log::debug!("tray: {command:?}");
             match command {
                 tray::Command::Toggle => self.toggle(ctx),
+                tray::Command::Pause => self.toggle_pause(),
                 tray::Command::Show => {
                     if let Some(hwnd) = self.window {
                         win::show_window(hwnd, true);
@@ -507,6 +508,14 @@ impl App {
             self.audio_warning = Some(warning);
             ctx.request_repaint();
         }
+    }
+
+    /// Pauses the recording or resumes it.
+    fn toggle_pause(&mut self) {
+        if let Some(recorder) = &self.recorder {
+            recorder.set_paused(!recorder.paused());
+        }
+        self.update_tray();
     }
 
     fn toggle(&mut self, ctx: &egui::Context) {
@@ -841,6 +850,7 @@ impl App {
         if let Some((tray, _)) = &self.tray {
             tray.set(tray::Status {
                 clock: self.clock(),
+                paused: self.recorder.as_ref().is_some_and(Recorder::paused),
                 tray_only: !self.taskbar,
                 close_to_tray: self.close_to_tray,
                 minimise_on_record: self.minimise_on_record,
@@ -860,7 +870,7 @@ impl App {
     /// The time recorded, `00:01:23`, while recording.
     fn clock(&self) -> Option<String> {
         self.recorder.as_ref().map(|recorder| {
-            let elapsed = recorder.started.elapsed().as_secs();
+            let elapsed = recorder.elapsed().as_secs();
             format!("{:02}:{:02}:{:02}", elapsed / 3600, elapsed / 60 % 60, elapsed % 60)
         })
     }
@@ -1428,6 +1438,12 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
                 if record_button(ui, clock.as_deref(), self.selecting.is_none()) {
                     self.toggle(&ui.ctx().clone());
                 }
+                if let Some(paused) = self.recorder.as_ref().map(Recorder::paused) {
+                    ui.add_space(6.0 - ui.spacing().item_spacing.x);
+                    if pause_button(ui, paused) {
+                        self.toggle_pause();
+                    }
+                }
             });
         });
         ui.add_space(10.0);
@@ -1833,6 +1849,29 @@ fn record_button(ui: &mut egui::Ui, clock: Option<&str>, enabled: bool) -> bool 
     }
     painter.galley(egui::pos2(left + mark + gap, rect.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
     let hint = if clock.is_some() { tr!("Stop", "Стоп") } else { tr!("Record", "Запись") };
+    response.on_hover_text(hint).clicked()
+}
+
+/// The pause button beside the record button while recording, as high as
+/// it and square: two bars, or a triangle to resume, filled with the
+/// selection colour while paused. True when clicked.
+fn pause_button(ui: &mut egui::Ui, paused: bool) -> bool {
+    let selection = ui.visuals().selection;
+    let button = egui::Button::new("").min_size(Vec2::splat(BAR_HEIGHT)).corner_radius(BAR_CORNER);
+    let button = if paused { button.fill(selection.bg_fill) } else { button };
+    let response = ui.add(button);
+    let colour = if paused { selection.stroke.color } else { ui.style().interact(&response).fg_stroke.color };
+    let c = response.rect.center();
+    let painter = ui.painter();
+    if paused {
+        let points = vec![c + Vec2::new(-4.5, -7.0), c + Vec2::new(7.0, 0.0), c + Vec2::new(-4.5, 7.0)];
+        painter.add(egui::Shape::convex_polygon(points, colour, egui::Stroke::NONE));
+    } else {
+        for x in [-3.5, 3.5] {
+            painter.rect_filled(egui::Rect::from_center_size(c + Vec2::new(x, 0.0), Vec2::new(4.0, 14.0)), 1.0, colour);
+        }
+    }
+    let hint = if paused { tr!("Resume recording", "Продолжить запись") } else { tr!("Pause recording", "Приостановить запись") };
     response.on_hover_text(hint).clicked()
 }
 

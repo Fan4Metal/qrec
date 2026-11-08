@@ -33,6 +33,8 @@ use crate::win::wide;
 pub enum Command {
     /// Start or stop the recording, as the hotkey does.
     Toggle,
+    /// Pause the recording or resume it.
+    Pause,
     /// Show the window in front of the others.
     Show,
     /// Put the window's button on the taskbar or take it off.
@@ -81,6 +83,7 @@ const MENU_TRIM_AFTER_RECORD: usize = 8;
 const MENU_FOLDER: usize = 9;
 const MENU_RECORDINGS: usize = 10;
 const MENU_UPDATE: usize = 11;
+const MENU_PAUSE: usize = 12;
 /// The latest recordings: this plus their place in `Status::recent`.
 const MENU_RECENT: usize = 100;
 
@@ -89,6 +92,8 @@ const MENU_RECENT: usize = 100;
 pub struct Status {
     /// The time recorded, `None` when there is no recording.
     pub clock: Option<String>,
+    /// Whether the recording is paused.
+    pub paused: bool,
     /// Whether the window is kept off the taskbar.
     pub tray_only: bool,
     /// Whether closing the window hides it.
@@ -246,8 +251,12 @@ fn load_icon(recording: bool) -> HICON {
 fn notify(hwnd: HWND, op: NOTIFY_ICON_MESSAGE) -> bool {
     CONTEXT.with_borrow(|c| {
         let Some(c) = c else { return false };
-        let clock = c.state.lock().unwrap().clock.clone();
+        let (clock, paused) = {
+            let state = c.state.lock().unwrap();
+            (state.clock.clone(), state.paused)
+        };
         let tip = match &clock {
+            Some(clock) if paused => format!("qrec: {} {clock}", tr!("paused at", "пауза на")),
             Some(clock) => format!("qrec: {} {clock}", tr!("recording", "запись")),
             None => "qrec".to_owned(),
         };
@@ -288,6 +297,7 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
     let state = CONTEXT.with_borrow(|c| c.as_ref().map(|c| c.state.lock().unwrap().clone())).unwrap_or_default();
     let recording = state.clock.is_some();
     let toggle = wide(if recording { tr!("Stop recording", "Остановить запись") } else { tr!("Start recording", "Начать запись") });
+    let pause = wide(if state.paused { tr!("Resume recording", "Продолжить запись") } else { tr!("Pause recording", "Приостановить запись") });
     let show = wide(tr!("Show the window", "Показать окно"));
     let taskbar = wide(tr!("Not on the taskbar", "Не показывать на панели задач"));
     let close_to_tray = wide(tr!("Hide when closed", "Сворачивать в трей при закрытии"));
@@ -304,6 +314,9 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
     unsafe {
         let menu = CreatePopupMenu().ok()?;
         let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, PCWSTR(toggle.as_ptr()));
+        if recording {
+            let _ = AppendMenuW(menu, MF_STRING, MENU_PAUSE, PCWSTR(pause.as_ptr()));
+        }
         let _ = AppendMenuW(menu, MF_STRING, MENU_SHOW, PCWSTR(show.as_ptr()));
         // A click on one opens it in the trimming window.
         if let Ok(list) = CreatePopupMenu() {
@@ -340,6 +353,7 @@ unsafe fn menu(hwnd: HWND, x: i32, y: i32) -> Option<Command> {
         let _ = DestroyMenu(menu);
         match chosen {
             MENU_TOGGLE => Some(Command::Toggle),
+            MENU_PAUSE => Some(Command::Pause),
             MENU_SHOW => Some(Command::Show),
             MENU_TASKBAR => Some(Command::Taskbar),
             MENU_CLOSE_TO_TRAY => Some(Command::CloseToTray),

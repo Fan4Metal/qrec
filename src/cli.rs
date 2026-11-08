@@ -1,6 +1,6 @@
 //! `qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N]
 //! [--quality low|medium|high] [--no-audio | --audio-app NAME.exe
-//! [--no-boost]] [--out FILE]`: a recording without the window, for checking the
+//! [--no-boost]] [--pause FROM-TO] [--out FILE]`: a recording without the window, for checking the
 //! pipeline from a console. `qrec --cut FILE --from S --to S [--out FILE]`
 //! and `qrec --info FILE`: a cut and a look at a file, the same way.
 
@@ -35,6 +35,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
     let mut cursor = true;
     let mut out: Option<PathBuf> = None;
     let mut border = false;
+    // Seconds into the run: paused from, resumed at (left out of the file).
+    let mut pause: Option<(f64, f64)> = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
@@ -49,12 +51,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--no-boost" => boost = false,
             "--no-cursor" => cursor = false,
             "--border" => border = true,
+            "--pause" => {
+                let v = value()?;
+                let parsed = v.split_once('-').and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?)));
+                pause = Some(parsed.filter(|(a, b)| *a >= 0.0 && b > a).ok_or("--pause wants FROM-TO in seconds")?);
+            }
             "--out" => out = Some(PathBuf::from(value()?)),
             s if seconds.is_none() => seconds = Some(s.parse().map_err(|_| format!("unknown argument {s}"))?),
             s => return Err(format!("unknown argument {s}")),
         }
     }
-    let seconds = seconds.ok_or("usage: qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality Q] [--rate quality|bitrate] [--no-audio | --audio-app NAME.exe [--no-boost]] [--out FILE]")?;
+    let seconds = seconds.ok_or("usage: qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality Q] [--rate quality|bitrate] [--no-audio | --audio-app NAME.exe [--no-boost]] [--pause FROM-TO] [--out FILE]")?;
     if let Some(Source::App { boost: b, .. }) = &mut audio {
         *b = boost;
     }
@@ -101,6 +108,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
     while started.elapsed().as_secs_f64() < seconds {
         if recorder.failed() {
             break;
+        }
+        if let Some((from, to)) = pause {
+            let now = started.elapsed().as_secs_f64();
+            let wanted = now >= from && now < to;
+            if wanted != recorder.paused() {
+                say!("{} at {now:.1} s", if wanted { "paused" } else { "resumed" });
+                recorder.set_paused(wanted);
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }

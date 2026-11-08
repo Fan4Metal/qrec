@@ -155,6 +155,61 @@ struct Shared {
     error: Mutex<Option<String>>,
     /// Why the sound stopped, when it did; the picture goes on.
     audio_error: Mutex<Option<String>>,
+    pauses: Mutex<Pauses>,
+}
+
+impl Shared {
+    fn pauses(&self) -> std::sync::MutexGuard<'_, Pauses> {
+        self.pauses.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The pauses of a recording, on the performance counter (100 ns units):
+/// from when to when, the last one open while paused. The file leaves them
+/// out: a time on the counter is moved back by the pauses before it, and
+/// what was captured during one is dropped. The video thread encodes no
+/// ticks while paused; the audio thread maps each packet by its own time,
+/// so a packet of the moment before the pause that arrives after it still
+/// counts.
+#[derive(Clone, Default, Debug)]
+struct Pauses(Vec<(i64, Option<i64>)>);
+
+impl Pauses {
+    fn paused(&self) -> bool {
+        self.0.last().is_some_and(|(_, to)| to.is_none())
+    }
+
+    fn pause(&mut self, now: i64) {
+        if !self.paused() {
+            self.0.push((now, None));
+        }
+    }
+
+    fn resume(&mut self, now: i64) {
+        if let Some((from, to @ None)) = self.0.last_mut() {
+            *to = Some(now.max(*from));
+        }
+    }
+
+    /// The time paused before `t`; `None` when `t` falls in a pause.
+    fn before(&self, t: i64) -> Option<i64> {
+        let mut sum = 0;
+        for &(from, to) in &self.0 {
+            if t < from {
+                break;
+            }
+            match to {
+                Some(to) if t >= to => sum += to - from,
+                _ => return None,
+            }
+        }
+        Some(sum)
+    }
+
+    /// The time paused up to `now`, an open pause included.
+    fn total(&self, now: i64) -> i64 {
+        self.0.iter().map(|&(from, to)| to.unwrap_or(now).max(from) - from).sum()
+    }
 }
 
 pub struct Recorder {
@@ -224,6 +279,29 @@ impl Recorder {
     /// it, and the file is complete all the same.
     pub fn audio_error(&self) -> Option<String> {
         self.shared.audio_error.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Pauses the recording, or resumes it: the time paused is left out of
+    /// the file.
+    pub fn set_paused(&self, paused: bool) {
+        let now = win::qpc_100ns();
+        let mut pauses = self.shared.pauses();
+        if paused {
+            pauses.pause(now);
+        } else {
+            pauses.resume(now);
+        }
+        log::debug!("paused: {paused}");
+    }
+
+    pub fn paused(&self) -> bool {
+        self.shared.pauses().paused()
+    }
+
+    /// The time recorded, the pauses left out.
+    pub fn elapsed(&self) -> Duration {
+        let paused = self.shared.pauses().total(win::qpc_100ns());
+        self.started.elapsed().saturating_sub(Duration::from_nanos(paused.max(0) as u64 * 100))
     }
 
     /// Stops and completes the file; blocks until the index is written.
@@ -353,7 +431,30 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
     let mut lost_since: Option<Instant> = None;
     let mut result = Ok(());
     'record: while !shared.stop.load(Relaxed) {
-        let target = start + tick * interval;
+        let (paused, offset) = {
+            let pauses = shared.pauses();
+            (pauses.paused(), pauses.total(win::qpc_100ns()))
+        };
+        if paused {
+            // Nothing is encoded, and the ticks wait; the desktop is still
+            // read, so the first frame after the pause is the current one.
+            match capturer.poll(20) {
+                Ok(_) => {}
+                Err(PollError::AccessLost) => {
+                    if capturer.recreate().is_err() {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                Err(PollError::Other(e)) => {
+                    result = Err(format!("{}: {}", tr!("screen capture", "захват экрана"), win::describe(&e)));
+                    break 'record;
+                }
+            }
+            continue;
+        }
+        // The clock of the file: the counter less the time paused.
+        let base = start + offset;
+        let target = base + tick * interval;
         loop {
             let remaining = target - win::qpc_100ns();
             // Behind the clock (the encoder slower than the frame rate):
@@ -390,7 +491,7 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
         }
         if !capturer.has_frame() {
             // Nothing captured yet (the duplication was just recreated).
-            tick = (win::qpc_100ns() - start) / interval + 1;
+            tick = (win::qpc_100ns() - base) / interval + 1;
             continue;
         }
         if let Some((composed, drawer)) = &mut drawer {
@@ -423,7 +524,7 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
             log::debug!("tick {tick}: {} output textures", converter.pool_size());
         }
         // Behind by whole frames: skip them, the timestamps stay on the clock.
-        let behind = (win::qpc_100ns() - (start + tick * interval)) / interval;
+        let behind = (win::qpc_100ns() - (base + tick * interval)) / interval;
         if behind > 0 {
             shared.dropped.fetch_add(behind as u64, Relaxed);
             tick += behind;
@@ -469,11 +570,24 @@ fn run_audio(mut loopback: Loopback, encoder: &Encoder, start: i64, shared: &Sha
             result = Err(describe(e));
             break;
         }
+        // A copy: the lock is not held while the encoder writes.
+        let pauses = shared.pauses().clone();
         for (samples, qpc) in packets.drain(..) {
-            track.add(&samples, qpc.map(|qpc| qpc - start), &mut write)?;
+            // On the file's clock; recorded during a pause, dropped (one
+            // without a time, while paused).
+            let time = match qpc {
+                Some(qpc) => match pauses.before(qpc) {
+                    Some(paused) => Some(qpc - paused - start),
+                    None => continue,
+                },
+                None if pauses.paused() => continue,
+                None => None,
+            };
+            track.add(&samples, time, &mut write)?;
         }
+        let now = win::qpc_100ns();
+        let now = now - pauses.total(now) - start;
         track.flush(&mut write)?;
-        let now = win::qpc_100ns() - start;
         if now / 50_000_000 > logged {
             logged = now / 50_000_000;
             log::debug!(
@@ -690,6 +804,29 @@ mod tests {
         track.keep_up(6 * 10_000_000, &mut write).unwrap();
         assert_eq!(track.end(), 5 * 10_000_000);
         assert_eq!(out.first(), Some(&(0, 10_000_000)));
+    }
+
+    #[test]
+    fn pauses_are_left_out() {
+        let mut pauses = Pauses::default();
+        assert_eq!(pauses.before(100), Some(0));
+        pauses.pause(1000);
+        pauses.pause(1500);
+        assert!(pauses.paused());
+        assert_eq!(pauses.before(999), Some(0));
+        assert_eq!(pauses.before(1200), None);
+        assert_eq!(pauses.total(1600), 600);
+        pauses.resume(2000);
+        pauses.resume(2500);
+        assert!(!pauses.paused());
+        assert_eq!(pauses.before(2000), Some(1000));
+        assert_eq!(pauses.total(9000), 1000);
+        pauses.pause(3000);
+        pauses.resume(3100);
+        assert_eq!(pauses.before(2999), Some(1000));
+        assert_eq!(pauses.before(3050), None);
+        assert_eq!(pauses.before(5000), Some(1100));
+        assert_eq!(pauses.total(5000), 1100);
     }
 
     #[test]
