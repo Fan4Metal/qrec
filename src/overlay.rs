@@ -39,6 +39,10 @@ use crate::win;
 /// Alpha of the veil over the parts not selected.
 const DIM: u32 = 0x66_000000;
 const WHITE: u32 = 0xFF_FFFFFF;
+/// The selection itself, clear: not fully transparent, since a layered
+/// window lets clicks through its pixels of alpha 0, and a click on the
+/// outlined window would reach that window instead of the selection.
+const CLEAR: u32 = 0x01_000000;
 const LABEL_BACKGROUND: u32 = 0xFF_202020;
 
 /// Opens the selection over all monitors and reports what was chosen:
@@ -453,7 +457,7 @@ fn paint_selection(hwnd: HWND, all: bool) {
         };
         fill(dirty, DIM);
         if let Some(r) = selection {
-            fill(r, 0);
+            fill(r, CLEAR);
             let b = OUTLINE;
             fill(Rect { left: r.left - b, top: r.top - b, right: r.right + b, bottom: r.top }, WHITE);
             fill(Rect { left: r.left - b, top: r.bottom, right: r.right + b, bottom: r.bottom + b }, WHITE);

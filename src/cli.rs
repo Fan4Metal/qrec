@@ -326,11 +326,11 @@ pub fn info(path: Option<PathBuf>) -> i32 {
     }
 }
 
-/// `qrec --test-select [click]`: opens the selection overlay and drives it
-/// with posted mouse messages (a drag from (100, 100) to (739, 459) on the
-/// virtual screen, or a click in the middle of the primary display, which
-/// picks the window there), then prints what it reported. The screen dims
-/// for a moment; the real mouse is not touched.
+/// `qrec --test-select [click]`: opens the selection overlay and drives it:
+/// with posted mouse messages, a drag from (100, 100) to (739, 459) on the
+/// virtual screen; with `click`, a real click in the middle of the primary
+/// display (the pointer moves there and back), which picks the window
+/// there. Then prints what it reported. The screen dims for a moment.
 pub fn test_select(args: Vec<String>) -> i32 {
     let click = args.first().is_some_and(|a| a == "click");
     use windows::Win32::Foundation::{LPARAM, WPARAM};
@@ -355,10 +355,25 @@ pub fn test_select(args: Vec<String>) -> i32 {
     };
     std::thread::sleep(std::time::Duration::from_millis(300));
     if click {
-        post(WM_MOUSEMOVE, middle.0, middle.1);
+        // A real click, not posted messages: those skip the hit test, and
+        // a click the overlay lets through to the window under it would
+        // pass unnoticed. The pointer is put back afterwards.
+        use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT, SendInput};
+        use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+        let mut saved = windows::Win32::Foundation::POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut saved);
+            let _ = SetCursorPos(middle.0, middle.1);
+        }
         std::thread::sleep(std::time::Duration::from_millis(500));
-        post(WM_LBUTTONDOWN, middle.0, middle.1);
-        post(WM_LBUTTONUP, middle.0 + 1, middle.1);
+        let button = |flags| INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dwFlags: flags, ..Default::default() } } };
+        unsafe {
+            SendInput(&[button(MOUSEEVENTF_LEFTDOWN), button(MOUSEEVENTF_LEFTUP)], size_of::<INPUT>() as i32);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        unsafe {
+            let _ = SetCursorPos(saved.x, saved.y);
+        }
     } else {
         post(WM_LBUTTONDOWN, 100, 100);
         for i in 1..=20 {
