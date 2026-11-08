@@ -282,10 +282,39 @@ pub fn videos_dir() -> Option<PathBuf> {
     }
 }
 
-/// Opens Explorer on the folder with the file selected.
+/// Opens Explorer on the folder with the file selected, through the shell
+/// (`SHOpenFolderAndSelectItems`): `explorer /select` could leave the
+/// Explorer window behind this one. On a thread of its own, in a
+/// single-threaded apartment as the shell wants, so a slow folder (a
+/// network drive) does not hold up the window; `explorer /select` when the
+/// shell fails.
 pub fn show_in_explorer(path: &std::path::Path) {
-    let arg = format!("/select,{}", path.display());
-    let _ = std::process::Command::new("explorer.exe").arg(arg).spawn();
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize};
+    use windows::Win32::UI::Shell::{SHOpenFolderAndSelectItems, SHParseDisplayName};
+    let path = path.to_path_buf();
+    let spawned = std::thread::Builder::new().name("show in explorer".into()).spawn(move || {
+        let name = wide(&path);
+        let shown = unsafe {
+            let initialised = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+            let mut pidl = std::ptr::null_mut();
+            let mut shown = SHParseDisplayName(PCWSTR(name.as_ptr()), None, &mut pidl, 0, None);
+            if shown.is_ok() {
+                shown = SHOpenFolderAndSelectItems(pidl, None, 0);
+                CoTaskMemFree(Some(pidl as *const _));
+            }
+            if initialised {
+                CoUninitialize();
+            }
+            shown
+        };
+        if let Err(e) = shown {
+            log::warn!("the shell did not show {}: {}", path.display(), describe(&e));
+            let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{}", path.display())).spawn();
+        }
+    });
+    if let Err(e) = spawned {
+        log::warn!("no thread to show the file: {e}");
+    }
 }
 
 /// Opens `target` (a web address here) as Explorer would. eframe opens
