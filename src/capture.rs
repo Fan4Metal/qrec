@@ -72,6 +72,8 @@ pub struct Capturer {
     device_name: String,
     /// An HDR desktop's area into the frame; `None` for an SDR one.
     tone: Option<ToneMapper>,
+    /// A window the area follows, and its monitor on the virtual screen.
+    following: Option<(isize, crate::region::Rect)>,
 }
 
 impl Capturer {
@@ -111,6 +113,7 @@ impl Capturer {
             shapes: 0,
             device_name: monitor.device_name.clone(),
             tone: None,
+            following: None,
         };
         capturer.recreate()?;
         Ok(capturer)
@@ -133,12 +136,27 @@ impl Capturer {
         self.has_frame
     }
 
-    /// Moves the area (the same size, in the monitor's pixels): the next
-    /// desktop frame is copied from there. Moving a window changes the
-    /// desktop, so one comes.
-    pub fn move_to(&mut self, region: Region) {
-        debug_assert_eq!((region.width, region.height), (self.region.width, self.region.height));
-        self.region = region;
+    /// Has the area follow `window`: before each desktop frame is copied
+    /// the area is moved to the window's corner (`Region::follow`, held
+    /// on the monitor `bounds`, on the virtual screen), so the picture and
+    /// the place are of one moment. Moving a window changes the desktop,
+    /// so a frame comes.
+    pub fn follow(&mut self, window: isize, bounds: crate::region::Rect) {
+        self.following = Some((window, bounds));
+    }
+
+    /// The area now, in the monitor's pixels.
+    pub fn region(&self) -> Region {
+        self.region
+    }
+
+    /// The area moved after the window it follows.
+    fn keep_up(&mut self) {
+        let Some((window, bounds)) = self.following else { return };
+        let Some(seen) = crate::win::window_bounds(window) else { return };
+        let origin = (bounds.left, bounds.top);
+        let now = Region { x: self.region.x + origin.0, y: self.region.y + origin.1, ..self.region };
+        self.region = now.follow(seen, bounds).relative_to(origin);
     }
 
     /// Opens the duplication (again, after it was lost): 8-bit BGRA, or
@@ -233,6 +251,7 @@ impl Capturer {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             unsafe { texture.GetDesc(&mut desc) };
             self.prepare(desc.Format)?;
+            self.keep_up();
             let r = self.region;
             let source = D3D11_BOX {
                 left: r.x as u32,

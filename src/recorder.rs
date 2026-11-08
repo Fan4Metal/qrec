@@ -421,9 +421,9 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
             constant_quality: encoder.constant_quality,
             audio_rate: audio.map(|a| a.sample_rate),
         };
-        Ok((capturer, converter, Arc::new(encoder), sources, info, drawer, local, clicks))
+        Ok((capturer, converter, Arc::new(encoder), sources, info, drawer, clicks))
     })();
-    let (mut capturer, mut converter, encoder, sources, info, mut drawer, local, clicks) = match setup {
+    let (mut capturer, mut converter, encoder, sources, info, mut drawer, clicks) = match setup {
         Ok(s) => s,
         Err(e) => {
             let _ = ready.send(Err(e.clone()));
@@ -453,10 +453,10 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
 
     let interval = 10_000_000 / i64::from(config.fps);
     let monitor_origin = (config.monitor.rect.left, config.monitor.rect.top);
-    // Where the area is now, on the virtual screen and in the monitor's
-    // pixels: it moves with a window it follows.
-    let mut region = config.region;
-    let mut local = local;
+    // The area moves with a window it follows, as each frame is copied.
+    if let Some(window) = config.follow {
+        capturer.follow(window, config.monitor.rect);
+    }
     let mut tick: i64 = 0;
     let mut lost_since: Option<Instant> = None;
     let mut result = Ok(());
@@ -481,14 +481,6 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
                 }
             }
             continue;
-        }
-        if let Some(bounds) = config.follow.and_then(win::window_bounds) {
-            let moved = region.follow(bounds, config.monitor.rect);
-            if moved != region {
-                region = moved;
-                local = moved.relative_to(monitor_origin);
-                capturer.move_to(local);
-            }
         }
         // The clock of the file: the counter less the time paused.
         let base = start + offset;
@@ -534,9 +526,12 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
         }
         if let Some((composed, drawer)) = &mut drawer {
             unsafe { capturer.context().CopyResource(&*composed, capturer.frame()) };
+            // Where the frame was taken from (it moves with a window).
+            let local = capturer.region();
             if let Some(clicks) = &clicks {
                 let now = win::qpc_100ns();
-                if let Err(e) = drawer.draw_clicks(&clicks.state(now), now, (region.x, region.y)) {
+                let corner = (local.x + monitor_origin.0, local.y + monitor_origin.1);
+                if let Err(e) = drawer.draw_clicks(&clicks.state(now), now, corner) {
                     log::warn!("clicks not drawn: {}", win::describe(&e));
                 }
             }

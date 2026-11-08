@@ -581,8 +581,57 @@ impl Drop for Border {
     }
 }
 
-fn run_border(mut region: Region, follow: Option<(isize, Rect)>, ready: mpsc::Sender<()>) {
-    use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SWP_NOSIZE as NOSIZE, SWP_NOZORDER, SetTimer, WM_TIMER};
+/// The frame following a window, on its thread: the frame's window, the
+/// window followed, its monitor, and where the frame's area is.
+struct Following {
+    frame: HWND,
+    window: isize,
+    monitor: Rect,
+    region: Region,
+}
+
+thread_local! {
+    static FOLLOWING: RefCell<Option<Following>> = const { RefCell::new(None) };
+}
+
+/// Moves the frame after the window it follows, if that has moved.
+fn keep_up_with_window() {
+    use windows::Win32::UI::WindowsAndMessaging::{SWP_NOSIZE as NOSIZE, SWP_NOZORDER};
+    FOLLOWING.with_borrow_mut(|f| {
+        let Some(f) = f else { return };
+        let Some(bounds) = win::window_bounds(f.window) else { return };
+        let moved = f.region.follow(bounds, f.monitor);
+        if moved != f.region {
+            f.region = moved;
+            unsafe {
+                let _ = SetWindowPos(f.frame, None, moved.x - BORDER, moved.y - BORDER, 0, 0, NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+    });
+}
+
+/// The followed window moved (a WinEvent of its own thread, delivered to
+/// this one): the frame follows at once, not on the next timer tick.
+unsafe extern "system" fn on_window_moved(
+    _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    object: i32,
+    _child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    let followed = FOLLOWING.with_borrow(|f| f.as_ref().map(|f| f.window));
+    if object == windows::Win32::UI::WindowsAndMessaging::OBJID_WINDOW.0 && followed == Some(hwnd.0 as isize) {
+        keep_up_with_window();
+    }
+}
+
+fn run_border(region: Region, follow: Option<(isize, Rect)>, ready: mpsc::Sender<()>) {
+    use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EVENT_OBJECT_LOCATIONCHANGE, GetWindowThreadProcessId, KillTimer, SetTimer, WINEVENT_OUTOFCONTEXT, WM_TIMER,
+    };
     const FOLLOW_TIMER: usize = 1;
     unsafe {
         let Ok(instance) = windows::Win32::System::LibraryLoader::GetModuleHandleW(None) else { return };
@@ -617,26 +666,39 @@ fn run_border(mut region: Region, follow: Option<(isize, Rect)>, ready: mpsc::Se
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         let _ = ready.send(());
-        if follow.is_some() {
-            SetTimer(Some(hwnd), FOLLOW_TIMER, 30, None);
+        // Following a window: moved by a WinEvent hook on the window's
+        // moves, with a timer besides in case one is missed.
+        let mut hook = None;
+        if let Some((window, monitor)) = follow {
+            FOLLOWING.with_borrow_mut(|f| *f = Some(Following { frame: hwnd, window, monitor, region }));
+            let mut process = 0u32;
+            let thread = GetWindowThreadProcessId(HWND(window as *mut _), Some(&mut process));
+            let h = SetWinEventHook(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                EVENT_OBJECT_LOCATIONCHANGE,
+                None,
+                Some(on_window_moved),
+                process,
+                thread,
+                WINEVENT_OUTOFCONTEXT,
+            );
+            hook = (!h.is_invalid()).then_some(h);
+            SetTimer(Some(hwnd), FOLLOW_TIMER, 100, None);
+            keep_up_with_window();
         }
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if msg.message == WM_TIMER
-                && let Some((window, monitor)) = follow
-            {
-                if let Some(bounds) = win::window_bounds(window) {
-                    let moved = region.follow(bounds, monitor);
-                    if moved != region {
-                        region = moved;
-                        let _ = SetWindowPos(hwnd, None, region.x - BORDER, region.y - BORDER, 0, 0, NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                    }
-                }
+            if msg.message == WM_TIMER {
+                keep_up_with_window();
                 continue;
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        if let Some(h) = hook {
+            let _ = UnhookWinEvent(h);
+        }
+        FOLLOWING.with_borrow_mut(|f| *f = None);
         let _ = KillTimer(Some(hwnd), FOLLOW_TIMER);
         let _ = DestroyWindow(hwnd);
     }
