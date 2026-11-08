@@ -92,7 +92,7 @@ The sound of one program is the process loopback of that program and its child p
 
 On earlier builds of Windows 10, the default output device is opened for loopback capture instead, which captures what is played through that device.
 
-The microphone is captured from the default recording device of Windows, converted by the audio engine to the same format, and mixed with the sound of the computer by the time of each packet; a stream that delivers nothing for more than a second is taken as silence meanwhile, so neither holds the other up.
+The microphone is captured from the default recording device of Windows, converted by the audio engine to the same format, and mixed with the sound of the computer by the time of each packet; a stream that delivers nothing for more than a second is taken as silence meanwhile, so neither holds the other up. The recording does not wait for the microphone: opening it can take a few seconds, or as long as an antivirus asks whether qrec may capture sound, and until then the microphone is silent in the file. When it cannot be opened (access to the microphone is turned off in the privacy settings of Windows, say), the recording goes on without it and the window says so.
 
 The audio and the video share one clock, the performance counter of Windows: a packet of sound is placed at the time it was recorded, gaps are filled with silence, and the video frames are stamped at fixed intervals of the same clock, so the two stay in step.
 

@@ -547,6 +547,15 @@ impl App {
             self.notice = Notice::Error(warning.clone());
             self.audio_warning = Some(warning);
             ctx.request_repaint();
+        } else if let Some(e) = self.recorder.as_ref().and_then(Recorder::microphone_error)
+            && self.audio_warning.is_none()
+        {
+            // The microphone would not open (refused by Windows' privacy
+            // settings or an antivirus); the rest is recorded.
+            let warning = format!("{e}. {}", tr!("The recording goes on without the microphone", "Запись продолжается без микрофона"));
+            self.notice = Notice::Error(warning.clone());
+            self.audio_warning = Some(warning);
+            ctx.request_repaint();
         }
     }
 

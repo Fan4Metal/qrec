@@ -308,7 +308,9 @@ impl Loopback {
         let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }.map_err(|e| context("Activate", e))?;
         let format = WAVEFORMATEX { nSamplesPerSec: rate, nAvgBytesPerSec: rate * 8, ..STEREO_FLOAT };
         let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        log::debug!("microphone: initialising");
         unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 10_000_000, 0, &format, None) }.map_err(|e| context("Initialize (microphone)", e))?;
+        log::debug!("microphone: initialised");
         let event = unsafe { CreateEventW(None, false, false, None).map_err(|e| context("CreateEvent", e))? };
         if let Err(e) = unsafe { client.SetEventHandle(event) } {
             unsafe {

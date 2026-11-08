@@ -162,6 +162,8 @@ struct Shared {
     error: Mutex<Option<String>>,
     /// Why the sound stopped, when it did; the picture goes on.
     audio_error: Mutex<Option<String>>,
+    /// Why the microphone could not be opened; the rest goes on.
+    microphone_error: Mutex<Option<String>>,
     pauses: Mutex<Pauses>,
 }
 
@@ -288,6 +290,12 @@ impl Recorder {
         self.shared.audio_error.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// Why the microphone could not be opened, when it could not: the
+    /// recording goes on without it.
+    pub fn microphone_error(&self) -> Option<String> {
+        self.shared.microphone_error.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Pauses the recording, or resumes it: the time paused is left out of
     /// the file.
     pub fn set_paused(&self, paused: bool) {
@@ -366,15 +374,11 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
             bitrate: bitrate(width, height, config.fps, config.quality),
             qp: (config.rate == RateControl::Quality).then(|| config.quality.qp()),
         };
-        // The microphone at the rate of the other sound, mixed with it.
-        let mut sources: Vec<Loopback> = loopback.into_iter().collect();
-        if config.microphone {
-            let rate = sources.first().map_or(48_000, Loopback::rate);
-            let microphone = Loopback::open_microphone(rate)
-                .map_err(|e| format!("{}: {}", tr!("microphone", "микрофон"), win::describe(&e)))?;
-            sources.push(microphone);
-        }
-        let audio = sources.first().map(|l| AudioConfig { sample_rate: l.rate() });
+        // The microphone is opened by the audio thread, at the rate of the
+        // other sound (its stream takes seconds to initialise here).
+        let sources: Vec<Loopback> = loopback.into_iter().collect();
+        let audio_rate = sources.first().map_or(48_000, Loopback::rate);
+        let audio = (!sources.is_empty() || config.microphone).then_some(AudioConfig { sample_rate: audio_rate });
         let encoder = Encoder::new(&config.path, capturer.device(), video, audio)
             .map_err(|e| format!("{}: {}", tr!("encoder", "кодер"), win::describe(&e)))?;
         // With the pointer, the frame is composed into a second texture, so
@@ -408,6 +412,9 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
         for l in &sources {
             log::debug!("audio: {} at {} Hz", l.method, l.rate());
         }
+        if config.microphone {
+            log::debug!("audio: the microphone at {audio_rate} Hz, once open");
+        }
         let info = Info {
             encoder: encoder.encoder_name.clone(),
             hardware: encoder.hardware,
@@ -426,14 +433,16 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
     log::debug!("recording {}x{} at {} fps to {}", config.region.width, config.region.height, config.fps, config.path.display());
 
     let start = win::qpc_100ns();
-    let audio_thread = (!sources.is_empty()).then_some(sources).and_then(|sources| {
+    let microphone = config.microphone;
+    let audio_rate = info.audio_rate;
+    let audio_thread = audio_rate.and_then(|rate| {
         let encoder = Arc::clone(&encoder);
         let shared = Arc::clone(shared);
         std::thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
                 let _com = win::com_init_mta();
-                if let Err(e) = run_audio(sources, &encoder, start, &shared) {
+                if let Err(e) = run_audio(sources, microphone, rate, &encoder, start, &shared) {
                     log::error!("audio stopped: {e}");
                     shared.audio_error.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
                 }
@@ -588,17 +597,32 @@ const AUDIO_TOLERANCE: i64 = 300_000;
 /// heard, a jump of 30 ms is.
 const AUDIO_DRIFT: i64 = 100_000;
 
-/// The sound sources (the computer's, the microphone, or both, at one
-/// rate), each laid down on a track of its own and mixed into the file.
-fn run_audio(mut sources: Vec<Loopback>, encoder: &Encoder, start: i64, shared: &Shared) -> Result<(), String> {
+/// The sound sources (the computer's, the microphone, or both, at `rate`),
+/// each laid down on a track of its own and mixed into the file. The
+/// microphone, when wanted, is opened on a thread of its own and joins
+/// the others once open (its stream takes seconds to initialise on some
+/// machines); until then it counts as silence. When it cannot be opened
+/// the recording goes on without it (`Shared::microphone_error`).
+fn run_audio(mut sources: Vec<Loopback>, microphone: bool, rate: u32, encoder: &Encoder, start: i64, shared: &Shared) -> Result<(), String> {
     let describe = |e: windows::core::Error| format!("{}: {}", tr!("audio capture", "захват звука"), win::describe(&e));
-    let rate = i64::from(sources.first().map_or(48_000, Loopback::rate));
+    let mut opening = microphone.then(|| {
+        let (tx, rx) = mpsc::channel();
+        let _ = std::thread::Builder::new().name("microphone".into()).spawn(move || {
+            let _com = win::com_init_mta();
+            let opened = Loopback::open_microphone(rate).map_err(|e| format!("{}: {}", tr!("microphone", "микрофон"), win::describe(&e)));
+            let _ = tx.send(opened);
+        });
+        rx
+    });
+    let rate = i64::from(rate);
     let mut write = |samples: &[i16], frame: i64| {
         let (time, end) = (frame * 10_000_000 / rate, (frame + samples.len() as i64 / 2) * 10_000_000 / rate);
         encoder.write_audio(samples, time, end - time).map_err(|e| format!("{}: {}", tr!("encoder", "кодер"), win::describe(&e)))
     };
-    let mut tracks: Vec<Track> = sources.iter().map(|_| Track::new(rate)).collect();
-    let mut mixer = Mixer::new(sources.len(), rate);
+    // The microphone's slot is the last one.
+    let slots = sources.len() + usize::from(microphone);
+    let mut tracks: Vec<Track> = (0..slots).map(|_| Track::new(rate)).collect();
+    let mut mixer = Mixer::new(slots, rate);
     for source in &sources {
         source.start().map_err(describe)?;
     }
@@ -606,7 +630,31 @@ fn run_audio(mut sources: Vec<Loopback>, encoder: &Encoder, start: i64, shared: 
     let mut result = Ok(());
     let mut logged = 0;
     'record: loop {
-        sources[0].wait(Duration::from_millis(10));
+        if let Some(rx) = &opening {
+            let opened = match rx.try_recv() {
+                Ok(opened) => Some(opened),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(tr!("microphone: not opened", "микрофон: не открыт").into())),
+            };
+            match opened.map(|o| o.and_then(|mic| mic.start().map(|()| mic).map_err(describe))) {
+                Some(Ok(mic)) => {
+                    log::debug!("the microphone joins at {:.2} s", (win::qpc_100ns() - start) as f64 / 1e7);
+                    sources.push(mic);
+                    opening = None;
+                }
+                Some(Err(e)) => {
+                    log::error!("{e}");
+                    shared.microphone_error.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
+                    mixer.retire(slots - 1);
+                    opening = None;
+                }
+                None => {}
+            }
+        }
+        match sources.first() {
+            Some(source) => source.wait(Duration::from_millis(10)),
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
         // A copy: the lock is not held while the encoder writes.
         let pauses = shared.pauses().clone();
         let now = win::qpc_100ns();
@@ -676,13 +724,22 @@ struct Mixer {
     rate: i64,
     /// Per source: the frame of the first sample waiting, and the samples.
     sources: Vec<Option<(i64, Vec<i16>)>>,
-    /// The next frame to write; `None` before any source has written.
-    next: Option<i64>,
+    /// Sources that will bring nothing more (a microphone that would not
+    /// open): not waited for.
+    retired: Vec<bool>,
+    /// The next frame to write: from the start of the file, silence until
+    /// the first source brings something (a microphone that takes seconds
+    /// to open, alone).
+    next: i64,
 }
 
 impl Mixer {
     fn new(sources: usize, rate: i64) -> Mixer {
-        Mixer { rate, sources: vec![None; sources], next: None }
+        Mixer { rate, sources: vec![None; sources], retired: vec![false; sources], next: 0 }
+    }
+
+    fn retire(&mut self, source: usize) {
+        self.retired[source] = true;
     }
 
     fn push(&mut self, source: usize, samples: &[i16], frame: i64) {
@@ -697,9 +754,8 @@ impl Mixer {
         }
         pending.1.extend_from_slice(samples);
         // What lies before the frames written is too late.
-        if let Some(next) = self.next
-            && pending.0 < next
-        {
+        let next = self.next;
+        if pending.0 < next {
             let drop = ((next - pending.0) as usize * 2).min(pending.1.len());
             pending.1.drain(..drop);
             pending.0 += drop as i64 / 2;
@@ -710,11 +766,11 @@ impl Mixer {
     fn mix(&mut self, all: bool, write: &mut impl FnMut(&[i16], i64) -> Result<(), String>) -> Result<(), String> {
         let ends: Vec<Option<i64>> = self.sources.iter().map(|s| s.as_ref().map(|(start, samples)| start + samples.len() as i64 / 2)).collect();
         let Some(furthest) = ends.iter().flatten().max().copied() else { return Ok(()) };
-        let first = self.next.unwrap_or_else(|| self.sources.iter().flatten().map(|(start, _)| *start).min().unwrap_or(furthest));
+        let first = self.next;
         let until = if all {
             furthest
         } else {
-            let slowest = ends.iter().map(|e| e.unwrap_or(i64::MIN)).min().unwrap_or(furthest);
+            let slowest = ends.iter().zip(&self.retired).filter(|(_, retired)| !**retired).map(|(e, _)| e.unwrap_or(i64::MIN)).min().unwrap_or(furthest);
             slowest.max(furthest - MIX_LAG * self.rate / 10_000_000)
         };
         if until <= first {
@@ -735,7 +791,7 @@ impl Mixer {
                 *start = until;
             }
         }
-        self.next = Some(until);
+        self.next = until;
         write(&out, first)
     }
 }
@@ -955,8 +1011,13 @@ mod tests {
         mixer.push(0, &[100; 200], 1000);
         // The second source has not started: nothing yet within the lag.
         assert_eq!(mixed(&mut mixer, false), vec![]);
+        // Retired, it is not waited for; the file starts with silence.
+        let mut alone = Mixer::new(2, 48_000);
+        alone.push(0, &[100; 200], 1000);
+        alone.retire(1);
+        assert_eq!(mixed(&mut alone, false), vec![(0, 1100, 0)]);
         mixer.push(1, &[10; 100], 1000);
-        assert_eq!(mixed(&mut mixer, false), vec![(1000, 50, 110)]);
+        assert_eq!(mixed(&mut mixer, false), vec![(0, 1050, 0)]);
         // The rest of the first, the second silent for it at the end.
         assert_eq!(mixed(&mut mixer, true), vec![(1050, 50, 100)]);
         // Late samples of the second are dropped; later ones are mixed.
@@ -973,8 +1034,8 @@ mod tests {
         assert_eq!(mixed(&mut mixer, false), vec![(0, 12_000, 1)]);
         // A source alone is written as it is.
         let mut alone = Mixer::new(1, 48_000);
-        alone.push(0, &[7; 20], 5);
-        assert_eq!(mixed(&mut alone, false), vec![(5, 10, 7)]);
+        alone.push(0, &[7; 20], 0);
+        assert_eq!(mixed(&mut alone, false), vec![(0, 10, 7)]);
         // Two loud ones are clipped, not wrapped.
         let mut loud = Mixer::new(2, 48_000);
         loud.push(0, &[30_000; 2], 0);
