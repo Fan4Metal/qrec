@@ -131,6 +131,11 @@ impl Loopback {
     /// Opens the system's audio for capture: the process loopback, or
     /// the default output device when that is not available.
     pub fn open() -> Result<Loopback> {
+        // QREC_ENDPOINT_LOOPBACK=1: the fallback straight away, to check it
+        // on a Windows that has the process loopback.
+        if std::env::var_os("QREC_ENDPOINT_LOOPBACK").is_some() {
+            return Self::open_endpoint();
+        }
         let own = unsafe { GetCurrentProcessId() };
         match Self::open_process(own, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE) {
             Ok(loopback) => Ok(loopback),
@@ -255,6 +260,7 @@ impl Loopback {
                         (client, mix)
                     }
                 };
+            log::debug!("endpoint loopback: initialised");
             let capture: IAudioCaptureClient = unsafe { client.GetService() }.map_err(|e| context("GetService", e))?;
             let keepalive = (|| -> Result<Keepalive> {
                 let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
@@ -264,7 +270,10 @@ impl Loopback {
                 Ok(Keepalive { client, render, frames })
             })();
             let keepalive = match keepalive {
-                Ok(k) => Some(k),
+                Ok(k) => {
+                    log::debug!("endpoint loopback: silent render stream ready");
+                    Some(k)
+                }
                 Err(e) => {
                     log::warn!("no silent render stream to keep the loopback alive: {e}");
                     None
