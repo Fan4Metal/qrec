@@ -40,6 +40,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
     // Seconds into the run: paused from, resumed at (left out of the file).
     let mut pause: Option<(f64, f64)> = None;
     let mut countdown = 0u32;
+    // A window to record, by its handle: its area, followed as it moves.
+    let mut window: Option<isize> = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
@@ -56,6 +58,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--clicks" => clicks = true,
             "--microphone" => microphone = true,
             "--border" => border = true,
+            "--window" => {
+                let v = value()?;
+                let parsed = match v.strip_prefix("0x") {
+                    Some(hex) => isize::from_str_radix(hex, 16).ok(),
+                    None => v.parse().ok(),
+                };
+                window = Some(parsed.ok_or("--window wants a window handle")?);
+            }
             "--countdown" => countdown = value()?.parse().map_err(|e: std::num::ParseIntError| e.to_string())?,
             "--pause" => {
                 let v = value()?;
@@ -67,12 +77,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
             s => return Err(format!("unknown argument {s}")),
         }
     }
-    let seconds = seconds.ok_or("usage: qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality Q] [--rate quality|bitrate] [--no-audio | --audio-app NAME.exe [--no-boost]] [--microphone] [--no-cursor | --clicks] [--countdown N] [--pause FROM-TO] [--out FILE]")?;
+    let seconds = seconds.ok_or("usage: qrec --record SECONDS [--region X,Y,W,H] [--monitor N] [--fps N] [--quality Q] [--rate quality|bitrate] [--no-audio | --audio-app NAME.exe [--no-boost]] [--microphone] [--no-cursor | --clicks] [--window HWND] [--countdown N] [--pause FROM-TO] [--out FILE]")?;
     if let Some(Source::App { boost: b, .. }) = &mut audio {
         *b = boost;
     }
 
     let monitors = display::monitors();
+    if let Some(window) = window {
+        let bounds = win::window_bounds(window).ok_or("the window is not on the screen")?;
+        let m = display::monitor_of(&monitors, &bounds).ok_or("the window is on no display")?;
+        monitor_index = monitors.iter().position(|x| x == m).unwrap_or(0);
+        region = Some(Region::from_rect(bounds));
+    }
     let monitor = monitors.get(monitor_index).ok_or_else(|| format!("no display {}", monitor_index + 1))?.clone();
     let region = region
         .unwrap_or_else(|| Region::from_rect(monitor.rect))
@@ -88,7 +104,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if microphone {
         sound = if audio.is_some() { format!("{sound} and the microphone") } else { "of the microphone".to_owned() };
     }
-    let config = Config { monitor, region, fps, quality, rate, audio, microphone, cursor, clicks, path: path.clone() };
+    let config_monitor = monitor.rect;
+    let config = Config { monitor, region, fps, quality, rate, audio, microphone, cursor, clicks, follow: window, path: path.clone() };
     say!(
         "recording {}x{} at ({}, {}) for {seconds} s, {fps} fps, {} quality, {}, sound {sound}",
         region.width,
@@ -109,7 +126,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
     }
     let recorder = Recorder::start(config)?;
-    let _border = border.then(|| crate::overlay::Border::show(region));
+    let _border = border.then(|| crate::overlay::Border::show(region, window.map(|w| (w, config_monitor))));
     say!(
         "encoder: {} ({}, {})",
         recorder.info.encoder,
@@ -268,15 +285,18 @@ pub fn info(path: Option<PathBuf>) -> i32 {
     }
 }
 
-/// `qrec --test-select`: opens the selection overlay and drives it with
-/// posted mouse messages (a drag from (100, 100) to (739, 459) on the
-/// virtual screen), then prints what it reported. The screen dims for a
-/// moment; the real mouse is not touched.
-pub fn test_select() -> i32 {
+/// `qrec --test-select [click]`: opens the selection overlay and drives it
+/// with posted mouse messages (a drag from (100, 100) to (739, 459) on the
+/// virtual screen, or a click in the middle of the primary display, which
+/// picks the window there), then prints what it reported. The screen dims
+/// for a moment; the real mouse is not touched.
+pub fn test_select(args: Vec<String>) -> i32 {
+    let click = args.first().is_some_and(|a| a == "click");
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetSystemMetrics, PostMessageW, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
     use windows::core::w;
     let monitors = display::monitors();
+    let middle = monitors.first().map_or((400, 300), |m| ((m.rect.left + m.rect.right) / 2, (m.rect.top + m.rect.bottom) / 2));
     let rx = crate::overlay::select(monitors, crate::region::Aspect::Free, || {});
     let hwnd = (0..50).find_map(|_| {
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -292,16 +312,28 @@ pub fn test_select() -> i32 {
         let _ = PostMessageW(Some(hwnd), msg, WPARAM(1), lparam(x, y));
     };
     std::thread::sleep(std::time::Duration::from_millis(300));
-    post(WM_LBUTTONDOWN, 100, 100);
-    for i in 1..=20 {
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        post(WM_MOUSEMOVE, 100 + i * 32, 100 + i * 18);
+    if click {
+        post(WM_MOUSEMOVE, middle.0, middle.1);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        post(WM_LBUTTONDOWN, middle.0, middle.1);
+        post(WM_LBUTTONUP, middle.0 + 1, middle.1);
+    } else {
+        post(WM_LBUTTONDOWN, 100, 100);
+        for i in 1..=20 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            post(WM_MOUSEMOVE, 100 + i * 32, 100 + i * 18);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        post(WM_LBUTTONUP, 739, 459);
     }
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    post(WM_LBUTTONUP, 739, 459);
     match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(Some(r)) => {
+        Ok(Some(picked)) => {
+            let r = picked.region;
             say!("selected {}x{} at ({}, {})", r.width, r.height, r.x, r.y);
+            if let Some(window) = picked.window {
+                let bounds = win::window_bounds(window);
+                say!("the window {window:#x} at {bounds:?}");
+            }
             0
         }
         Ok(None) => {

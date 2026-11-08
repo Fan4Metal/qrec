@@ -177,7 +177,10 @@ pub struct App {
     /// beside the file when it did.
     audio_warning: Option<String>,
     border: Option<Border>,
-    selecting: Option<mpsc::Receiver<Option<Region>>>,
+    selecting: Option<mpsc::Receiver<Option<overlay::Picked>>>,
+    /// The window clicked in the selection and the area it gave: a
+    /// recording of that area follows the window (not kept between runs).
+    window_picked: Option<(isize, Region)>,
     notice: Notice,
     /// The window's handle, to hide it while an area is being selected.
     window: Option<isize>,
@@ -374,6 +377,7 @@ impl App {
             recorder: None,
             border: None,
             selecting: None,
+            window_picked: None,
             notice: Notice::None,
             audio_warning: None,
             window,
@@ -422,13 +426,15 @@ impl App {
                 Ok(result) => {
                     self.selecting = None;
                     match result {
-                        Some(region) => {
+                        Some(picked) => {
+                            let region = picked.region;
                             if let Some(i) = display::monitor_of(&self.monitors, &region.rect())
                                 .and_then(|m| self.monitors.iter().position(|x| x == m))
                             {
                                 self.monitor = i;
                             }
                             self.region = Some(region);
+                            self.window_picked = picked.window.map(|w| (w, region));
                             self.notice = Notice::None;
                         }
                         None => {
@@ -598,11 +604,13 @@ impl App {
             microphone: self.microphone,
             cursor: self.cursor,
             clicks: self.clicks,
+            follow: self.followed(),
             path,
         };
+        let follow = config.follow.map(|window| (window, config.monitor.rect));
         match Recorder::start(config) {
             Ok(recorder) => {
-                self.border = Some(Border::show(region));
+                self.border = Some(Border::show(region, follow));
                 let encoder = if recorder.info.hardware {
                     tr!("hardware encoder", "аппаратный кодер")
                 } else {
@@ -1018,9 +1026,24 @@ impl App {
 
     fn area_label(&self) -> String {
         match self.region {
-            Some(r) => format!("{}×{} {} ({}, {})", r.width, r.height, tr!("at", "в точке"), r.x, r.y),
+            Some(r) => {
+                let area = format!("{}×{} {} ({}, {})", r.width, r.height, tr!("at", "в точке"), r.x, r.y);
+                match self.followed() {
+                    Some(window) => {
+                        let title = win::window_title(window);
+                        tr!(format!("The window «{title}», {area}; the area follows it"), format!("Окно «{title}», {area}; область следует за ним"))
+                    }
+                    None => area,
+                }
+            }
             None => tr!("Whole display", "Весь экран").into(),
         }
+    }
+
+    /// The window the area was picked from, while the area is still the
+    /// one picked and the window is there: the recording follows it.
+    fn followed(&self) -> Option<isize> {
+        self.window_picked.filter(|&(window, region)| self.region == Some(region) && win::window_bounds(window).is_some()).map(|(w, _)| w)
     }
 }
 

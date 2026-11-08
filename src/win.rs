@@ -502,6 +502,91 @@ pub fn move_window(hwnd: isize, x: i32, y: i32) {
 
 /// The window's rectangle on the virtual screen, physical pixels:
 /// `(left, top, right, bottom)`.
+/// The window as it is seen, in physical pixels on the virtual screen: its
+/// extended frame bounds, without the invisible resizing border Windows 10
+/// gives a window; `None` for a window gone or minimised.
+pub fn window_bounds(hwnd: isize) -> Option<crate::region::Rect> {
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindow};
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmGetWindowAttribute(hwnd: isize, attribute: u32, value: *mut core::ffi::c_void, size: u32) -> i32;
+    }
+    const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
+    let handle = HWND(hwnd as *mut _);
+    unsafe {
+        if !IsWindow(Some(handle)).as_bool() || IsIconic(handle).as_bool() {
+            return None;
+        }
+        let mut r = windows::Win32::Foundation::RECT::default();
+        if DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, (&raw mut r).cast(), size_of::<windows::Win32::Foundation::RECT>() as u32) != 0 {
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(handle, &mut r);
+        }
+        let rect = crate::region::Rect { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+        (rect.width() > 0 && rect.height() > 0).then_some(rect)
+    }
+}
+
+/// The windows a user can see and pick, from the topmost down: shown, not
+/// minimised, not cloaked (other virtual desktops, suspended apps), not
+/// tool windows or click-through overlays, not the desktop or the taskbar,
+/// not this program's; with their bounds.
+pub fn windows_on_screen() -> Vec<(isize, crate::region::Rect)> {
+    use windows::Win32::Foundation::LPARAM;
+    use windows::core::BOOL;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GWL_EXSTYLE, GetClassNameW, GetWindowLongPtrW, GetWindowThreadProcessId, IsWindowVisible, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    };
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmGetWindowAttribute(hwnd: isize, attribute: u32, value: *mut core::ffi::c_void, size: u32) -> i32;
+    }
+    const DWMWA_CLOAKED: u32 = 14;
+    unsafe extern "system" fn each(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let found = unsafe { &mut *(lparam.0 as *mut Vec<(isize, crate::region::Rect)>) };
+        unsafe {
+            if !IsWindowVisible(hwnd).as_bool() {
+                return true.into();
+            }
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            if ex & (WS_EX_TOOLWINDOW.0 | WS_EX_TRANSPARENT.0) != 0 {
+                return true.into();
+            }
+            let mut cloaked = 0u32;
+            if DwmGetWindowAttribute(hwnd.0 as isize, DWMWA_CLOAKED, (&raw mut cloaked).cast(), 4) == 0 && cloaked != 0 {
+                return true.into();
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == windows::Win32::System::Threading::GetCurrentProcessId() {
+                return true.into();
+            }
+            let mut class = [0u16; 64];
+            let n = GetClassNameW(hwnd, &mut class).max(0) as usize;
+            let class = String::from_utf16_lossy(&class[..n]);
+            if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+                return true.into();
+            }
+        }
+        if let Some(rect) = window_bounds(hwnd.0 as isize) {
+            found.push((hwnd.0 as isize, rect));
+        }
+        true.into()
+    }
+    let mut found: Vec<(isize, crate::region::Rect)> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(each), LPARAM((&raw mut found) as isize));
+    }
+    found
+}
+
+/// A window's title, shortened to 40 characters.
+pub fn window_title(hwnd: isize) -> String {
+    let mut buffer = [0u16; 256];
+    let n = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(HWND(hwnd as *mut _), &mut buffer) }.max(0) as usize;
+    let title = String::from_utf16_lossy(&buffer[..n]);
+    if title.chars().count() > 40 { format!("{}…", title.chars().take(39).collect::<String>()) } else { title }
+}
+
 pub fn window_rect(hwnd: isize) -> (i32, i32, i32, i32) {
     let mut r = windows::Win32::Foundation::RECT::default();
     unsafe {

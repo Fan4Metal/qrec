@@ -133,6 +133,14 @@ impl Capturer {
         self.has_frame
     }
 
+    /// Moves the area (the same size, in the monitor's pixels): the next
+    /// desktop frame is copied from there. Moving a window changes the
+    /// desktop, so one comes.
+    pub fn move_to(&mut self, region: Region) {
+        debug_assert_eq!((region.width, region.height), (self.region.width, self.region.height));
+        self.region = region;
+    }
+
     /// Opens the duplication (again, after it was lost): 8-bit BGRA, or
     /// 16-bit float scRGB from an HDR display, which is tone-mapped into
     /// the frame (`hdr.rs`). QREC_HDR=1 asks for the float format alone, to

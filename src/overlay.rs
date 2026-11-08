@@ -43,9 +43,10 @@ const LABEL_BACKGROUND: u32 = 0xFF_202020;
 
 /// Opens the selection over all monitors and reports what was chosen:
 /// the area, of the proportions `aspect` and fitted to the monitor the
-/// drag started on, or `None` when cancelled or too small. `done` runs on the selection's thread when it
-/// closes, before the result is sent.
-pub fn select(monitors: Vec<Monitor>, aspect: Aspect, done: impl FnOnce() + Send + 'static) -> mpsc::Receiver<Option<Region>> {
+/// drag started on, or a window clicked (its own proportions, fitted to
+/// its monitor), or `None` when cancelled or too small. `done` runs on the
+/// selection's thread when it closes, before the result is sent.
+pub fn select(monitors: Vec<Monitor>, aspect: Aspect, done: impl FnOnce() + Send + 'static) -> mpsc::Receiver<Option<Picked>> {
     let (tx, rx) = mpsc::channel();
     let done = std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(done) as Box<dyn FnOnce() + Send>)));
     let thread_done = done.clone();
@@ -67,8 +68,21 @@ pub fn select(monitors: Vec<Monitor>, aspect: Aspect, done: impl FnOnce() + Send
     rx
 }
 
+/// What the selection chose: the area, and the window it was taken from
+/// when one was clicked (the recording follows it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Picked {
+    pub region: Region,
+    pub window: Option<isize>,
+}
+
+/// A press and release this close together is a click, not a drag.
+const CLICK_SLOP: i32 = 3;
+
 struct Selection {
     monitors: Vec<Monitor>,
+    /// The windows on the screen, topmost first, for a click on one.
+    windows: Vec<(isize, Rect)>,
     aspect: Aspect,
     origin: (i32, i32),
     size: (i32, i32),
@@ -81,11 +95,22 @@ struct Selection {
     current: (i32, i32),
     /// What the last paint touched, to be painted over next time.
     painted: Option<Rect>,
-    result: Option<Region>,
+    /// The window under the pointer before a drag, as it would be picked.
+    hover: Option<(isize, Region)>,
+    result: Option<Picked>,
     done: bool,
 }
 
 impl Selection {
+    /// The topmost window at `(x, y)`, as recorded: cut to the monitor the
+    /// point is on, even sides; `None` when there is none or it is too
+    /// small.
+    fn window_at(&self, x: i32, y: i32) -> Option<(isize, Region)> {
+        let monitor = display::monitor_at(&self.monitors, x, y)?;
+        let &(hwnd, rect) = self.windows.iter().find(|(_, r)| r.contains(x, y))?;
+        Some((hwnd, Region::from_rect(rect).fit(monitor.rect)?))
+    }
+
     /// The rectangle dragged from the start to `end`, and what is recorded
     /// of it: fitted to the monitor the drag started on, or `None` when
     /// too small. `None` before the drag.
@@ -103,7 +128,7 @@ thread_local! {
     static SELECTION: RefCell<Option<Selection>> = const { RefCell::new(None) };
 }
 
-fn run_selection(monitors: Vec<Monitor>, aspect: Aspect) -> Option<Region> {
+fn run_selection(monitors: Vec<Monitor>, aspect: Aspect) -> Option<Picked> {
     unsafe {
         let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok()?;
         let class = w!("qrec_select");
@@ -159,9 +184,11 @@ fn run_selection(monitors: Vec<Monitor>, aspect: Aspect) -> Option<Region> {
         SetBkMode(dc, TRANSPARENT);
         let mut current = POINT::default();
         let _ = GetCursorPos(&mut current);
+        let windows = win::windows_on_screen();
         SELECTION.with(|s| {
             *s.borrow_mut() = Some(Selection {
                 monitors,
+                windows,
                 aspect,
                 origin,
                 size,
@@ -173,9 +200,15 @@ fn run_selection(monitors: Vec<Monitor>, aspect: Aspect) -> Option<Region> {
                 start: None,
                 current: (current.x, current.y),
                 painted: None,
+                hover: None,
                 result: None,
                 done: false,
             });
+        });
+        SELECTION.with(|s| {
+            if let Some(s) = s.borrow_mut().as_mut() {
+                s.hover = s.window_at(current.x, current.y);
+            }
         });
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
@@ -234,13 +267,20 @@ unsafe extern "system" fn selection_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
         }
         WM_MOUSEMOVE => {
             let pos = position(hwnd, lparam);
-            let dragging = SELECTION.with(|s| {
-                s.borrow_mut().as_mut().map(|s| {
+            let repaint = SELECTION.with(|s| {
+                s.borrow_mut().as_mut().is_some_and(|s| {
                     s.current = pos;
-                    s.start.is_some()
+                    if s.start.is_some() {
+                        return true;
+                    }
+                    // Before a drag: the window under the pointer.
+                    let hover = s.window_at(pos.0, pos.1);
+                    let changed = hover != s.hover;
+                    s.hover = hover;
+                    changed
                 })
             });
-            if dragging == Some(true) {
+            if repaint {
                 paint_selection(hwnd, false);
             }
             LRESULT(0)
@@ -250,8 +290,15 @@ unsafe extern "system" fn selection_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             let finished = SELECTION.with(|s| {
                 let mut s = s.borrow_mut();
                 let Some(s) = s.as_mut() else { return false };
-                let Some((_, fitted)) = s.dragged(pos) else { return false };
-                s.result = fitted;
+                let Some(start) = s.start else { return false };
+                // A click on a window takes the window.
+                let click = (pos.0 - start.0).abs() <= CLICK_SLOP && (pos.1 - start.1).abs() <= CLICK_SLOP;
+                if let (true, Some((window, region))) = (click, s.window_at(start.0, start.1)) {
+                    s.result = Some(Picked { region, window: Some(window) });
+                } else {
+                    let Some((_, fitted)) = s.dragged(pos) else { return false };
+                    s.result = fitted.map(|region| Picked { region, window: None });
+                }
                 s.done = true;
                 true
             });
@@ -325,14 +372,20 @@ fn paint_selection(hwnd: HWND, all: bool) {
         }
         let (w, h) = s.size;
         let whole = Rect { left: 0, top: 0, right: w, bottom: h };
-        let dragged = s.dragged(s.current);
+        // A drag once the pointer has moved; before that the window under
+        // it, which a click picks.
+        let moved = s.start.is_some_and(|p| (s.current.0 - p.0).abs() > CLICK_SLOP || (s.current.1 - p.1).abs() > CLICK_SLOP);
+        let dragged = if moved { s.dragged(s.current) } else { s.hover.map(|(_, r)| (r, Some(r))) };
         let selection = dragged.map(|(region, _)| {
             let r = region.rect();
             Rect { left: r.left - s.origin.0, top: r.top - s.origin.1, right: r.right - s.origin.0, bottom: r.bottom - s.origin.1 }
         });
         // The hint at the top of the monitor the pointer is on.
         let hint_monitor = display::monitor_at(&s.monitors, s.current.0, s.current.1).map(|m| m.rect);
-        let hint = tr!("Drag to select the area, Esc to cancel", "Выделите область мышью, Esc для отмены");
+        let hint = tr!(
+            "Drag to select the area or click a window, Esc to cancel",
+            "Выделите область мышью или щёлкните по окну, Esc для отмены"
+        );
         let hint_rect = hint_monitor.map(|m| {
             let (tw, th) = text_size(s.dc, hint);
             let cx = (m.left + m.right) / 2 - s.origin.0;
@@ -477,7 +530,9 @@ const KEY: COLORREF = COLORREF(0x00FF_00FF);
 const FRAME_COLOUR: COLORREF = COLORREF(0x0000_00FF);
 
 impl Border {
-    pub fn show(region: Region) -> Border {
+    /// The frame around `region`; with `follow` (a window and its monitor)
+    /// it moves with the window, as the recorded area does.
+    pub fn show(region: Region, follow: Option<(isize, Rect)>) -> Border {
         let thread_id = Arc::new(AtomicIsize::new(0));
         let id = Arc::clone(&thread_id);
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -485,7 +540,7 @@ impl Border {
             .name("border".into())
             .spawn(move || {
                 id.store(unsafe { windows::Win32::System::Threading::GetCurrentThreadId() } as isize, Relaxed);
-                run_border(region, ready_tx);
+                run_border(region, follow, ready_tx);
             })
             .ok();
         // Not joined when it did not answer in time and has no thread id
@@ -510,7 +565,9 @@ impl Drop for Border {
     }
 }
 
-fn run_border(region: Region, ready: mpsc::Sender<()>) {
+fn run_border(mut region: Region, follow: Option<(isize, Rect)>, ready: mpsc::Sender<()>) {
+    use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SWP_NOSIZE as NOSIZE, SWP_NOZORDER, SetTimer, WM_TIMER};
+    const FOLLOW_TIMER: usize = 1;
     unsafe {
         let Ok(instance) = windows::Win32::System::LibraryLoader::GetModuleHandleW(None) else { return };
         let class = w!("qrec_border");
@@ -544,11 +601,27 @@ fn run_border(region: Region, ready: mpsc::Sender<()>) {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         let _ = ready.send(());
+        if follow.is_some() {
+            SetTimer(Some(hwnd), FOLLOW_TIMER, 30, None);
+        }
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if msg.message == WM_TIMER
+                && let Some((window, monitor)) = follow
+            {
+                if let Some(bounds) = win::window_bounds(window) {
+                    let moved = region.follow(bounds, monitor);
+                    if moved != region {
+                        region = moved;
+                        let _ = SetWindowPos(hwnd, None, region.x - BORDER, region.y - BORDER, 0, 0, NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
+                }
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        let _ = KillTimer(Some(hwnd), FOLLOW_TIMER);
         let _ = DestroyWindow(hwnd);
     }
 }

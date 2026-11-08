@@ -101,7 +101,7 @@ fn main() -> eframe::Result {
         }
         Some("--test-select") => {
             console_mode();
-            std::process::exit(cli::test_select());
+            std::process::exit(cli::test_select(args()));
         }
         Some("--export-icon") => {
             console_mode();

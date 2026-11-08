@@ -163,6 +163,14 @@ impl Region {
         (region.width >= Self::MIN_SIDE && region.height >= Self::MIN_SIDE).then_some(region)
     }
 
+    /// The region moved to the top-left corner of `window` (a window it
+    /// follows), its size kept, held inside `bounds` (its monitor).
+    pub fn follow(self, window: Rect, bounds: Rect) -> Region {
+        let x = window.left.min(bounds.right - self.width as i32).max(bounds.left);
+        let y = window.top.min(bounds.bottom - self.height as i32).max(bounds.top);
+        Region { x, y, ..self }
+    }
+
     /// The same region with its origin moved: into the pixels of the
     /// monitor whose top-left corner is `origin`.
     pub fn relative_to(&self, origin: (i32, i32)) -> Region {
@@ -215,6 +223,16 @@ mod tests {
         let b = Region::from_drag((109, 219), (10, 20));
         assert_eq!(a, b);
         assert_eq!(a, Region { x: 10, y: 20, width: 100, height: 200 });
+    }
+
+    #[test]
+    fn follows_a_window_within_the_monitor() {
+        let r = Region { x: 100, y: 100, width: 640, height: 360 };
+        let window = |left, top| Rect { left, top, right: left + 700, bottom: top + 400 };
+        assert_eq!(r.follow(window(300, 200), SCREEN), Region { x: 300, y: 200, ..r });
+        // Partly off the monitor: held at its edges.
+        assert_eq!(r.follow(window(-50, 900), SCREEN), Region { x: 0, y: SCREEN.bottom - 360, ..r });
+        assert_eq!(r.follow(window(1800, -20), SCREEN), Region { x: SCREEN.right - 640, y: 0, ..r });
     }
 
     #[test]

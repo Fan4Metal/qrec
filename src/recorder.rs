@@ -135,6 +135,9 @@ pub struct Config {
     pub cursor: bool,
     /// Draw its clicks too (with the pointer only).
     pub clicks: bool,
+    /// A window the area follows: moved with it, its size kept, within the
+    /// monitor.
+    pub follow: Option<isize>,
     pub path: PathBuf,
 }
 
@@ -440,6 +443,11 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
     let _ = ready.send(Ok(info));
 
     let interval = 10_000_000 / i64::from(config.fps);
+    let monitor_origin = (config.monitor.rect.left, config.monitor.rect.top);
+    // Where the area is now, on the virtual screen and in the monitor's
+    // pixels: it moves with a window it follows.
+    let mut region = config.region;
+    let mut local = local;
     let mut tick: i64 = 0;
     let mut lost_since: Option<Instant> = None;
     let mut result = Ok(());
@@ -464,6 +472,14 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
                 }
             }
             continue;
+        }
+        if let Some(bounds) = config.follow.and_then(win::window_bounds) {
+            let moved = region.follow(bounds, config.monitor.rect);
+            if moved != region {
+                region = moved;
+                local = moved.relative_to(monitor_origin);
+                capturer.move_to(local);
+            }
         }
         // The clock of the file: the counter less the time paused.
         let base = start + offset;
@@ -511,7 +527,7 @@ fn run_video(config: Config, shared: &Arc<Shared>, ready: mpsc::Sender<Result<In
             unsafe { capturer.context().CopyResource(&*composed, capturer.frame()) };
             if let Some(clicks) = &clicks {
                 let now = win::qpc_100ns();
-                if let Err(e) = drawer.draw_clicks(&clicks.state(now), now, (config.region.x, config.region.y)) {
+                if let Err(e) = drawer.draw_clicks(&clicks.state(now), now, (region.x, region.y)) {
                     log::warn!("clicks not drawn: {}", win::describe(&e));
                 }
             }
