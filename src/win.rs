@@ -304,6 +304,91 @@ pub fn open_folder(path: &std::path::Path) {
     let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
 }
 
+/// HTTPS GET of `path` on `host` through WinHTTP, which brings the system's
+/// TLS and proxy settings (no HTTP crate); `headers` are extra request
+/// lines joined with `\r\n`. Returns the status code and the body, refused
+/// past `limit` bytes. Blocks for up to `timeout_ms` per step, so call it
+/// off the UI thread.
+pub fn https_get(host: &str, path: &str, agent: &str, headers: &str, timeout_ms: i32, limit: usize) -> Result<(u32, Vec<u8>), String> {
+    use std::ffi::c_void;
+    use std::ptr::{null, null_mut};
+    use windows::Win32::Networking::WinHttp::*;
+
+    struct Handle(*mut c_void);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = WinHttpCloseHandle(self.0);
+            }
+        }
+    }
+    fn handle(h: *mut c_void) -> Result<Handle, String> {
+        if h.is_null() { Err(winhttp_error(&windows::core::Error::from_thread())) } else { Ok(Handle(h)) }
+    }
+    let check = |r: windows::core::Result<()>| r.map_err(|e| winhttp_error(&e));
+
+    let (agent, host, path) = (wide(agent), wide(host), wide(path));
+    // Without the terminating NUL: the crate passes the slice's length.
+    let headers: Vec<u16> = headers.encode_utf16().collect();
+    let verb = wide("GET");
+    let t = timeout_ms;
+    // Declared in this order, the handles close request first.
+    unsafe {
+        let session = handle(WinHttpOpen(PCWSTR(agent.as_ptr()), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, PCWSTR::null(), PCWSTR::null(), 0))?;
+        check(WinHttpSetTimeouts(session.0, t, t, t, t))?;
+        let connection = handle(WinHttpConnect(session.0, PCWSTR(host.as_ptr()), INTERNET_DEFAULT_HTTPS_PORT, 0))?;
+        let request = handle(WinHttpOpenRequest(
+            connection.0,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(path.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            null(),
+            WINHTTP_FLAG_SECURE,
+        ))?;
+        check(WinHttpSendRequest(request.0, Some(&headers), None, 0, 0, 0))?;
+        check(WinHttpReceiveResponse(request.0, null_mut()))?;
+        let mut status = 0u32;
+        let mut len = size_of::<u32>() as u32;
+        check(WinHttpQueryHeaders(
+            request.0,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            PCWSTR::null(),
+            Some((&raw mut status).cast()),
+            &mut len,
+            null_mut(),
+        ))?;
+        let mut body = Vec::new();
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let mut read = 0u32;
+            check(WinHttpReadData(request.0, buf.as_mut_ptr().cast(), buf.len() as u32, &mut read))?;
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&buf[..read as usize]);
+            if body.len() > limit {
+                return Err(format!("the answer is larger than {limit} bytes"));
+            }
+        }
+        Ok((status, body))
+    }
+}
+
+/// A WinHTTP error in words; the system's message table lacks them.
+fn winhttp_error(e: &windows::core::Error) -> String {
+    // HRESULT_FROM_WIN32: the facility 7 and the code in the low word.
+    let hr = e.code().0 as u32;
+    let code = if hr >> 16 == 0x8007 { hr & 0xFFFF } else { hr };
+    match code {
+        12002 => "the server did not answer in time".into(),
+        12007 => "the server name could not be resolved".into(),
+        12029 | 12030 => "the connection to the server failed".into(),
+        12175 => "the secure connection failed".into(),
+        _ => format!("WinHTTP error {code}"),
+    }
+}
+
 /// A readable form of a Windows error: its message, or the code when there
 /// is none.
 pub fn describe(e: &windows::core::Error) -> String {

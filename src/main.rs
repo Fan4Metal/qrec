@@ -35,6 +35,7 @@ mod region;
 mod sessions;
 mod tray;
 mod trim;
+mod update;
 mod venc;
 mod win;
 

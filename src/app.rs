@@ -19,6 +19,7 @@ use crate::recordings::{self, Recordings};
 use crate::region::{Aspect, Region};
 use crate::sessions;
 use crate::tray::{self, Tray};
+use crate::update::{self, Updates};
 use crate::win;
 
 /// The window's size in points.
@@ -49,6 +50,8 @@ const LANGUAGE_KEY: &str = "language";
 /// is not taken for pixels.
 const EDITOR_RECT_KEY: &str = "editor_window";
 const TRIM_REPLACE_KEY: &str = "trim_replace";
+const CHECK_UPDATES_KEY: &str = "check_updates";
+const LAST_UPDATE_CHECK_KEY: &str = "last_update_check";
 
 /// Width of the language list in About, enough for its longest entry.
 const LANG_WIDTH: f32 = 220.0;
@@ -113,6 +116,8 @@ pub struct App {
     lang: LangChoice,
     /// Whether the About window is open.
     about: bool,
+    /// The update check, enabled in About.
+    updates: Updates,
     /// The trimming window, while one is open.
     editor: Option<Editor>,
     /// What copies of qrec started later ask of this one.
@@ -264,6 +269,11 @@ impl App {
         let lang = get(LANGUAGE_KEY).and_then(|l| LangChoice::from_name(&l)).unwrap_or_default();
         let editor_rect = get(EDITOR_RECT_KEY).and_then(|r| rect_from_setting(&r));
         let trim_replace = get(TRIM_REPLACE_KEY).as_deref() == Some("true");
+        let mut updates = Updates::new(
+            get(CHECK_UPDATES_KEY).as_deref() == Some("true"),
+            get(LAST_UPDATE_CHECK_KEY).and_then(|s| s.parse().ok()).unwrap_or(0),
+        );
+        updates.start_if_due(&cc.egui_ctx);
         crate::i18n::set_lang(lang.resolve());
         let cursor = get(CURSOR_KEY).as_deref() != Some("false");
         let folder = get(FOLDER_KEY).map(PathBuf::from).unwrap_or_else(default_folder);
@@ -325,6 +335,7 @@ impl App {
             trim_after_record,
             lang,
             about: false,
+            updates,
             editor: None,
             instance: crate::instance::listen(cc.egui_ctx.clone()).inspect_err(|e| log::warn!("no instance window: {e}")).ok(),
             editor_rect,
@@ -640,7 +651,8 @@ impl App {
 
     /// About, as in qview: the icon, the name, the version, what the
     /// program does, the author, the homepage and the licence from
-    /// Cargo.toml, where the settings are kept, and the interface language.
+    /// Cargo.toml, where the settings are kept, the interface language and
+    /// the update check.
     fn about_window(&mut self, ctx: &egui::Context) {
         if !self.about {
             return;
@@ -657,7 +669,7 @@ impl App {
         }
         let icon = self.about_icon.clone().expect("set above");
         let modal = egui::Modal::new(egui::Id::new("about")).show(ctx, |ui| {
-            ui.set_width(320.0);
+            ui.set_width(340.0);
             // The cross in the top right corner, over the centred content
             // (a child Ui takes no room in the layout).
             let corner = egui::Rect::from_min_size(egui::pos2(ui.max_rect().right() - 24.0, ui.cursor().top()), Vec2::splat(24.0));
@@ -705,6 +717,10 @@ impl App {
                     self.lang = choice;
                     crate::i18n::set_lang(choice.resolve());
                 }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(2.0);
+                update_section(ui, &mut self.updates);
                 ui.add_space(4.0);
             });
             closed
@@ -1009,7 +1025,19 @@ impl eframe::App for App {
                     self.open_library(&ctx);
                 }
             }
-            title(ui, egui::Rect::from_min_max(ui.max_rect().min, egui::pos2(list.rect.left() - 8.0, ui.max_rect().top() + 24.0)));
+            // A newer release, left of the list.
+            let mut title_right = list.rect.left();
+            if let Some(tag) = self.updates.newer().map(str::to_owned) {
+                let button = update_button(ui, title_right - 4.0, &tag);
+                title_right = button.rect.left();
+                if button.clicked() {
+                    let url = update::release_url(&tag);
+                    if !win::shell_open(&url) {
+                        log::warn!("could not open {url}");
+                    }
+                }
+            }
+            title(ui, egui::Rect::from_min_max(ui.max_rect().min, egui::pos2(title_right - 8.0, ui.max_rect().top() + 24.0)));
             ui.add_space(28.0);
             egui::Frame::group(ui.style()).inner_margin(10).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -1042,6 +1070,7 @@ impl eframe::App for App {
         self.uncloak(ctx);
         self.shown_at_start = self.window.is_none_or(win::is_shown);
         self.poll(ctx);
+        self.updates.poll();
         if self.listed.elapsed() > Duration::from_secs(5) {
             self.relist();
         }
@@ -1075,6 +1104,8 @@ impl eframe::App for App {
         storage.set_string(LANGUAGE_KEY, self.lang.name().to_owned());
         storage.set_string(EDITOR_RECT_KEY, self.editor_rect.map(rect_to_setting).unwrap_or_default());
         storage.set_string(TRIM_REPLACE_KEY, self.trim_replace.to_string());
+        storage.set_string(CHECK_UPDATES_KEY, self.updates.enabled.to_string());
+        storage.set_string(LAST_UPDATE_CHECK_KEY, self.updates.last_check.to_string());
         storage.set_string(CURSOR_KEY, self.cursor.to_string());
         storage.set_string(FOLDER_KEY, self.folder.display().to_string());
         storage.set_string(HOTKEY_KEY, self.record_key.chord.map(|c| c.label()).unwrap_or_default());
@@ -1882,6 +1913,89 @@ fn recordings_button(ui: &mut egui::Ui, right: f32, count: &str, open: bool) -> 
         tr!("All the recordings of the folder, beside this window", "Все записи папки, рядом с этим окном")
     };
     response.on_hover_text(hint)
+}
+
+/// The title row's button of a newer release, its right edge at `right`:
+/// a download arrow and the version in the link colour; a click opens the
+/// release page. Shown only while one has been found.
+fn update_button(ui: &mut egui::Ui, right: f32, tag: &str) -> egui::Response {
+    let version = update::version_of(tag);
+    let colour = ui.visuals().hyperlink_color;
+    let galley = ui.painter().layout_no_wrap(version.to_owned(), egui::FontId::proportional(13.0), colour);
+    let width = 6.0 + 14.0 + 5.0 + galley.size().x + 7.0;
+    let top = ui.max_rect().top();
+    let rect = egui::Rect::from_min_max(egui::pos2(right - width, top), egui::pos2(right, top + 24.0));
+    let response = ui.interact(rect, ui.id().with("update"), egui::Sense::click());
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect, 3.0, ui.style().interact(&response).bg_fill);
+    }
+    // The arrow down onto a tray, on the 14 pt grid of the family's icons,
+    // its ends round (egui ends a stroke flat).
+    let c = egui::pos2(rect.left() + 6.0 + 7.0, rect.center().y);
+    let p = |x: f32, y: f32| c + Vec2::new(x, y);
+    let stroke = egui::Stroke::new(1.5, colour);
+    let lines = [vec![p(0.0, -5.5), p(0.0, 2.5)], vec![p(-4.0, -1.5), p(0.0, 2.5), p(4.0, -1.5)], vec![p(-5.5, 5.5), p(5.5, 5.5)]];
+    for line in lines {
+        for end in [line[0], line[line.len() - 1]] {
+            painter.circle_filled(end, stroke.width / 2.0, colour);
+        }
+        painter.add(egui::Shape::line(line, stroke));
+    }
+    painter.galley(egui::pos2(rect.left() + 25.0, rect.center().y - galley.size().y / 2.0), galley, colour);
+    response
+        .on_hover_text(tr!(
+            format!("Version {version} is available: open its release page"),
+            format!("Доступна версия {version}: открыть страницу выпуска")
+        ))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The update check in About: the start-up option, a button to check now
+/// and the outcome.
+fn update_section(ui: &mut egui::Ui, updates: &mut Updates) {
+    let before = updates.enabled;
+    ui.checkbox(&mut updates.enabled, tr!("Check for updates at start-up (once a day)", "Проверять обновления при запуске (раз в сутки)"))
+        .on_hover_text(tr!(
+            "Asks api.github.com for the latest release; nothing else is sent, and nothing is downloaded",
+            "Запрашивает у api.github.com последний выпуск; больше ничего не отправляется и не скачивается"
+        ));
+    if updates.enabled && !before {
+        updates.start_if_due(ui.ctx());
+    }
+    let checking = updates.status == update::Status::Checking;
+    if ui.add_enabled(!checking, egui::Button::new(tr!("Check now", "Проверить сейчас"))).clicked() {
+        updates.start(ui.ctx());
+    }
+    match &updates.status {
+        update::Status::Unknown => {}
+        update::Status::Checking => {
+            ui.horizontal(|ui| {
+                // Centred by hand, as the language list above.
+                ui.add_space(((ui.available_width() - 110.0) / 2.0).max(0.0));
+                ui.add(egui::Spinner::new());
+                ui.weak(tr!("Checking…", "Проверка…"));
+            });
+        }
+        update::Status::UpToDate => {
+            ui.weak(tr!("This is the latest version", "Установлена последняя версия"));
+        }
+        update::Status::Newer(tag) => {
+            let version = update::version_of(tag);
+            let url = update::release_url(tag);
+            if ui
+                .link(tr!(format!("Version {version} is available"), format!("Доступна версия {version}")))
+                .on_hover_text(url.as_str())
+                .clicked()
+                && !win::shell_open(&url)
+            {
+                log::warn!("could not open {url}");
+            }
+        }
+        update::Status::Failed(e) => {
+            ui.weak(tr!("Could not check for updates", "Не удалось проверить обновления")).on_hover_text(e);
+        }
+    }
 }
 
 /// A square button with a cross, as high as the buttons beside it.

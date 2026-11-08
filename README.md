@@ -33,7 +33,7 @@ qrec records a rectangle of the screen, or a whole display, to an MP4 file: H.26
 - **An icon in the notification area**: red while a recording runs, with the time recorded in its tooltip; its menu starts and stops the recording, opens one of the latest recordings, and can leave the program in the notification area alone, without a taskbar button, make the window's cross hide it there, or put the window away when a recording starts.
 - **Nothing of qrec in the recording**: its own windows are kept out of the capture.
 - **Russian and English**: the interface follows the language of Windows, or the one chosen in the About window.
-- **One file**: no FFmpeg, no runtime, no network access; the executable is about 7 MB.
+- **One file**: no FFmpeg, no runtime, no network access unless the [update check](#update-check-and-privacy) is enabled; the executable is about 7 MB.
 
 ## Installation
 
@@ -77,7 +77,7 @@ The area is cut to the monitor it was started on, its sides are made even (as H.
 
 The icon of qrec in the notification area turns red while a recording runs, and its tooltip shows the time recorded. A click on the icon brings the window to the front; its menu (right button) starts or stops the recording, shows the window, opens one of the **Latest recordings** in the trimming window or the folder of the recordings, opens **About**, or closes the program. **Not on the taskbar** in the same menu removes the window's button from the taskbar (and from `Alt+Tab`): the minimise button then hides the window, and the icon brings it back. **Hide when closed** makes the cross in the window's corner hide the window instead of closing the program; `Alt+F4` and the **Exit** item still close it. **Minimise when recording starts** minimises the window as a recording starts, however it was started (hidden instead when the window is not on the taskbar), and brings it back when the recording stops; a window that was already minimised or hidden (a recording started by the hotkey) stays so. **Trim after recording** opens every recording in the trimming window as soon as it ends (see [Trimming](#trimming)). The choices are remembered. Windows 10 places a new icon among the hidden ones, behind the arrow; it can be dragged from there onto the taskbar.
 
-The **i** button in the window's title row (or **About** in the icon's menu) shows the version, the author, the homepage and the licence, where the settings are kept, and the interface language: as in Windows, English or Russian; the choice applies at once and is remembered.
+The **i** button in the window's title row (or **About** in the icon's menu) shows the version, the author, the homepage and the licence, where the settings are kept, the interface language (as in Windows, English or Russian; the choice applies at once and is remembered), and the [update check](#update-check-and-privacy).
 
 Closing the window during a recording completes the file first.
 
@@ -112,6 +112,10 @@ qrec.exe FILE.mp4
 `--record` records without the window for the given number of seconds, from a console: `--region` is on the virtual screen (physical pixels), `--monitor` counts from 1 with the primary display first, `--audio-app` records the sound of one program, named by its executable (`firefox.exe`) or its full path, boosted unless `--no-boost` is given, and the defaults are the whole primary display, 30 frames per second, medium quality, with sound and the pointer, into `qrec_<date>_<time>.mp4` in the current folder.
 
 `--cut` copies the stretch between the two times into a new file without re-encoding, from the key frame at or before `--from` up to the frame before `--to`, into `<name>.cut.mp4` beside the source unless `--out` names the file. `--info` prints the size, the frame rate and the length of a file and the times of its key frames. A file given on its own opens the window with the trimming window on that file.
+
+## Update check and privacy
+
+The update check is optional and off by default. With **Check for updates at start-up (once a day)** enabled in the About window, the program asks the GitHub Releases API (`api.github.com`) for the latest release at most once a day; **Check now** in the same window asks at once. The request carries nothing but the program version in its `User-Agent` header, and nothing is downloaded or installed: when a newer release exists, a button with its version appears in the window's title row, left of the recordings button, and opens the release page in the browser. Otherwise the program does not access the network.
 
 ## Building
 
