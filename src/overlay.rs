@@ -42,16 +42,17 @@ const WHITE: u32 = 0xFF_FFFFFF;
 const LABEL_BACKGROUND: u32 = 0xFF_202020;
 
 /// Opens the selection over all monitors and reports what was chosen:
-/// the area, of the proportions `aspect` and fitted to the monitor the
-/// drag started on, or a window clicked (its own proportions, fitted to
-/// its monitor), or `None` when cancelled or too small. `done` runs on the
-/// selection's thread when it closes, before the result is sent.
-pub fn select(monitors: Vec<Monitor>, aspect: Aspect, done: impl FnOnce() + Send + 'static) -> mpsc::Receiver<Option<Picked>> {
+/// with `Mode::Area` the area dragged, of the proportions `aspect` and
+/// fitted to the monitor the drag started on; with `Mode::Window` the
+/// window clicked (its own proportions, fitted to its monitor); `None`
+/// when cancelled or too small. `done` runs on the selection's thread when
+/// it closes, before the result is sent.
+pub fn select(monitors: Vec<Monitor>, mode: Mode, aspect: Aspect, done: impl FnOnce() + Send + 'static) -> mpsc::Receiver<Option<Picked>> {
     let (tx, rx) = mpsc::channel();
     let done = std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(done) as Box<dyn FnOnce() + Send>)));
     let thread_done = done.clone();
     let spawned = std::thread::Builder::new().name("select".into()).spawn(move || {
-        let result = run_selection(monitors, aspect);
+        let result = run_selection(monitors, mode, aspect);
         if let Some(done) = thread_done.lock().ok().and_then(|mut d| d.take()) {
             done();
         }
@@ -76,11 +77,18 @@ pub struct Picked {
     pub window: Option<isize>,
 }
 
-/// A press and release this close together is a click, not a drag.
-const CLICK_SLOP: i32 = 3;
+/// What the selection picks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// An area dragged with the mouse.
+    Area,
+    /// A window clicked: the one under the pointer is outlined.
+    Window,
+}
 
 struct Selection {
     monitors: Vec<Monitor>,
+    mode: Mode,
     /// The windows on the screen, topmost first, for a click on one.
     windows: Vec<(isize, Rect)>,
     aspect: Aspect,
@@ -128,7 +136,7 @@ thread_local! {
     static SELECTION: RefCell<Option<Selection>> = const { RefCell::new(None) };
 }
 
-fn run_selection(monitors: Vec<Monitor>, aspect: Aspect) -> Option<Picked> {
+fn run_selection(monitors: Vec<Monitor>, mode: Mode, aspect: Aspect) -> Option<Picked> {
     unsafe {
         let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok()?;
         let class = w!("qrec_select");
@@ -184,10 +192,11 @@ fn run_selection(monitors: Vec<Monitor>, aspect: Aspect) -> Option<Picked> {
         SetBkMode(dc, TRANSPARENT);
         let mut current = POINT::default();
         let _ = GetCursorPos(&mut current);
-        let windows = win::windows_on_screen();
+        let windows = if mode == Mode::Window { win::windows_on_screen() } else { Vec::new() };
         SELECTION.with(|s| {
             *s.borrow_mut() = Some(Selection {
                 monitors,
+                mode,
                 windows,
                 aspect,
                 origin,
@@ -270,10 +279,10 @@ unsafe extern "system" fn selection_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             let repaint = SELECTION.with(|s| {
                 s.borrow_mut().as_mut().is_some_and(|s| {
                     s.current = pos;
-                    if s.start.is_some() {
-                        return true;
+                    if s.mode == Mode::Area {
+                        return s.start.is_some();
                     }
-                    // Before a drag: the window under the pointer.
+                    // The window under the pointer.
                     let hover = s.window_at(pos.0, pos.1);
                     let changed = hover != s.hover;
                     s.hover = hover;
@@ -290,14 +299,16 @@ unsafe extern "system" fn selection_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             let finished = SELECTION.with(|s| {
                 let mut s = s.borrow_mut();
                 let Some(s) = s.as_mut() else { return false };
-                let Some(start) = s.start else { return false };
-                // A click on a window takes the window.
-                let click = (pos.0 - start.0).abs() <= CLICK_SLOP && (pos.1 - start.1).abs() <= CLICK_SLOP;
-                if let (true, Some((window, region))) = (click, s.window_at(start.0, start.1)) {
-                    s.result = Some(Picked { region, window: Some(window) });
-                } else {
-                    let Some((_, fitted)) = s.dragged(pos) else { return false };
-                    s.result = fitted.map(|region| Picked { region, window: None });
+                if s.start.is_none() {
+                    return false;
+                }
+                match s.mode {
+                    // The window the button is released over.
+                    Mode::Window => s.result = s.window_at(pos.0, pos.1).map(|(window, region)| Picked { region, window: Some(window) }),
+                    Mode::Area => {
+                        let Some((_, fitted)) = s.dragged(pos) else { return false };
+                        s.result = fitted.map(|region| Picked { region, window: None });
+                    }
                 }
                 s.done = true;
                 true
@@ -372,20 +383,21 @@ fn paint_selection(hwnd: HWND, all: bool) {
         }
         let (w, h) = s.size;
         let whole = Rect { left: 0, top: 0, right: w, bottom: h };
-        // A drag once the pointer has moved; before that the window under
-        // it, which a click picks.
-        let moved = s.start.is_some_and(|p| (s.current.0 - p.0).abs() > CLICK_SLOP || (s.current.1 - p.1).abs() > CLICK_SLOP);
-        let dragged = if moved { s.dragged(s.current) } else { s.hover.map(|(_, r)| (r, Some(r))) };
+        // The area dragged, or the window under the pointer.
+        let dragged = match s.mode {
+            Mode::Area => s.dragged(s.current),
+            Mode::Window => s.hover.map(|(_, r)| (r, Some(r))),
+        };
         let selection = dragged.map(|(region, _)| {
             let r = region.rect();
             Rect { left: r.left - s.origin.0, top: r.top - s.origin.1, right: r.right - s.origin.0, bottom: r.bottom - s.origin.1 }
         });
         // The hint at the top of the monitor the pointer is on.
         let hint_monitor = display::monitor_at(&s.monitors, s.current.0, s.current.1).map(|m| m.rect);
-        let hint = tr!(
-            "Drag to select the area or click a window, Esc to cancel",
-            "Выделите область мышью или щёлкните по окну, Esc для отмены"
-        );
+        let hint = match s.mode {
+            Mode::Area => tr!("Drag to select the area, Esc to cancel", "Выделите область мышью, Esc для отмены"),
+            Mode::Window => tr!("Click the window to record, Esc to cancel", "Щёлкните по окну для записи, Esc для отмены"),
+        };
         let hint_rect = hint_monitor.map(|m| {
             let (tw, th) = text_size(s.dc, hint);
             let cx = (m.left + m.right) / 2 - s.origin.0;

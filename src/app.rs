@@ -496,7 +496,7 @@ impl App {
             self.toggle_pause();
         }
         if self.select_key.presses() > 0 && self.selecting.is_none() && self.recorder.is_none() {
-            self.select_area(ctx);
+            self.select_area(ctx, overlay::Mode::Area);
         }
         // While an area is selected the window stays hidden: the commands
         // wait in their channels until it is done.
@@ -716,14 +716,15 @@ impl App {
     /// does not cover what is to be recorded. A hidden window is not
     /// repainted, so the selection's thread shows it again itself. A
     /// window already out of the way (the hotkey) stays so.
-    fn select_area(&mut self, ctx: &egui::Context) {
+    /// Opens the selection of an area or of a window (`mode`).
+    fn select_area(&mut self, ctx: &egui::Context, mode: overlay::Mode) {
         self.monitors = display::monitors();
         let window = self.window.filter(|&hwnd| win::is_shown(hwnd));
         if let Some(hwnd) = window {
             win::show_window(hwnd, false);
         }
         let ctx = ctx.clone();
-        self.selecting = Some(overlay::select(self.monitors.clone(), self.aspect, move || {
+        self.selecting = Some(overlay::select(self.monitors.clone(), mode, self.aspect, move || {
             if let Some(hwnd) = window {
                 win::show_window(hwnd, true);
             }
@@ -1478,19 +1479,28 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
         ui.allocate_ui_with_layout(row, egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.set_min_height(BAR_HEIGHT);
             ui.add_enabled_ui(!busy, |ui| {
-                // Two halves of one choice, the current one filled: an
-                // area of its own or the whole display.
+                // Three parts of one choice, the current one filled: an
+                // area drawn with the mouse, a window, the whole display.
                 ui.spacing_mut().item_spacing.x = 1.0;
                 let size = Vec2::new(0.0, BAR_HEIGHT);
-                let area = self.region.is_some();
+                let window = self.followed().is_some();
+                let area = self.region.is_some() && !window;
                 let r = BAR_CORNER;
                 let left = egui::CornerRadius { nw: r, sw: r, ne: 0, se: 0 };
                 let right = egui::CornerRadius { nw: 0, sw: 0, ne: r, se: r };
-                let select = choice(ui, area, tr!("Select area…", "Выделить область…"), Some(16.0)).corner_radius(left).min_size(size);
-                if ui.add(select).clicked() {
-                    self.select_area(ui.ctx());
+                let select = choice(ui, area, tr!("Area…", "Область…"), Some(16.0)).corner_radius(left).min_size(size);
+                if ui.add(select).on_hover_text(tr!("Draw the area to record with the mouse", "Выделить записываемую область мышью")).clicked() {
+                    self.select_area(ui.ctx(), overlay::Mode::Area);
                 }
-                let whole = choice(ui, !area, tr!("Whole display", "Весь экран"), Some(16.0)).corner_radius(right).min_size(size);
+                let pick = choice(ui, window, tr!("Window…", "Окно…"), Some(16.0)).corner_radius(egui::CornerRadius::ZERO).min_size(size);
+                if ui
+                    .add(pick)
+                    .on_hover_text(tr!("Click the window to record; the area follows it as it moves", "Щёлкнуть по окну для записи; область следует за ним при перемещении"))
+                    .clicked()
+                {
+                    self.select_area(ui.ctx(), overlay::Mode::Window);
+                }
+                let whole = choice(ui, self.region.is_none(), tr!("Whole display", "Весь экран"), Some(16.0)).corner_radius(right).min_size(size);
                 if ui.add(whole).clicked() {
                     self.region = None;
                 }

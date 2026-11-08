@@ -338,7 +338,8 @@ pub fn test_select(args: Vec<String>) -> i32 {
     use windows::core::w;
     let monitors = display::monitors();
     let middle = monitors.first().map_or((400, 300), |m| ((m.rect.left + m.rect.right) / 2, (m.rect.top + m.rect.bottom) / 2));
-    let rx = crate::overlay::select(monitors, crate::region::Aspect::Free, || {});
+    let mode = if click { crate::overlay::Mode::Window } else { crate::overlay::Mode::Area };
+    let rx = crate::overlay::select(monitors, mode, crate::region::Aspect::Free, || {});
     let hwnd = (0..50).find_map(|_| {
         std::thread::sleep(std::time::Duration::from_millis(50));
         unsafe { FindWindowW(w!("qrec_select"), None) }.ok()
