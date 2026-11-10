@@ -277,6 +277,31 @@ pub(crate) fn cross_button(ui: &mut egui::Ui) -> egui::Response {
     response
 }
 
+/// The shared catalogue's Reset: one clockwise arc and a filled head,
+/// on its original 14-point grid, beside the hotkey's Change and cross.
+pub(crate) fn reset_button(ui: &mut egui::Ui) -> egui::Response {
+    let side = ui.spacing().interact_size.y;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), egui::Sense::CLICK);
+    let visuals = ui.style().interact(&response);
+    let painter = ui.painter();
+    painter.rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
+    let colour = visuals.fg_stroke.color;
+    let p = |x, y| rect.center() + Vec2::new(x, y);
+    let radius = 4.5;
+    let arc = (0..=36).map(|i| {
+        let angle = (55.0 + 305.0 * i as f32 / 36.0).to_radians();
+        p(-0.75 + angle.cos() * radius, angle.sin() * radius)
+    }).collect();
+    painter.add(egui::Shape::line(arc, egui::Stroke::new(1.8, colour)));
+    let head_x = radius - 0.75;
+    painter.add(egui::Shape::convex_polygon(
+        vec![p(head_x - 2.65, -0.9), p(head_x + 2.65, -0.9), p(head_x, 2.35)],
+        colour,
+        egui::Stroke::NONE,
+    ));
+    response
+}
+
 /// A recording's picture in a box of `size` (dark until it is decoded),
 /// fitted inside it; a click trims the recording.
 pub(crate) fn thumbnail(ui: &mut egui::Ui, texture: Option<&egui::TextureHandle>, size: Vec2) -> egui::Response {

@@ -213,6 +213,16 @@ enum KeyAction {
     Pause,
 }
 
+impl KeyAction {
+    fn default_chord(self) -> Chord {
+        match self {
+            Self::Record => Chord::RECORD,
+            Self::Select => Chord::SELECT,
+            Self::Pause => Chord::PAUSE,
+        }
+    }
+}
+
 /// A global hotkey: its chord, registered while the program runs.
 #[derive(Default)]
 struct GlobalKey {
@@ -443,6 +453,20 @@ impl App {
             KeyAction::Record => &mut self.record_key,
             KeyAction::Select => &mut self.select_key,
             KeyAction::Pause => &mut self.pause_key,
+        }
+    }
+
+    /// Assigns a chord, taking it from any other action that has it.
+    /// While another hotkey is being chosen, all chords stay unregistered.
+    fn set_hotkey(&mut self, ctx: &egui::Context, action: KeyAction, chord: Chord) {
+        for other in [&mut self.record_key, &mut self.select_key, &mut self.pause_key] {
+            if other.chord == Some(chord) {
+                other.chord = None;
+            }
+        }
+        self.global_key(action).chord = Some(chord);
+        if self.capturing_hotkey.is_none() {
+            self.register_hotkeys(ctx);
         }
     }
 
@@ -937,14 +961,8 @@ impl App {
                 if let Some(chord) = Chord::from_egui(key, modifiers)
                     && chord.is_usable()
                 {
-                    for other in [&mut self.record_key, &mut self.select_key, &mut self.pause_key] {
-                        if other.chord == Some(chord) {
-                            other.chord = None;
-                        }
-                    }
-                    self.global_key(action).chord = Some(chord);
                     self.capturing_hotkey = None;
-                    self.register_hotkeys(ctx);
+                    self.set_hotkey(ctx, action, chord);
                     return;
                 }
             }
@@ -1370,7 +1388,7 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
         });
     }
 
-    /// A hotkey, the button that changes it and the cross that removes it.
+    /// A hotkey, Change, the cross that removes it and its default reset.
     fn hotkey_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, recording: bool, action: KeyAction, hint: &str) {
         let capturing = self.capturing_hotkey == Some(action);
         ui.horizontal_wrapped(|ui| {
@@ -1404,6 +1422,17 @@ Fixed: the encoder is given a bitrate from the area, the frame rate and the qual
                 if self.capturing_hotkey.is_none() {
                     self.register_hotkeys(ctx);
                 }
+            }
+            let default = action.default_chord();
+            if !capturing
+                && ui.add_enabled(!recording && chord != Some(default), reset_button)
+                    .on_hover_text(tr!(
+                        format!("Reset to default ({})", default.label()),
+                        format!("Сбросить по умолчанию ({})", default.label())
+                    ))
+                    .clicked()
+            {
+                self.set_hotkey(ctx, action, default);
             }
             if let Some(e) = &self.global_key(action).error {
                 // Usually another program (or another qrec) holds the key.
